@@ -1,0 +1,15 @@
+PQ shielded pool — minimal post-quantum privacy protocol prototype
+
+The reference protocol model (pool/*.py) and the zkDSL spend circuit
+(circuits/spend.py) are original work, licensed under Apache-2.0 (see LICENSE).
+
+circuits/pool_circuits.patch adds one test function and an embedded zkDSL
+program constant (POOL_SPEND_PROGRAM) to crates/lean_prover/src/test_zkvm.rs of:
+
+  leanEthereum/leanVM  (https://github.com/leanEthereum/leanVM)
+  commit 12e61512416548e743040aab4daf83c58a5c5476
+  licensed under Apache-2.0
+
+Apply it against the pinned commit as described in circuits/README.md. All
+modifications are marked by the patch itself (added lines only). No upstream
+leanVM source is vendored in this repository.

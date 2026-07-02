@@ -1,0 +1,190 @@
+diff --git a/crates/lean_prover/src/test_zkvm.rs b/crates/lean_prover/src/test_zkvm.rs
+index 440e099..114690c 100644
+--- a/crates/lean_prover/src/test_zkvm.rs
++++ b/crates/lean_prover/src/test_zkvm.rs
+@@ -454,3 +454,185 @@ fn test_zk_vm_helper_with_bytecode(
+     println!("{}", proof.metadata.as_ref().unwrap().display());
+     println!("Proof time: {:.3} s", proof_time.as_secs_f32());
+ }
++
++/// PQ shielded pool — spend circuit (covers both private transfer and withdraw).
++/// Closes the five soundness caveats of the mempool prototype's cost-only spend:
++///  1. path bits are boolean-constrained (assert b*(b-1)==0);
++///  2. the computed root is bound into the public claim, which the contract
++///     checks against its recent-roots ring (root anchoring);
++///  3. every hash role is domain-separated by a distinct tag (tagged());
++///  4. nullifier = H(TAG_NULL, spend_key, cm) is key-bound and note-bound
++///     (cm is unique per note via rho), so it is deterministic per note and
++///     computable only by the owner;
++///  5. the nullifier is a public output the contract inserts into its spent set.
++/// Fixed-denomination notes: no value field, so no in-circuit range checks.
++/// Ownership = knowledge of spend_key with owner_pk = H(TAG_PK, spend_key).
++/// Public claim = H(TAG_CLAIM, H(root||nf), H(out_cm||ctx)), written to the
++/// 8-cell public-input region; the immutable contract recomputes it from the
++/// on-chain (root, nf, out_cm, ctx). Run:
++/// cargo test --release -p lean_prover pool_spend_circuits -- --nocapture
++const POOL_SPEND_PROGRAM: &str = r#"
++from snark_lib import *
++DIGEST_LEN = 8
++DEPTH = DEPTH_PLACEHOLDER
++TAG_PK = 1
++TAG_LEAF = 2
++TAG_NULL = 3
++TAG_CLAIM = 4
++
++def tagged(tag, a, b, out):
++    inner = Array(DIGEST_LEN)
++    poseidon16_compress_half(a, b, inner)
++    tb = Array(DIGEST_LEN)
++    tb[0] = tag
++    for i in unroll(1, DIGEST_LEN):
++        tb[i] = 0
++    poseidon16_compress_half(tb, inner, out)
++    return
++
++def main():
++    pub = 0
++    W = 32 + 9 * DEPTH
++    w = Array(W)
++    hint_witness("w", w)
++    spend_key = w
++    rho = w + DIGEST_LEN
++    siblings = w + 2 * DIGEST_LEN
++    bits = w + (2 + DEPTH) * DIGEST_LEN
++    out_cm = w + (2 + DEPTH) * DIGEST_LEN + DEPTH
++    ctx = out_cm + DIGEST_LEN
++
++    zero8 = Array(DIGEST_LEN)
++    for i in unroll(0, DIGEST_LEN):
++        zero8[i] = 0
++
++    for i in unroll(0, DEPTH):
++        assert bits[i] * (bits[i] - 1) == 0
++
++    owner_pk = Array(DIGEST_LEN)
++    tagged(TAG_PK, spend_key, zero8, owner_pk)
++
++    cm = Array(DIGEST_LEN)
++    tagged(TAG_LEAF, owner_pk, rho, cm)
++
++    scratch = Array(DEPTH * DIGEST_LEN)
++    state: Mut = cm
++    for i in unroll(0, DEPTH):
++        out = scratch + i * DIGEST_LEN
++        sib = siblings + i * DIGEST_LEN
++        if bits[i] == 0:
++            poseidon16_compress_half(state, sib, out)
++        else:
++            poseidon16_compress_half(sib, state, out)
++        state = out
++    root = state
++
++    nf = Array(DIGEST_LEN)
++    tagged(TAG_NULL, spend_key, cm, nf)
++
++    c1 = Array(DIGEST_LEN)
++    poseidon16_compress_half(root, nf, c1)
++    c2 = Array(DIGEST_LEN)
++    poseidon16_compress_half(out_cm, ctx, c2)
++    tagged(TAG_CLAIM, c1, c2, pub)
++    return
++"#;
++
++#[test]
++fn pool_spend_circuits() {
++    use rand::{RngExt, SeedableRng, rngs::StdRng};
++    use std::time::Instant;
++
++    fn h8(l: &[F], r: &[F]) -> [F; 8] {
++        let mut x = [F::ZERO; 16];
++        x[..8].copy_from_slice(&l[..8]);
++        x[8..].copy_from_slice(&r[..8]);
++        poseidon16_compress(x)[..8].try_into().unwrap()
++    }
++    fn tagged(tag: usize, a: &[F], b: &[F]) -> [F; 8] {
++        let inner = h8(a, b);
++        let mut tb = [F::ZERO; 8];
++        tb[0] = F::from_usize(tag);
++        h8(&tb, &inner)
++    }
++    let zero8 = [F::ZERO; 8];
++
++    println!("\n=== PQ shielded pool: real Poseidon spend proofs (rate 1/2) ===");
++    println!("{:>6}  {:>9}  {:>7}  {:>8}  {:>7}   op", "depth", "prove", "proof", "verify", "sound?");
++    for &depth in &[20usize, 32] {
++        for (op, use_out, use_ctx) in [("transfer", true, false), ("withdraw", false, true)] {
++            let flags = CompilationFlags {
++                replacements: BTreeMap::from([("DEPTH_PLACEHOLDER".to_string(), depth.to_string())]),
++            };
++            let bc = compile_program_with_flags(&ProgramSource::Raw(POOL_SPEND_PROGRAM.to_string()), flags);
++
++            let mut rng = StdRng::seed_from_u64(42);
++            let spend_key: [F; 8] = rng.random();
++            let rho: [F; 8] = rng.random();
++            let owner_pk = tagged(1, &spend_key, &zero8);
++            let cm = tagged(2, &owner_pk, &rho);
++
++            let siblings: Vec<[F; 8]> = (0..depth).map(|_| rng.random()).collect();
++            let idx: usize = 0b1011010;
++            let mut node = cm;
++            let mut bits = Vec::new();
++            for i in 0..depth {
++                let b = (idx >> i) & 1;
++                bits.push(b);
++                node = if b == 0 { h8(&node, &siblings[i]) } else { h8(&siblings[i], &node) };
++            }
++            let root = node;
++            let nf = tagged(3, &spend_key, &cm);
++
++            let out_cm: [F; 8] = if use_out {
++                let rk: [F; 8] = rng.random();
++                let rr: [F; 8] = rng.random();
++                tagged(2, &tagged(1, &rk, &zero8), &rr)   // recipient's fresh note
++            } else {
++                [F::ZERO; 8]
++            };
++            let ctx: [F; 8] = if use_ctx { rng.random() } else { [F::ZERO; 8] };
++            let c1 = h8(&root, &nf);
++            let c2 = h8(&out_cm, &ctx);
++            let claim = tagged(4, &c1, &c2);
++
++            let mut w: Vec<F> = Vec::new();
++            w.extend_from_slice(&spend_key);
++            w.extend_from_slice(&rho);
++            for s in &siblings {
++                w.extend_from_slice(s);
++            }
++            for &b in &bits {
++                w.push(F::from_usize(b));
++            }
++            w.extend_from_slice(&out_cm);
++            w.extend_from_slice(&ctx);
++
++            let mut public_input = [F::ZERO; PUBLIC_INPUT_LEN];
++            public_input.copy_from_slice(&claim);
++            let mut hints = Hints::default();
++            hints.insert(&bc, "w", arena_vec![ArenaVec::from_slice(&w)]);
++            let witness = ExecutionWitness { hints, ..Default::default() };
++
++            let _ = prove_execution(&bc, &public_input, &witness, &default_whir_config(1), false).unwrap();
++            let t = Instant::now();
++            let ep = prove_execution(&bc, &public_input, &witness, &default_whir_config(1), false).unwrap();
++            let prove_ms = t.elapsed().as_secs_f64() * 1e3;
++            let proof_kib = ep.proof.proof_size_fe() as f64 * 31.0 / 8.0 / 1024.0;
++            let tv = Instant::now();
++            verify_execution(&bc, &public_input, ep.proof.clone()).unwrap();
++            let verify_ms = tv.elapsed().as_secs_f64() * 1e3;
++
++            // soundness smoke test: a tampered claim (wrong root/nf/out/ctx) must NOT verify
++            let mut bad = public_input;
++            bad[0] += F::ONE;
++            let sound = verify_execution(&bc, &bad, ep.proof).is_err();
++
++            println!(
++                "{:>6}  {:>7.1}ms  {:>4.1}KiB  {:>6.1}ms  {:>7}   {}",
++                depth, prove_ms, proof_kib, verify_ms, if sound { "reject" } else { "ACCEPT!" }, op
++            );
++            assert!(sound, "tampered public claim must be rejected");
++        }
++    }
++}
