@@ -57,7 +57,9 @@ def spend_entry(pub, proofpath, **extra):
     # Sepolia the attester posts the proof and its hash for anyone to recheck.
     # The real STARK is verified off-chain by verify-spend above, not by a hash.
     e["proof_hash"] = "0x" + hashlib.sha256(proofpath.read_bytes()).hexdigest()
-    e["proof_file"] = f"wallet/artifacts/{proofpath.name}"  # for off-chain re-verify
+    # paths (relative to wallet/) so the standalone attester can re-verify
+    e["proof_file"] = f"artifacts/{proofpath.name}"
+    e["publics_file"] = f"artifacts/{proofpath.name.replace('proof_', 'publics_')}"
     e.update(extra)
     return e
 

@@ -91,8 +91,11 @@ wallet/
   wallet.py            tree/indexer + witness builder (reconstructs the tree
                        from LeafAppended events, builds real auth paths)
   gen_smoke.py         real proofs for a transfer + withdraw, verified off-chain
-  smoke.sh             end-to-end: real STARK -> off-chain verify -> on-chain
-                       shield/transfer/withdraw (Sepolia milestone 4; see wallet/README.md)
+  smoke.sh             end-to-end (in-process EVM): real STARK -> off-chain
+                       verify -> on-chain shield/transfer/withdraw (milestone 4)
+  deploy_flow.sh       deploy + run the flow against a live node (anvil or
+                       Sepolia); attest.sh is the standalone verifying attester
+                       (Sepolia milestone 5; see wallet/DEPLOY.md)
 docs/                  figures used by the explainer
 ```
 

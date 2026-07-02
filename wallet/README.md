@@ -45,15 +45,24 @@ wallet.py         tree/indexer + note crypto + witness builder (Poseidon16)
 gen_smoke.py      generate real proofs for Alice's transfer and Bob's withdraw,
                   verify them off-chain, assert wallet roots == prover roots,
                   write smoke_fixture.json
-smoke.sh          the full end-to-end runner
+smoke.sh          the full end-to-end runner (in-process EVM)
+deploy_flow.sh    deploy + run the flow against a live node (anvil or Sepolia)
+attest.sh         standalone attester: verify-spend then sign (the trust shim)
+DEPLOY.md         Sepolia deployment steps
 smoke_fixture.json  committed, deterministic; drives contracts/test/SmokeE2E.t.sol
 ```
 
-## Live anvil (optional)
+## Live deployment (milestone 5)
 
-The in-process `forge test` already runs a full EVM. To drive a live node
-instead: start `anvil`, then a thin `cast`/web3 driver can deploy the four
-contracts, `shield` from a funded EOA, and submit the transfer/withdraw from
-`POOL_SENDER` using the same `smoke_fixture.json`. That driver is the natural
-first half of milestone 5 (Sepolia deployment), which swaps anvil for Sepolia
-and the in-test attester for a standalone signer.
+`deploy_flow.sh` deploys the four contracts and runs the whole flow against a
+live JSON-RPC node (default: a local anvil it launches) with the real proofs,
+signing each spend with a standalone attester (`attest.sh`) that verifies the
+proof off-chain before signing:
+
+```
+./deploy_flow.sh              # anvil dress rehearsal, writes deploy_config.json
+```
+
+For Sepolia, set `RPC_URL`, `DEPLOYER_PK`, `POOL_SENDER_PK`, `ATTESTER_PK` and
+run the same script. See [DEPLOY.md](DEPLOY.md). `attest.sh` is the standalone
+attester: `verify-spend` then `cast wallet sign`, replacing the in-test signer.
