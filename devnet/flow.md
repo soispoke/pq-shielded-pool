@@ -45,7 +45,7 @@ hash); the pool call carries `out_cm` and `ctx` as calldata.
 
 ```
 frame tx
-  sender     = <shared pool/relayer sender>   # see the privacy note in step 5
+  sender     = POOL_SENDER   # the pool's pinned sender; see step 4 and step 5
   nonce_keys = [ nf ]        # EIP-8250: the nullifier is a non-zero nonce key
   nonce_seq  = 0             # a fresh single-use key's sequence is 0
   recent_root_references = [ (source_id, slot, root) ]   # EIP-8272, tx-level
@@ -67,29 +67,41 @@ so `nonce_seq = 0` is the only includable value; payment approval advances it to
 - **EIP-8272 (protocol)**: the referenced `(source_id, slot, root)` must resolve
   to a root actually written for that source within the window. Stale or absent
   entries are rejected here.
-- **EIP-8250 (protocol)**: every non-zero nonce key must be unused. `nf` is a
-  non-zero key, so key-freshness is the spent-once check. If the frame is
-  included, `nf` is marked used at the payment-approval step, regardless of
-  whether any later frame reverts.
+- **EIP-8250 (protocol)**: every non-zero nonce key must be unused *for this
+  sender*. Key domains are per sender (`slot(sender, key)`), so freshness of
+  `(POOL_SENDER, nf)` is the spent-once check. If the frame is included, the
+  key is marked used at the payment-approval step, regardless of whether any
+  later frame reverts.
 - **The pool contract's VERIFY logic** must bind the proof to this exact
-  envelope, or a lifted proof could be replayed under a different key or sender.
+  envelope, or a valid proof could be replayed under a different key or sender.
   It MUST:
   1. verify the leanVM proof and recompute `claim` from `(root, nf, cm_B, 0)`,
      rejecting on mismatch;
-  2. read `(source_id, slot, root)` via `RECENTROOTREFLOAD` and require
-     `source_id` to be the pool's own root source and `slot` within the window
-     (binding the anchored root to *this* pool, per EIP-8272 Security
-     Considerations);
-  3. assert the consumed nonce key equals `nf` (`TXPARAM_NONCE_KEY_0 == nf`),
-     require `TXPARAM_NONCE_KEY_COUNT == 1`, and authenticate
-     `(sender, nonce_keys_hash, nonce_seq == 0)`, per EIP-8250 Security
-     Considerations (authenticating one key while others ride along is unsafe);
-  4. append `cm_B` to the tree and write the new root to EIP-8272.
+  2. require the transaction sender to equal `POOL_SENDER`. Because key
+     domains are per sender, this check is what makes the spent set global: a
+     frame from any other sender would consume a fresh `(other_sender, nf)`
+     slot and double-spend the note, and the protocol alone would accept it;
+  3. scan the recent-root references via `RECENTROOTREFLOAD`, require exactly
+     one with `source_id` equal to the pool's own root source, and require its
+     root to equal the claim's `root` (binding the anchored root to *this*
+     pool, per EIP-8272 Security Considerations);
+  4. assert the consumed nonce key equals `nf` (`TXPARAM_NONCE_KEY_0 == nf`),
+     require `TXPARAM_NONCE_KEY_COUNT == 1` and `nonce_seq == 0`, and reject
+     `nf == 0`, per EIP-8250 Security Considerations (authenticating one key
+     while others ride along is unsafe);
+  5. require exactly one of `out_cm`, `ctx` to be zero (a spend is a transfer
+     or a withdraw, never both: accepting both would mint);
+  6. append `cm_B` to the tree and write the new root to EIP-8272. If `cm_B`
+     is already a leaf, this is a no-op success, never a revert: `nf` was
+     consumed at payment approval and survives later-frame reverts, so a
+     revert here would burn the note, and `cm_B` is front-runnable from
+     mempool calldata.
 
-The claim binds `(root, nf, out_cm, ctx)`. The envelope bindings (sender, nonce
-key, root source) are enforced by the checks above, not carried by the claim, so
-eliding the `VERIFY`-frame proof from the signature hash is safe only once the
-contract performs them.
+The claim binds `(root, nf, out_cm, ctx)`. The envelope bindings (pinned
+sender, nonce key, root source, operation shape) are enforced by the checks
+above, not carried by the claim, so eliding the `VERIFY`-frame proof from the
+signature hash is safe only once the contract performs them. `pool/envelope.py`
+runs this checklist, and each check's attack, in plain Python.
 
 ## 5. After
 
@@ -97,13 +109,15 @@ The pool's state now contains: one consumed nullifier (`nf`), one new commitment
 (`cm_B`), one root write. It does not encode Alice's or Bob's in-pool identity,
 the amount (fixed and implicit), or any link between `cm_A` and `cm_B`.
 
-Two on-chain leaks are outside the circuit and must be handled by the wallet:
-the **transaction sender** and the **deposit funding address**. Sender
-unlinkability holds only when the frame is submitted from a shared pool/relayer
-sender (a personal EOA sender links the spend, and for a withdraw links its
-`ctx` recipient); this is the motivating use case for EIP-8250's keyed nonces
-(concurrent spends from one shared sender). The deposit's funder is on-chain and
-must be decorrelated by the wallet.
+Every spend is submitted from `POOL_SENDER`. That pin is first a soundness
+requirement (step 4, check 2), and it delivers sender unlinkability as a side
+effect: no personal address ever appears as the sender of a spend. It is also
+the motivating use case for EIP-8250's keyed nonces, since disjoint nullifier
+keys let one sender carry many users' concurrent spends. One on-chain leak
+remains outside the circuit: the **deposit funding address**, which the wallet
+must decorrelate. Wallets should also pick their `(slot, root)` reference by a
+fixed convention (the newest root at least k slots old); an unusual choice
+fingerprints the wallet.
 
 Privacy also equals the count of indistinguishable unspent notes at spend time.
 That set is dynamic and can be 1: a spend into a small or single-deposit pool is
@@ -117,8 +131,11 @@ paying one denomination out of the pool.
 
 ## What the devnet is testing
 
-That this whole path works using only base-protocol primitives: the proof is a
-normal frame, the nullifier is a normal keyed nonce, the root is a normal
-recent-root reference. The pool still supplies its own `VERIFY` logic (step 4)
-to bind them together. If it works, PQ privacy is an application on top of
-8141 / 8250 / 8272, not a special case the protocol has to know about.
+That this whole path works using base-protocol primitives plus exactly one
+devnet-supplied ingredient: the proof is a normal frame, the nullifier is a
+normal keyed nonce, the root is a normal recent-root reference, and the only
+thing the three EIPs do not provide is the leanVM proof verifier itself (see
+[README](README.md#what-the-devnet-must-add)). The pool still supplies its own
+`VERIFY` logic (step 4) to bind proof and envelope together. If it works, PQ
+privacy is an application on top of 8141 / 8250 / 8272, not a special case the
+protocol has to know about.

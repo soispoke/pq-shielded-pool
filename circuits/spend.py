@@ -45,19 +45,25 @@ The five soundness properties, each enforced here rather than assumed:
      spent set (one key per nullifier, the EIP-8250 keyed-nonce shape).
 
 The claim binds only `(root, nf, out_cm, ctx)`. It does NOT bind the transaction
-envelope, so end-to-end devnet soundness additionally requires the pool's
-on-chain VERIFY logic to (a) authenticate `(sender, nonce_keys_hash,
-nonce_seq == 0)` and require the consumed nonce key to equal `nf` with no extra
-keys (EIP-8250 Security Considerations), and (b) bind the referenced
-`(source_id, slot)` to the pool's own root source (EIP-8272 Security
-Considerations). Without those out-of-circuit checks a valid proof could be
-lifted into a frame that consumes a different key or references a foreign root.
-See `devnet/README.md`.
+envelope, so end-to-end devnet soundness additionally requires four bindings in
+the pool's on-chain VERIFY logic: (a) the sender equals the pool's single
+pinned POOL_SENDER (EIP-8250 key domains are per sender, so without the pin the
+same nf is a fresh key under every other sender and the note double-spends);
+(b) the consumed nonce key set is exactly [nf] at nonce_seq == 0 (EIP-8250
+Security Considerations); (c) exactly one recent-root reference carries the
+pool's own source_id and its root equals the claim's (EIP-8272 Security
+Considerations); (d) exactly one of out_cm, ctx is zero (the circuit accepts
+any pair; a contract accepting both nonzero would mint). Without those
+out-of-circuit checks a valid proof could be lifted into a different frame or
+replayed under a different sender. See `devnet/README.md` and
+`pool/envelope.py`, which runs each binding's attack.
 
 Residual trust surface (stated, not hidden): leanVM's hash-based security is
 ~124-bit classical / ~62-bit quantum today, so "post-quantum" is directional,
-not yet 128-bit; the circuit is not audited; and the devnet envelope bindings
-above are a required part of the trusted contract, not proven in-circuit.
+not yet 128-bit; the circuit is not audited; the devnet envelope bindings
+above are a required part of the trusted contract, not proven in-circuit; and
+the devnet must supply the proof verifier itself (none of EIP-8141/8250/8272
+provides one).
 """
 
 SPEND_PROGRAM = """

@@ -106,11 +106,36 @@ def main():
     except PoolError as e:
         print(f"6. Double-withdraw refused: {e}")
 
+    # 7. Duplicate-output front-run: Dana transfers to Carol, but Eve saw cm_C
+    #    in the mempool and shielded a copy first. The append is a no-op, not a
+    #    revert: on a devnet the nullifier is consumed at payment approval and
+    #    survives later-frame reverts (EIP-8250), so a revert here would let Eve
+    #    burn Dana's note; the no-op reaches the same end state with no revert
+    #    path. The attack stays negative-sum: Eve's own denomination is what
+    #    Carol ends up spending, and Dana's stays locked in the pool.
+    dana, carol = Wallet(pool, "Dana"), Wallet(pool, "Carol")
+    sk_d, rho_d, cm_d = dana.fresh_commitment()
+    idx_d = pool.shield(cm_d)
+    dana.remember(idx_d, sk_d, rho_d, cm_d)
+    sk_c, rho_c, cm_c = carol.fresh_commitment()
+    idx_eve = pool.shield(cm_c)                      # Eve front-runs with Carol's cm
+    carol.remember(idx_eve, sk_c, rho_c, cm_c)
+    spend = dana.build_spend(idx_d, out_cm=cm_c, ctx=note.ZERO)
+    leaves_before = len(pool.leaves)
+    assert pool.transfer(spend) is None and spend.nf in pool.nullifiers
+    assert len(pool.leaves) == leaves_before
+    pool.withdraw(carol.build_spend(idx_eve, out_cm=note.ZERO,
+                                    ctx=note._h(b"recipient:0xCAROL")))
+    print(f"\n7. Front-run duplicate output: append is a no-op, Carol spends Eve's")
+    print(f"   copy, Dana's denomination stays locked (balance = {pool.balance})")
+    assert pool.balance == 1
+
     print(f"\n{line}\nAll steps passed. In the pool's state the spend exposed a nullifier,")
     print("a new commitment (or a withdraw recipient), and a claim digest, never an")
-    print("amount (fixed) or which deposit it consumed. On a real devnet the tx sender")
-    print("and deposit funding address are still on-chain and must be decorrelated by a")
-    print("shared/relayer sender; privacy also requires a large enough anonymity set.")
+    print("amount (fixed) or which deposit it consumed. On a real devnet every spend")
+    print("is submitted from the pool's single pinned sender (a soundness requirement,")
+    print("see envelope.py, and also what decorrelates users); the deposit funding")
+    print("address is still on-chain, and privacy requires a large enough anonymity set.")
     print(line)
 
 

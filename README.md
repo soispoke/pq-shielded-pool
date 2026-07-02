@@ -22,8 +22,9 @@ them to each proof. See [devnet/](devnet/README.md).
   128-bit; and the circuit is unaudited.)
 - **Minimal**: fixed-denomination notes mean there is no value field, hence no
   in-circuit balance arithmetic and no range checks, the largest soundness
-  footgun in a 31-bit field, deleted by design. The contract is a Merkle tree,
-  a recent-roots ring, and a nullifier set. Nothing else.
+  footgun in a 31-bit field, deleted by design. The contract is a Merkle tree
+  plus a handful of envelope binding checks; the spent set and the recent-roots
+  window live in the protocol (EIP-8250 / EIP-8272).
 - **Immutable and permissionless**: no owner, no upgrade path, no allowlist, no
   freezing, no viewing keys, no compliance backdoor.
 
@@ -64,8 +65,11 @@ pool/
   note.py              note, commitment, nullifier, and the spend relation (matches
                        the circuit; SHA-256 stands in for Poseidon2 so it runs in Python)
   pool.py              the immutable contract: Merkle tree + recent-roots ring + nullifier set
-  demo.py              end-to-end: shield -> transfer -> withdraw, with double-spend
-                       and forged-root both refused
+  demo.py              end-to-end: shield -> transfer -> withdraw, with double-spend,
+                       forged-root, and duplicate-output front-run all handled
+  envelope.py          the devnet envelope: per-sender EIP-8250 keyed nonces, EIP-8272
+                       windowed roots, and the pool's pinned-sender VERIFY checklist,
+                       with the envelope-level attacks refused
 devnet/
   README.md            how the pool maps onto EIP-8141 / 8250 / 8272, and the test plan
   flow.md              one private transfer traced field-by-field through the stack
@@ -77,6 +81,10 @@ docs/                  figures used by the explainer
 ```
 # the whole protocol, in plain Python (self-checking):
 python3 pool/demo.py
+
+# the devnet envelope and its attacks (cross-sender double-spend, lifted
+# proof, foreign root, transfer+withdraw in one spend), all refused:
+python3 pool/envelope.py
 
 # check the circuit source matches the harness:
 python3 circuits/spend.py
@@ -99,24 +107,34 @@ directly into that aggregation pipeline.
 
 The five spend-circuit properties above are enforced in-circuit, and fixed
 denomination removes value arithmetic. End-to-end devnet soundness additionally
-requires the pool's on-chain `VERIFY` logic to (1) authenticate
-`(sender, nonce_keys_hash, nonce_seq == 0)` and bind the consumed nonce key to
-`nf` while rejecting extra keys (EIP-8250), and (2) bind the referenced
-`(source_id, slot)` to the pool's own root source (EIP-8272); without these a
-valid proof could be lifted into a different frame. See [devnet/](devnet/README.md).
+requires four bindings in the pool's on-chain `VERIFY` logic: (1) the sender
+equals the pool's single pinned `POOL_SENDER` (EIP-8250 key domains are per
+sender, so the pin is what makes the spent set global; any other sender could
+double-spend the note); (2) the consumed nonce key set is exactly `[nf]` at
+`nonce_seq = 0` (EIP-8250); (3) exactly one recent-root reference carries the
+pool's own `source_id` and its root equals the claim's (EIP-8272); (4) exactly
+one of `out_cm`, `ctx` is zero (both nonzero would mint). `pool/envelope.py`
+runs each binding's attack. Because the nonce key is consumed at payment
+approval and survives later-frame reverts, the pool's post-approval frame must
+be revert-free (a duplicate append is a no-op), or a note burns.
+See [devnet/](devnet/README.md).
 
 Stated residual trust surface: leanVM's current ~124-bit classical / ~62-bit
 quantum hash security (so "PQ" is directional, not yet 128-bit); the circuit and
-contract are unaudited; the two contract-side bindings above are trusted, not
-proven in-circuit; and this is a research prototype, not production software.
+contract are unaudited; the four contract-side bindings above are trusted, not
+proven in-circuit; the devnet must itself supply a leanVM proof verifier
+(precompile or native, none of the three EIPs provides one) and a funded
+payment path for `POOL_SENDER` (the fee story is an open problem, see
+devnet/); and this is a research prototype, not production software.
 
 Privacy limits: anonymity equals the number of indistinguishable unspent notes
 at spend time, a dynamic set that can be as small as 1 (a spend into a tiny pool
 is linkable), so wallets should wait for a sufficient set and avoid
-spend-soon-after-deposit timing. The circuit cannot hide the transaction sender
-or the deposit's funding address; both are on-chain and must be decorrelated by
-a shared/relayer sender. By design there is no compliance or viewing-key
-mechanism.
+spend-soon-after-deposit timing. Spends all come from the pinned `POOL_SENDER`,
+which is what decorrelates users on the sending side; the deposit's funding
+address is still on-chain and must be decorrelated by the wallet, and note
+commitments travel to recipients out of band (that channel should be PQ
+encrypted too). By design there is no compliance or viewing-key mechanism.
 
 ## License
 

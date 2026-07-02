@@ -79,16 +79,22 @@ existing EIPs. A private transfer is just a frame transaction:
 
 - the **nullifier** is used as an [EIP-8250](devnet/README.md) keyed nonce (spent
   at `nonce_seq = 0`), so the protocol's "each key used once" rule becomes the
-  pool's double-spend protection, once the pool's `VERIFY` logic binds the
-  consumed key to the proven nullifier;
+  pool's double-spend protection. Two bindings make that true: the pool's
+  `VERIFY` logic requires the consumed key to equal the proven nullifier, and
+  it requires every spend to come from the pool's one pinned sender, because
+  the protocol tracks keys per sender and the same nullifier would be fresh
+  under any other sender;
 - the **recent root** is an [EIP-8272](devnet/README.md) reference, so a proof
   built a few slots ago is still valid;
 - the **proof** rides in an EIP-8141 `VERIFY` frame and can be aggregated with
   other privacy proofs via [EIP-8288](https://github.com/soispoke/recursive-stark-mempool).
 
 So the devnet answers a real question: can a post-quantum privacy protocol be an
-ordinary application on top of 8141 / 8250 / 8272, with no special protocol
-support? If yes, privacy scales on the same rails as everything else.
+ordinary application on top of 8141 / 8250 / 8272? The three EIPs cover the
+envelope; the one thing the devnet has to add itself is a verifier for the
+proof (a precompile or native `VERIFY`-frame verification, since checking a
+STARK in plain contract code is not realistic). If it works, privacy scales on
+the same rails as everything else.
 
 ## Numbers
 
@@ -107,15 +113,21 @@ direction, not yet a 128-bit guarantee.
 Anonymity equals the number of indistinguishable unspent notes at spend time, a
 set that is dynamic and can be as small as 1: a spend into a tiny pool is
 linkable, so wallets should wait for a sufficient set and avoid
-spend-soon-after-deposit timing. The circuit also cannot hide the transaction
-sender or the deposit's funding address; both are on-chain and must be
-decorrelated by a shared/relayer sender (the classic Tornado deanonymization
-vectors). By design there is no compliance or viewing-key mechanism.
+spend-soon-after-deposit timing. Every spend is submitted from the pool's one
+pinned sender, which hides who is spending; the deposit's funding address is
+still on-chain and must be decorrelated by the wallet (the classic Tornado
+deanonymization vector). By design there is no compliance or viewing-key
+mechanism.
 
-Finally, the devnet mapping is not free: the pool's on-chain `VERIFY` logic must
-bind each proof to its nonce key, sender, and root source (see
-[devnet/README.md](devnet/README.md)), and those bindings are trusted contract
-code, not proven in-circuit.
+The devnet mapping is not free either. The pool's on-chain `VERIFY` logic must
+bind each proof to its pinned sender, nonce key, root source, and operation
+shape (see [devnet/README.md](devnet/README.md)), and those bindings are
+trusted contract code, not proven in-circuit; `pool/envelope.py` demonstrates
+each one's attack. The devnet must supply the proof verifier itself, and
+nobody yet pays the pinned sender's gas: the fee story is an open problem.
+Because the protocol consumes the nullifier at payment approval, anything that
+makes the pool's later frame revert would burn the spent note, so the contract
+keeps that frame revert-free (a duplicate append is a no-op).
 
 The reference pool uses SHA-256 as a stand-in so it runs in plain Python; the
 real proof uses Poseidon2, and only the circuit half is the actual security

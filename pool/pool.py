@@ -4,11 +4,15 @@ The whole contract is three pieces of state and three operations. Nothing else:
 no token, no governance, no admin key, no upgrade path, no compliance hook.
 
 State:
-  - an append-only Merkle tree of note commitments;
+  - an append-only Merkle tree of note commitments (plus a leaf set for
+    duplicate-commitment handling);
   - a ring buffer of recent roots (the EIP-8272 "recent roots" shape: a bounded
     window a proof may reference, so wallets need not chase the very latest root);
   - a set of spent nullifiers (the EIP-8250 keyed-nonce shape: one key per
-    nullifier, consumed exactly once).
+    nullifier, consumed exactly once). On the devnet this set is the protocol's
+    NONCE_MANAGER, whose key domains are per sender; it is a global spent set
+    only because every spend is submitted from the pool's single pinned
+    POOL_SENDER (see envelope.py).
 
 Operations:
   - shield(cm): deposit one denomination, append the commitment. No proof.
@@ -144,7 +148,15 @@ class Pool:
             raise PoolError("transfer must have zero context")
         self._consume(spend)
         if spend.out_cm in self.leaf_set:
-            raise PoolError("duplicate output commitment")
+            # A duplicate append is a no-op, not a revert. On the devnet the
+            # nullifier is consumed at payment approval, which persists through
+            # later-frame reverts (EIP-8250), and out_cm is visible in mempool
+            # calldata, so a revert here would let an attacker front-run
+            # shield(out_cm) to burn the spent note for nothing. The no-op has
+            # the same end state (nullifier consumed, nothing appended, the
+            # earlier copy stays spendable by whoever holds its secrets) with
+            # one fewer post-approval revert path.
+            return None
         idx = len(self.leaves)
         self.leaves.append(spend.out_cm)
         self.leaf_set.add(spend.out_cm)
