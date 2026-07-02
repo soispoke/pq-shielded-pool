@@ -1,3 +1,52 @@
+# Contracts — Sepolia milestones 1 and 3
+
+Milestone 1 was leanVM's hash on-chain (below). Milestone 3 adds the four
+contracts and ports `pool/envelope.py`'s attack battery to Foundry.
+
+## The contracts (milestone 3)
+
+```
+src/NonceManager.sol     EIP-8250 emulation: per-sender keyed-nonce domains
+                         (slot(sender, key) = keccak256(pad(sender) || key)),
+                         consume-fresh-at-0. The per-sender part is why the
+                         pool pins one sender.
+src/RecentRoots.sol      EIP-8272 emulation: (source_id, slot, root) entries,
+                         8191-slot window, block.number standing in for the
+                         consensus slot.
+src/AttestedVerifier.sol the trust shim: an attester signs (claim, proofHash);
+                         this checks the signature. It is exactly the boundary a
+                         real devnet's leanVM-verify precompile deletes. Anyone
+                         re-verifies a posted proof with prover/verify-spend.
+src/ShieldedPool.sol     the immutable pool: incremental Merkle tree over
+                         Poseidon16, shield/transfer/withdraw, and the four
+                         VERIFY bindings from devnet/README.md (pinned sender,
+                         key set, root reference, operation shape) plus the
+                         duplicate-append no-op.
+test/ShieldedPool.t.sol  the envelope.py battery on-chain (cross-sender
+                         double-spend, lifted/unattested proof, foreign and
+                         stale roots, transfer+withdraw mint, duplicate no-op,
+                         withdraw payout) + cross-stack fixtures: ctxFor,
+                         computeClaim, and the incremental tree root all checked
+                         against values the leanVM prover / Python reference
+                         produced (vectors/pool_fixtures.json).
+```
+
+`forge test` runs all of it (23 tests). The leanVM STARK is represented in these
+tests by the attester signature; what is tested is the pool's binding logic,
+not the proof. The real proof is checked end to end by
+[`../prover/`](../prover/) (milestone 2) and wired in at milestone 4.
+
+To regenerate `vectors/pool_fixtures.json` (after any hash or encoding change):
+
+```
+cd ../prover && cargo build --release --bin prove-spend
+./target/release/prove-spend --demo 20 --recipient 0x00000000000000000000000000000000cafebabe \
+    --out /tmp/wd_pub.json --proof-out /tmp/wd_proof.json
+python3 ../contracts/reference/gen_pool_fixtures.py   # reads /tmp/wd_pub.json
+```
+
+---
+
 # Contracts — Sepolia milestone 1: the hash, on-chain
 
 First milestone of the Sepolia path: leanVM's hash reimplemented in Solidity

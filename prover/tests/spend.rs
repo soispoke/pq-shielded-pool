@@ -76,6 +76,20 @@ fn prove_verify_and_tamper_reject() {
     }
 }
 
+/// The withdraw ctx encoding must match ShieldedPool.ctxFor: the 160-bit
+/// address as 8 big-endian 20-bit chunks. (Regression guard: an earlier u128
+/// version wrapped the shift for the top chunks.)
+#[test]
+fn ctx_for_recipient_encoding() {
+    let mut addr = [0u8; 20];
+    addr[16..].copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
+    let ctx = ctx_for_recipient(&addr);
+    assert_eq!(ctx, [0, 0, 0, 0, 0, 0, 0xcaf, 0xebabe]);
+    // a full-width address exercises every chunk
+    let addr2 = [0xffu8; 20];
+    assert!(ctx_for_recipient(&addr2).iter().all(|&w| w == 0xfffff));
+}
+
 /// The verify-spend path: a proof survives JSON serialization and a fresh
 /// deserialization still verifies (and still rejects a tampered claim).
 #[test]

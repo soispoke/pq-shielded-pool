@@ -18,7 +18,16 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let witness: SpendWitness = if let Some(depth) = arg(&args, "--demo") {
         let depth: usize = depth.parse().expect("--demo takes a tree depth");
-        demo_witness(depth, args.iter().any(|a| a == "--withdraw"), 42)
+        let withdraw = args.iter().any(|a| a == "--withdraw") || arg(&args, "--recipient").is_some();
+        let mut w = demo_witness(depth, withdraw, 42);
+        if let Some(addr) = arg(&args, "--recipient") {
+            let hex = addr.strip_prefix("0x").unwrap_or(&addr);
+            let bytes: Vec<u8> = (0..20)
+                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("bad address"))
+                .collect();
+            w.ctx = ctx_for_recipient(bytes.as_slice().try_into().unwrap());
+        }
+        w
     } else if let Some(path) = arg(&args, "--in") {
         serde_json::from_str(&std::fs::read_to_string(&path).expect("cannot read witness file"))
             .expect("witness JSON does not match the SpendWitness schema")

@@ -81,7 +81,12 @@ prover/
 contracts/
   src/Poseidon16.sol   leanVM's hash (classic Poseidon over KoalaBear) in Solidity,
                        differentially tested against vectors exported from leanVM
-                       itself (Sepolia milestone 1; see contracts/README.md)
+                       itself (Sepolia milestone 1)
+  src/*.sol            ShieldedPool + NonceManager (EIP-8250) + RecentRoots
+                       (EIP-8272) + AttestedVerifier shim; Foundry tests port
+                       pool/envelope.py's attack battery on-chain and check
+                       ctxFor/computeClaim/tree-root against the prover
+                       (Sepolia milestone 3; see contracts/README.md)
 docs/                  figures used by the explainer
 ```
 

@@ -87,6 +87,27 @@ pub fn from_u32(d: &[u32; 8]) -> Result<Digest, String> {
     Ok(core::array::from_fn(|i| F::new(d[i])))
 }
 
+/// The withdraw context digest for a recipient address: the 160-bit address
+/// split into 8 big-endian 20-bit chunks, one per field element (each < 2^31).
+/// Must match ShieldedPool.ctxFor in contracts/src/ShieldedPool.sol.
+pub fn ctx_for_recipient(addr: &[u8; 20]) -> [u32; 8] {
+    // 160 big-endian bits, then 8 chunks of 20 bits, most-significant first.
+    // (Done bitwise rather than via a 160-bit integer, which does not fit u128.)
+    let mut bits = [0u8; 160];
+    for (i, &b) in addr.iter().enumerate() {
+        for j in 0..8 {
+            bits[i * 8 + j] = (b >> (7 - j)) & 1;
+        }
+    }
+    core::array::from_fn(|c| {
+        let mut v = 0u32;
+        for k in 0..20 {
+            v = (v << 1) | bits[c * 20 + k] as u32;
+        }
+        v
+    })
+}
+
 /// Canonical 32-byte encoding: 8 big-endian 32-bit words, "0x"-prefixed hex.
 pub fn pack_hex(d: &[u32; 8]) -> String {
     let mut s = String::with_capacity(66);
