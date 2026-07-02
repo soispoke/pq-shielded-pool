@@ -87,6 +87,12 @@ contracts/
                        pool/envelope.py's attack battery on-chain and check
                        ctxFor/computeClaim/tree-root against the prover
                        (Sepolia milestone 3; see contracts/README.md)
+wallet/
+  wallet.py            tree/indexer + witness builder (reconstructs the tree
+                       from LeafAppended events, builds real auth paths)
+  gen_smoke.py         real proofs for a transfer + withdraw, verified off-chain
+  smoke.sh             end-to-end: real STARK -> off-chain verify -> on-chain
+                       shield/transfer/withdraw (Sepolia milestone 4; see wallet/README.md)
 docs/                  figures used by the explainer
 ```
 

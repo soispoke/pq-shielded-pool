@@ -39,6 +39,7 @@ contract ShieldedPool {
     bytes32[DEPTH] public filledSubtrees;
     uint32 public nextIndex;
     bytes32 public currentRoot;
+    uint64 public lastRootSlot; // the slot currentRoot was published at (EIP-8272)
     mapping(bytes32 => bool) public isLeaf;
 
     event LeafAppended(bytes32 indexed cm, uint32 index, bytes32 newRoot, uint64 slot);
@@ -192,6 +193,7 @@ contract ShieldedPool {
     }
 
     function _publishRoot() internal {
+        lastRootSlot = uint64(block.number);
         roots.write(SALT, currentRoot);
     }
 }
