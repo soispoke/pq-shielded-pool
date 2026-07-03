@@ -34,7 +34,7 @@ new opcodes:
   Scope `0x0` (execution) and `0x2` (both) require `frame_target == sender`;
   scope `0x1` (payment) does **not** — it only needs execution already
   approved. So a paymaster contract that is a frame's target can approve
-  payment for a sender that is not itself. This is the on-chain hook the
+  payment for a sender that is not itself. This is the onchain hook the
   trustless-paymaster fee design needs.
 - `TXPARAMLOAD/SIZE/COPY` (0xB0/0xB1/0xB2): read transaction parameters by
   selector. Implemented selectors: tx_type(0x00), nonce(0x01), sender(0x02),
@@ -44,7 +44,7 @@ new opcodes:
 
 ## Two gaps that block a fully-faithful binding
 
-The pool's design (see `../README.md`) needs its on-chain VERIFY
+The pool's design (see `../README.md`) needs its onchain VERIFY
 logic to bind each proof to the transaction envelope. On this devnet, two of
 those bindings cannot be done in-EVM today:
 
@@ -75,7 +75,7 @@ edges of an early multi-EIP testnet, and they line up exactly with the
 already states. They are the concrete work items to make the envelope bindings
 enforceable rather than trusted.
 
-## Live-run findings (2026-07-03), with on-chain evidence
+## Live-run findings (2026-07-03), with onchain evidence
 
 Attempting the real run surfaced five concrete devnet facts, each demonstrated
 against the live network. Finding 4 corrects a wrong conclusion reached
@@ -168,7 +168,7 @@ be chunked.
 ## The integration: pool as a frame-native application
 
 Because the pool's proof is a Groth16 SNARK and a devnet SENDER frame
-executes real EVM, the proof is verified **on-chain via the pairing precompiles inside the pool
+executes real EVM, the proof is verified **onchain via the pairing precompiles inside the pool
 call**. No attester, no missing verifier: the whole spend, proof check
 included, is an ordinary application frame. That is the end-to-end story the
 three EIPs were supposed to enable, and here it needs no extra trusted party.
@@ -214,6 +214,53 @@ protocol. It is expected to be rejected by the public RPC (mempool admits only
 document the intended faithful mapping and to test it the moment a builder
 endpoint is available.
 
+### Proof placement and FOCIL eligibility
+
+Two spend shapes matter here, and they sit on opposite sides of EIP-8141's
+100k mempool cap.
+
+**Today's shape: proof in the SENDER frame.** The Groth16 verify (~188k) plus
+the claim recompute (4 hash3 calls, ~450k) cannot fit the 100k VERIFY prefix
+budget, so this build checks the proof in the execution frame. That placement
+is sound for this build because the spent set is contract state consumed in
+the same frame: an invalid proof reverts the whole pool call and consumes
+nothing. The transaction is trivially Profile 2 eligible under the FOCIL
+eligibility draft (the prefix is an 80k self-verify reading only sender
+state), so FOCIL can enforce inclusion of the envelope. What the envelope
+cannot express in this shape is spend validity: an included-but-reverting
+spend satisfies the inclusion guarantee, and a paymaster cannot condition
+payment on the proof.
+
+**The faithful shape: proof in the VERIFY prefix.** Once the nullifiers become
+EIP-8250 keys consumed at payment approval, the proof must be checked before
+APPROVE: key consumption survives later-frame reverts, so an execution-frame
+proof check would let an invalid spend burn its nullifiers. That prefix costs
+roughly 0.7M gas, over the 100k public-mempool cap but under the FOCIL
+eligibility draft's `MAX_VERIFY_GAS_PER_TX = 2^20` (~1.05M). This is exactly
+the draft's separation: public mempool admission and FOCIL eligibility are
+different policies, and this transaction reaches includers through a custom
+mempool or direct submission. One such spend consumes most of an IL's verify
+budget.
+
+**Enforcement is the index-based check.** FOCIL's stock omission rule
+(end-of-block nonce and balance) cannot express keyed-nonce validity. The
+mechanism that fits is the builder-claimed-index approach from the
+FOCIL-native-AA thread: the builder names the block index where insertion was
+attempted, attesters reconstruct state at that index (EIP-7928 BAL) and replay
+the validation prefix, and "another transaction consumed this key first"
+becomes a verifiable omission justification.
+
+**The VOPS surface is the remaining constraint.** Profile 2 bounds prefix
+state reads to protocol validation state plus the first `AA_VOPS_SLOT_COUNT`
+storage slots of `sender` and `payer`. The pool's own NonceManager and
+RecentRoots keep their state behind mappings, at keccak-derived slots outside
+that surface, so moving today's contract-side checks into the prefix would not
+be eligible. The faithful mapping is what fixes this: keyed nonces and
+recent-root references are protocol validation state, inside the surface by
+definition, read from the envelope via the TXPARAM selectors of gaps 1 and 2.
+Those selectors are therefore not only what turns the trusted bindings into
+proven ones; they are what makes the spend FOCIL-enforceable.
+
 ## The live run (2026-07-03)
 
 The full flow ran end to end on the public network, deployed from genesis
@@ -234,9 +281,9 @@ so the Sepolia-sized 3M frame would not have been safe):
 
 - **shield** 1 ETH: tx `0xd0277767…65786b`, block 19388, status 1, 1,502,420
   gas. The `LeafAppended` root equals the fixture's transfer root, so the
-  split on-chain Poseidon matches circomlibjs exactly, and RecentRoots
+  split onchain Poseidon matches circomlibjs exactly, and RecentRoots
   recorded it at slot 19388.
-- **transfer** (join-split, Groth16 verified on-chain in the SENDER frame):
+- **transfer** (join-split, Groth16 verified onchain in the SENDER frame):
   tx `0xd329f3fd…52a8cc`, block 19394, status 1, 2,871,428 gas. The two
   output notes' final root equals the fixture's withdraw root, recorded at
   slot 19394.
@@ -255,7 +302,7 @@ the deploy driver, `frame_deploy.py` the deploy-frame probe used for finding
 The devnet implements the three EIPs cleanly and the pool ran on it end to
 end as a genuine frame-native application: shield, join-split transfer, and
 withdraw all mined as type-0x06 frame transactions with the Groth16 proof
-verified **on-chain inside the SENDER frame, no attester**, the milestone the
+verified **onchain inside the SENDER frame, no attester**, the milestone the
 whole prototype was aiming at. Two capability gaps (no `nonce_keys` /
 `recent_root_references` TXPARAM exposure) keep two of the four envelope
 bindings trusted contract state rather than proven envelope properties, and
