@@ -9,5 +9,20 @@ optimizer_runs = 200
 via_ir = true
 fs_permissions = [
     { access = "read", path = "./vectors" },
+    { access = "read", path = "../vectors" },
     { access = "read", path = "../wallet" },
 ]
+
+# Legacy-codegen profile for the split Poseidon libraries (PoseidonT3/T4):
+# via-IR emits ~3KB of dispatch glue per library, which pushes PoseidonT4 past
+# the hegota devnet's 2^24 per-tx gas cap (EIP-8037 code deposit is ~1,545
+# gas per runtime byte there). run_live.sh deploys the two halves with
+# FOUNDRY_PROFILE=libsmall; everything else keeps the default via-IR profile.
+[profile.libsmall]
+src = "src"
+out = "out-libsmall"
+libs = []
+solc_version = "0.8.30"
+optimizer = true
+optimizer_runs = 1
+via_ir = false

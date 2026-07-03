@@ -1,15 +1,26 @@
-PQ shielded pool — minimal post-quantum privacy protocol prototype
+Minimal shielded pool — a minimal Tornado-style privacy protocol prototype (BN254 / Groth16)
 
-The reference protocol model (pool/*.py) and the zkDSL spend circuit
-(circuits/spend.py) are original work, licensed under Apache-2.0 (see LICENSE).
+Original sources (the spend circuit, the Python reference and generators, the
+pool contract, the wallet, and the devnet tooling) are licensed under
+Apache-2.0 (see LICENSE).
 
-circuits/pool_circuits.patch adds one test function and an embedded zkDSL
-program constant (POOL_SPEND_PROGRAM) to crates/lean_prover/src/test_zkvm.rs of:
+This project builds on:
 
-  leanEthereum/leanVM  (https://github.com/leanEthereum/leanVM)
-  commit 12e61512416548e743040aab4daf83c58a5c5476
-  licensed under Apache-2.0
+  iden3/circomlib 2.0.5 and iden3/circomlibjs 0.1.7 (GPL-3.0): the spend
+  circuit includes circomlib's poseidon.circom at compile time (fetched via
+  npm, not vendored), and reference/poseidon_bn254_constants.json plus
+  vectors/poseidon_bn254_vectors.json are exported from circomlibjs by
+  tooling/export_vectors.js. contracts/src/PoseidonBN254.sol and the split
+  PoseidonT3.sol / PoseidonT4.sol are generated from those constants.
 
-Apply it against the pinned commit as described in circuits/README.md. All
-modifications are marked by the patch itself (added lines only). No upstream
-leanVM source is vendored in this repository.
+  iden3/snarkjs 0.7.5 (GPL-3.0): contracts/src/Groth16Verifier.sol is generated
+  by snarkjs's `zkey export solidityverifier` and carries its GPL-3.0 header;
+  it is the standard snarkjs verifier template instantiated with this circuit's
+  verification key.
+
+devnet/frametx.py is vendored from lambdaclass/ethrex
+(scripts/hegota-devnet/frametx.py, hegota-devnet branch), the reference
+type-0x06 frame-transaction encoder for the Hegotá devnet, with a one-line
+type-annotation widening for Python 3.9. ethrex is Apache-2.0 / MIT
+dual-licensed. devnet/pool_frametx.py and REVIEW.md are original Apache-2.0
+work.

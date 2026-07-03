@@ -1,26 +1,25 @@
-"""Wallet and indexer for the PQ shielded pool.
+"""Wallet and indexer for the BN254 join-split shielded pool.
 
-Reconstructs the note-commitment tree from the pool's `LeafAppended` events
-(here: an ordered list of leaves), computes real Merkle authentication paths
-that match `ShieldedPool._append`, and builds the spend witnesses the prover
-(`prover/`) consumes. The hash is leanVM's Poseidon16, imported from the same
-reference the contracts and circuit are checked against, so the root a wallet
-computes for a leaf set equals the root the pool publishes for it.
+Value-carrying notes: cm = Poseidon(TAG_LEAF, inner, value) with
+inner = Poseidon2(owner_pk, rho). A recipient reveals only `inner` (never the
+secrets); the payer chooses the value, and `shield` hashes msg.value into the
+commitment on-chain, so a deposit's value is what was actually deposited.
 
-Digest convention throughout: a digest is 8 KoalaBear field elements (a list of
-8 ints < p). `hex32` gives the canonical 32-byte encoding used on-chain.
+A spend consumes two inputs (a zero-value dummy stands in when only one real
+note is spent) and creates two outputs. `build_witness` returns the circom
+input map that ../tooling proves with snarkjs against build/spend_final.zkey.
 """
 import random
 import secrets
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "contracts" / "reference"))
-from poseidon16 import compress_pair, tagged, P  # noqa: E402
+sys.path.insert(0, str(Path(__file__).parent.parent / "reference"))
+from poseidon_bn254 import P, p2, p3, tagged, hex32  # noqa: E402
 
 DEPTH = 20
-ZERO8 = [0] * 8
 TAG_PK, TAG_LEAF, TAG_NULL = 1, 2, 3
+MAX_VALUE = 1 << 128
 
 _RNG = None  # None = cryptographic secrets; set_seed makes note generation reproducible
 
@@ -31,29 +30,26 @@ def set_seed(seed):
     _RNG = random.Random(seed)
 
 
-def rand_digest():
-    """A uniformly random valid digest (8 field elements)."""
+def rand_fe():
+    """A uniformly random field element."""
     if _RNG is None:
-        return [secrets.randbelow(P) for _ in range(8)]
-    return [_RNG.randrange(P) for _ in range(8)]
+        return secrets.randbelow(P)
+    return _RNG.randrange(P)
 
 
-def hex32(d):
-    return "0x" + "".join(f"{w:08x}" for w in d)
-
-
-def hashpair(l, r):
-    return compress_pair(l, r)
-
-
-# ---- note cryptography (mirrors circuits/spend.py and pool/note.py) ----
+# ---- note cryptography (mirrors ../circuits/spend.circom) ----
 
 def owner_pk(spend_key):
-    return tagged(TAG_PK, spend_key, ZERO8)
+    return tagged(TAG_PK, spend_key, 0)
 
 
-def commitment(spend_key, rho):
-    return tagged(TAG_LEAF, owner_pk(spend_key), rho)
+def inner(spend_key, rho):
+    """What a recipient reveals to be paid: hides owner_pk and rho."""
+    return p2(owner_pk(spend_key), rho)
+
+
+def commitment(spend_key, rho, value):
+    return tagged(TAG_LEAF, inner(spend_key, rho), value)
 
 
 def nullifier(spend_key, cm):
@@ -62,29 +58,32 @@ def nullifier(spend_key, cm):
 
 def new_note():
     """Fresh (spend_key, rho); the wallet keeps both secret."""
-    return rand_digest(), rand_digest()
+    return rand_fe(), rand_fe()
+
+
+def dummy_input():
+    """A zero-value dummy input: fabricated secrets, never in the tree. Its
+    nullifier derives from its own fabricated cm, so it cannot collide with a
+    real note's, and it contributes zero to conservation."""
+    sk, rho = new_note()
+    return {"sk": sk, "rho": rho, "value": 0, "idx": None}
 
 
 # ---- the tree / indexer ----
 
 class Tree:
-    """Full zero-padded Merkle tree of note commitments, matching the pool.
-
-    Built from the ordered leaf list an indexer reads off `LeafAppended`
-    events. `root()` equals `ShieldedPool.currentRoot()` for the same leaves,
-    and `auth_path(idx)` gives the (siblings, bits) the circuit expects
-    (bit = idx&1 at each level; bit 0 means the node is the left child).
-    """
+    """Full zero-padded Merkle tree of note commitments, matching the pool."""
 
     def __init__(self, depth=DEPTH):
         self.depth = depth
         self.leaves = []
-        self.zeros = [ZERO8]
+        self.zeros = [0]
         for _ in range(depth):
-            self.zeros.append(hashpair(self.zeros[-1], self.zeros[-1]))
+            self.zeros.append(p2(self.zeros[-1], self.zeros[-1]))
 
     def append(self, cm):
         idx = len(self.leaves)
+        assert idx < (1 << self.depth), "tree full"
         self.leaves.append(cm)
         return idx
 
@@ -96,7 +95,7 @@ class Tree:
             for i in range(0, len(level), 2):
                 left = level[i]
                 right = level[i + 1] if i + 1 < len(level) else self.zeros[d]
-                nxt.append(hashpair(left, right))
+                nxt.append(p2(left, right))
             level = nxt
             levels.append(level)
         return levels
@@ -119,70 +118,86 @@ class Tree:
 
 # ---- witness building ----
 
-def _ctx_for_recipient(addr_hex):
-    """160-bit address as 8 big-endian 20-bit chunks (matches ShieldedPool.ctxFor
-    and prover ctx_for_recipient)."""
+def ctx_for_recipient(addr_hex):
+    """The recipient address as one field element (matches ShieldedPool.ctxFor)."""
     h = addr_hex[2:] if addr_hex.startswith("0x") else addr_hex
-    val = int(h, 16)
-    bits = [(val >> (159 - i)) & 1 for i in range(160)]
-    return [sum(bits[c * 20 + k] << (19 - k) for k in range(20)) for c in range(8)]
+    return int(h, 16)
 
 
-def build_witness(tree, idx, spend_key, rho, out_cm=None, recipient=None):
-    """A spend witness against the current tree.
+def build_witness(tree, inputs, outputs, public_amount=0, fee=0, recipient=None):
+    """A join-split witness against the current tree, as the circom input map.
 
-    Transfer: pass out_cm (the recipient's fresh commitment), no recipient.
-    Withdraw: pass recipient (a 0x address); out_cm defaults to zero.
+    inputs: exactly two dicts {sk, rho, value, idx} (idx None for a dummy,
+            which must have value 0). Use dummy_input() to pad.
+    outputs: exactly two (inner, value) pairs.
+    Values must conserve: sum(in) == sum(out) + public_amount + fee.
     """
-    if (out_cm is None) == (recipient is None):
-        raise ValueError("pass exactly one of out_cm (transfer) or recipient (withdraw)")
-    siblings, bits = tree.auth_path(idx)
-    if recipient is not None:
-        out_cm, ctx = ZERO8, _ctx_for_recipient(recipient)
-    else:
-        ctx = ZERO8
+    assert len(inputs) == 2 and len(outputs) == 2
+    assert all(i["idx"] is not None or i["value"] == 0 for i in inputs), \
+        "a dummy input must have value 0"
+    total_in = sum(i["value"] for i in inputs)
+    total_out = sum(v for _, v in outputs) + public_amount + fee
+    assert total_in == total_out, f"not conserved: {total_in} != {total_out}"
+    assert all(0 <= v < MAX_VALUE for v in
+               [public_amount, fee] + [i["value"] for i in inputs] + [v for _, v in outputs])
+
+    ctx = ctx_for_recipient(recipient) if recipient is not None else 0
+    sibs, bits = [], []
+    for i in inputs:
+        if i["idx"] is None:
+            sibs.append([0] * tree.depth)
+            bits.append([0] * tree.depth)
+        else:
+            s, b = tree.auth_path(i["idx"])
+            sibs.append(s)
+            bits.append(b)
     return {
-        "spend_key": spend_key,
-        "rho": rho,
-        "siblings": siblings,
-        "bits": bits,
-        "out_cm": out_cm,
-        "ctx": ctx,
+        "root": str(tree.root()),
+        "in_spend_key": [str(i["sk"]) for i in inputs],
+        "in_rho": [str(i["rho"]) for i in inputs],
+        "in_value": [str(i["value"]) for i in inputs],
+        "in_siblings": [[str(x) for x in s] for s in sibs],
+        "in_bits": [[str(x) for x in b] for b in bits],
+        "out_inner": [str(inn) for inn, _ in outputs],
+        "out_value": [str(v) for _, v in outputs],
+        "public_amount": str(public_amount),
+        "fee": str(fee),
+        "ctx": str(ctx),
     }
 
 
-def spend_nullifier(spend_key, rho):
-    return nullifier(spend_key, commitment(spend_key, rho))
+def input_nullifiers(inputs):
+    """The two nullifiers a witness's inputs expose, in order."""
+    return [nullifier(i["sk"], commitment(i["sk"], i["rho"], i["value"])) for i in inputs]
+
+
+def output_commitments(outputs):
+    return [tagged(TAG_LEAF, inn, v) for inn, v in outputs]
 
 
 def _selfcheck():
-    """The wallet tree must agree with the pool's incremental-tree fixture."""
+    """The wallet tree must agree with the exported incremental-tree fixture,
+    and a value note's auth path must reproduce the root."""
     import json
-    fx = json.loads((Path(__file__).parent.parent / "contracts" / "vectors"
-                     / "pool_fixtures.json").read_text())["tree"]
+    fx = json.loads((Path(__file__).parent.parent / "vectors"
+                     / "poseidon_bn254_vectors.json").read_text())["tree"]
     t = Tree()
-    assert hex32(t.root()) == fx["root_empty"], "empty root mismatch"
+    assert t.root() == int(fx["root_empty"]), "empty root mismatch"
+    t.append(int(fx["cm0"]))
+    assert t.root() == int(fx["root_after_cm0"]), "root after cm0 mismatch"
+    t.append(int(fx["cm1"]))
+    assert t.root() == int(fx["root_after_cm0_cm1"]), "root after cm0,cm1 mismatch"
 
-    def unhex(h):
-        b = bytes.fromhex(h[2:])
-        return [int.from_bytes(b[i:i + 4], "big") for i in range(0, 32, 4)]
-
-    t.append(unhex(fx["cm0"]))
-    assert hex32(t.root()) == fx["root_after_cm0"], "root after cm0 mismatch"
-    t.append(unhex(fx["cm1"]))
-    assert hex32(t.root()) == fx["root_after_cm0_cm1"], "root after cm0,cm1 mismatch"
-
-    # a spent note's nullifier and a rebuilt path reproduce the committed leaf
     sk, rho = new_note()
-    cm = commitment(sk, rho)
+    cm = commitment(sk, rho, 10**18)
     t2 = Tree()
     i = t2.append(cm)
     sibs, bits = t2.auth_path(i)
     node = cm
     for b, s in zip(bits, sibs):
-        node = hashpair(node, s) if b == 0 else hashpair(s, node)
+        node = p2(node, s) if b == 0 else p2(s, node)
     assert node == t2.root(), "auth path does not reproduce the root"
-    print("wallet.py OK: tree matches the pool fixture; auth paths verify")
+    print("wallet.py OK: tree matches the exported fixture; value-note paths verify")
 
 
 if __name__ == "__main__":

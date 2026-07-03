@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# End-to-end smoke: real leanVM proofs through the whole stack.
+# End-to-end smoke: real Groth16 proofs through the whole BN254 stack.
 #
-#   1. build the prover
+#   1. compile the circuit + run the (testbed) trusted setup if not done
 #   2. generate fresh witnesses from the reconstructed tree, prove them
-#      (real STARKs), verify each off-chain, and write wallet/smoke_fixture.json
+#      (real Groth16), verify each off-chain, write wallet/smoke_fixture.json
 #   3. run the on-chain flow (shield -> transfer -> withdraw) in an in-process
-#      EVM via forge, consuming those real claims through the attester shim
-#
-# Pass --anvil to run step 3 against a live anvil node instead (see below).
+#      EVM via forge, verifying those real proofs ON-CHAIN (no attester)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "==> building prover"
-( cd ../prover && cargo build --release --bin prove-spend --bin verify-spend )
+if [ ! -f ../build/spend_final.zkey ]; then
+  echo "==> no zkey; compiling circuit + running testbed setup"
+  ( cd ../tooling && ./setup.sh )
+fi
 
 echo "==> generating real proofs and fixture (${1:-deterministic})"
 if [ "${1:-}" = "--random" ]; then
@@ -22,7 +22,7 @@ else
 fi
 
 echo "==> running the on-chain flow (forge, in-process EVM)"
-( cd ../contracts && forge test --match-contract SmokeE2E -vv )
+( cd ../contracts && forge test -vv )
 
-echo "==> smoke passed: a real leanVM proof was produced, verified off-chain,"
-echo "    and accepted on-chain for shield -> transfer -> withdraw."
+echo "==> smoke passed: real Groth16 proofs produced, verified off-chain,"
+echo "    and verified ON-CHAIN for shield -> transfer -> withdraw."

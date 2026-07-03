@@ -1,168 +1,156 @@
-# PQ shielded pool
+# Minimal shielded pool
 
-A minimal, post-quantum privacy pool for Ethereum. Fixed
-denomination, no token, no governance, no admin key, no compliance hooks: an
-immutable contract with exactly three operations (shield, transfer, withdraw)
-and a leanVM STARK that proves ownership without revealing it.
+A minimal, immutable, Tornado-style privacy pool for Ethereum: three operations
+(shield, transfer, withdraw), no token, no governance, no admin key, no
+compliance hooks. Notes carry an arbitrary value, a spend is a 2-in/2-out
+join-split, and the proof is a Groth16 SNARK (circom + snarkjs) verified
+**on-chain** through the BN254 pairing precompiles, so there is no attester and
+nobody to compromise. It has run end to end on lambdaclass/ethrex's Hegotá
+devnet as a frame-native application, the full shield -> transfer -> withdraw
+flow mined live with the proof checked inside the SENDER frame (see
+[devnet/REVIEW.md](devnet/REVIEW.md)).
 
-Built to run in an EIP-8141 / EIP-8250 / EIP-8272 devnet, so a user's private
-transaction is an ordinary frame transaction: the base protocol supplies the
-spent-once keys and recent-roots ring, and the pool's own `VERIFY` logic binds
-them to each proof. See [devnet/](devnet/README.md).
+Built to answer two envelope questions a fixed-denomination design cannot reach:
 
-**New here? Start with [EXPLAINER.md](EXPLAINER.md).**
+1. **EIP-8250 multi-key nonces, exercised for real.** A join-split spend
+   consumes two input notes, so it exposes two nullifiers, and they are
+   consumed as ONE keyed-nonce set (`consumeFreshMany`): shared
+   `nonce_seq = 0`, atomic all-or-nothing, bounded by `MAX_NONCE_KEYS = 16`,
+   per-sender domains. The battery's star witness is a REAL, circuit-valid
+   proof that spends one note through both inputs (`nf1 == nf2`, conservation
+   satisfied at twice the value); nothing in the proof layer refuses it, and
+   the duplicate-key rule of the set consumption is what stands between it
+   and a double-count. It reverts there, consuming nothing.
+2. **The trustless-paymaster fee loop.** Every spend binds a `fee` inside the
+   claim, and the contract pays it to `msg.sender` from shielded value. The
+   fixed-denomination design foreclosed this ("no value field, no fee
+   skimming"); here the pinned sender is reimbursed by the very spends it
+   submits, which is the Sepolia-testable half of an EIP-8141 trustless
+   paymaster (see [devnet/REVIEW.md](devnet/REVIEW.md)).
 
-## What it is
+The trade's cost, against a fixed-denomination post-quantum design: pairing-based
+(not post-quantum) cryptography and a circuit-specific trusted setup.
 
-- **Post-quantum**: the only cryptography is hashing (leanVM's Poseidon16,
-  classic Poseidon over KoalaBear). No elliptic curves anywhere. Ownership is
-  knowledge of a hash preimage, membership is a Merkle proof, and the whole
-  spend is one leanVM STARK, all quantum-resistant. (Honest caveat: leanVM's hash security is
-  ~124-bit classical / ~62-bit quantum today, so "PQ" is directional, not yet
-  128-bit; and the circuit is unaudited.)
-- **Minimal**: fixed-denomination notes mean there is no value field, hence no
-  in-circuit balance arithmetic and no range checks, the largest soundness
-  footgun in a 31-bit field, deleted by design. The contract is a Merkle tree
-  plus a handful of envelope binding checks; the spent set and the recent-roots
-  window live in the protocol (EIP-8250 / EIP-8272).
-- **Immutable and permissionless**: no owner, no upgrade path
+## The join-split design
 
-## What a spend proves
+Notes carry a 128-bit value: `cm = Poseidon(TAG_LEAF, inner, value)` with
+`inner = Poseidon2(owner_pk, rho)`. A recipient reveals only `inner`; the
+payer chooses the value. `shield` hashes `msg.value` into the commitment
+ON-CHAIN, so a deposit's value is what was actually deposited. A spend takes
+two inputs and makes two outputs (payment + change), proving in-circuit:
 
-Hiding the spend key, the note secret, and the Merkle path, the circuit proves:
+- membership of each nonzero-value input at the anchored root (a zero-value
+  input is a dummy, for spending a single note through the 2-input circuit:
+  it contributes nothing to conservation, and its nullifier derives from its
+  own fabricated commitment, so it can never collide with a real note's);
+- value conservation `v_in1 + v_in2 = v_out1 + v_out2 + publicAmount + fee`
+  over six 128-bit range checks (the sum is < 2^131, far from the field);
+- the claim, the single public signal:
+  `claim = Poseidon(TAG_CLAIM, P3(root, nf1, nf2), P3(outCm1, outCm2, P3(publicAmount, fee, ctx)))`.
 
-> I own a note committed in the pool's tree at an anchored root, and I expose
-> exactly one nullifier for it, one optional output note, and one context, all
-> bound into a single public claim.
-
-The five properties that make this a secure spend rather than a cost
-demonstration are each enforced in-circuit, not assumed:
-
-1. **Boolean path bits** so the Merkle path is well-formed.
-2. **Root anchoring**: the computed root is folded into the public claim and
-   the contract checks it against its recent-roots ring, so the prover cannot
-   invent a tree.
-3. **Domain separation**: owner key, leaf, nullifier, and claim each hash under
-   a distinct tag, so no digest is reusable across roles.
-4. **Key- and note-bound nullifier**: `nf = H(TAG_NULL, spend_key, cm)`,
-   deterministic per note, computable only by the owner.
-5. **Double-spend prevention**: the nullifier is published and the contract
-   consumes it exactly once.
-
-These are precisely the five caveats the [recursive STARK mempool](https://github.com/soispoke/recursive-stark-mempool)'s
-cost-only spend circuit left open; this repo closes all five in a real circuit.
+Transfer has `publicAmount = 0, ctx = 0`; withdraw has `publicAmount > 0` and
+`ctx` naming the recipient. Both may carry a fee. The four contract-side
+VERIFY bindings (pinned sender, key set, root source, operation shape) hold,
+with the key set generalised: the consumed nonce-key set must be exactly
+`{nf1, nf2}`, no extras. `NonceManager` (EIP-8250 emulation, with
+`consumeFreshMany`) and `RecentRoots` (EIP-8272 emulation) live in
+[`contracts/src/`](contracts/src/).
 
 ## Layout
 
 ```
-circuits/
-  spend.py             the leanVM zkDSL spend circuit (transfer + withdraw), with
-                       its full soundness rationale and a drift guard
-  pool_circuits.patch  the leanVM harness (proves + verifies both ops), vs commit 12e6151
-  README.md            reproduce the proving numbers
-pool/
-  note.py              note, commitment, nullifier, and the spend relation (matches
-                       the circuit; SHA-256 stands in for Poseidon so it runs in Python)
-  pool.py              the immutable contract: Merkle tree + recent-roots ring + nullifier set
-  demo.py              end-to-end: shield -> transfer -> withdraw, with double-spend,
-                       forged-root, and duplicate-output front-run all handled
-  envelope.py          the devnet envelope: per-sender EIP-8250 keyed nonces, EIP-8272
-                       windowed roots, and the pool's pinned-sender VERIFY checklist,
-                       with the envelope-level attacks refused
-devnet/
-  README.md            how the pool maps onto EIP-8141 / 8250 / 8272, and the test plan
-  flow.md              one private transfer traced field-by-field through the stack
-prover/
-  src/                 pool-prover: prove-spend / verify-spend / export-vectors
-                       binaries against leanVM pinned as a git dependency; the
-                       circuit is extracted from circuits/spend.py, never
-                       duplicated (Sepolia milestone 2; see prover/README.md)
-contracts/
-  src/Poseidon16.sol   leanVM's hash (classic Poseidon over KoalaBear) in Solidity,
-                       differentially tested against vectors exported from leanVM
-                       itself (Sepolia milestone 1)
-  src/*.sol            ShieldedPool + NonceManager (EIP-8250) + RecentRoots
-                       (EIP-8272) + AttestedVerifier shim; Foundry tests port
-                       pool/envelope.py's attack battery on-chain and check
-                       ctxFor/computeClaim/tree-root against the prover
-                       (Sepolia milestone 3; see contracts/README.md)
-wallet/
-  wallet.py            tree/indexer + witness builder (reconstructs the tree
-                       from LeafAppended events, builds real auth paths)
-  gen_smoke.py         real proofs for a transfer + withdraw, verified off-chain
-  smoke.sh             end-to-end (in-process EVM): real STARK -> off-chain
-                       verify -> on-chain shield/transfer/withdraw (milestone 4)
-  deploy_flow.sh       deploy + run the flow against a live node (anvil or
-                       Sepolia); attest.sh is the standalone verifying attester
-                       (Sepolia milestone 5; see wallet/DEPLOY.md)
-docs/                  figures used by the explainer
+circuits/spend.circom    the join-split circuit (2-in/2-out, values, fee)
+reference/               poseidon_bn254.py (Python reference vs circomlibjs
+                         vectors) + gen_poseidon_sol.py (Solidity generator)
+vectors/                 differential vectors exported from circomlibjs
+tooling/                 pinned npm deps, export_vectors.js, setup.sh
+contracts/src/
+  PoseidonT3/T4.sol      GENERATED split EXTERNAL libraries (via-IR inlining
+                         busts EIP-170, and each half fits the hegota 2^24
+                         deploy budget); PoseidonBN254.sol is the facade
+  Groth16Verifier.sol    GENERATED by snarkjs (GPL-3.0 header, see NOTICE)
+  NonceManager.sol       EIP-8250 keyed-nonce emulation (consumeFreshMany)
+  RecentRoots.sol        EIP-8272 recent-roots emulation
+  ShieldedPool.sol       the join-split pool (4.9 KB runtime, linked)
+contracts/test/          35 tests: the attack battery with REAL proofs
+                         (incl. the same-note-twice star witness), multi-key
+                         set semantics in isolation, Poseidon differentials
+wallet/                  wallet.py (value notes, dummies, witness builder),
+                         gen_smoke.py (real proofs + the adversarial proof),
+                         smoke.sh, deploy_flow.sh (runs the attack live)
 ```
 
 ## Run
 
 ```
-# the whole protocol, in plain Python (self-checking):
-python3 pool/demo.py
-
-# the devnet envelope and its attacks (cross-sender double-spend, lifted
-# proof, foreign root, transfer+withdraw in one spend), all refused:
-python3 pool/envelope.py
-
-# check the circuit source matches the harness:
-python3 circuits/spend.py
-
-# the on-chain hash vs vectors exported from leanVM (needs Foundry):
-cd contracts && forge test && python3 reference/poseidon16.py
-
-# prove and verify real spends on your machine (leanVM fetched automatically):
-cd prover && cargo run --release --bin prove-spend -- --demo 20
-# (or the in-leanVM form: apply circuits/pool_circuits.patch, see circuits/README.md)
+cd tooling && npm ci && ./setup.sh    # compile circuit + TESTBED trusted setup
+cd ../wallet && ./smoke.sh            # real proofs, off-chain verify, forge on-chain
+./deploy_flow.sh                      # deploy + full flow + live attack on anvil
 ```
 
-## Measured (Apple M5 Max, WHIR rate 1/2)
+`forge test` runs unaided from a fresh clone: the committed fixture's proofs
+pair with the committed `Groth16Verifier.sol`. Re-running `setup.sh`
+re-randomises the ceremony and requires `gen_smoke.py` again; the two
+artifacts only ever ship together.
 
-A spend (transfer or withdraw) proves in **~20-28 ms**, produces a
-**~155-158 KiB** proof, and verifies in **~16-18 ms**, independent of tree
-depth. Tampered claims are rejected. At WHIR rate 1/4 the same circuit is
-smaller (the [recursive STARK mempool](https://github.com/soispoke/recursive-stark-mempool)
-measured a comparable spend at ~108 KiB / ~17 ms prove), so these proofs feed
-directly into that aggregation pipeline.
+## Measured
+
+14,069 R1CS constraints at depth 20; proving ~600 ms in snarkjs (Node,
+M5 Max); 256-byte proofs. On-chain (via-ir, optimizer 200, external Poseidon
+library):
+
+| operation | gas | what it pays for |
+|---|---:|---|
+| Groth16 verify | ~188k | the real proof check, in-EVM |
+| shield | ~1.11M | commitment hash + 20 tree levels |
+| transfer | ~2.48M | claim (4x hash3) + verify + TWO appends + fee payout |
+| withdraw | ~2.51M | same + publicAmount payout |
+
+Every join-split appends two output commitments (40 Poseidon levels), twice
+the append cost of a single-output design. The external-library
+switch also prices each hash call with DELEGATECALL overhead (hash2 ~37k,
+hash3 ~112k); if this ever matters, batching the two appends into one
+root recomputation is the obvious headroom. A malformed proof still burns the
+submitter's full gas stipend before reverting (pairing-precompile behaviour);
+wallets pre-verify off-chain.
+
+## Running on a real 8141/8250/8272 devnet
+
+`devnet/` plugs the pool onto lambdaclass/ethrex's Hegotá devnet as a
+frame-native application: each interaction rides a type-0x06 frame transaction
+(`pool_frametx.py`), and because a SENDER frame runs real EVM, the Groth16
+proof is verified **on-chain in-frame** with no attester. The full flow ran
+live on the public devnet on 2026-07-03: shield (1 ETH), join-split transfer,
+and withdraw all mined as frame transactions, with the recipient ending at
+exactly the proven public amount (addresses, tx hashes, and gas numbers in
+`devnet/REVIEW.md`, "The live run"). Deploying under EIP-8037 gas accounting
+(~1,545 gas per byte of runtime, 2^24 per-tx cap) required splitting the
+Poseidon library into `PoseidonT3`/`PoseidonT4` (`split_poseidon.py`,
+differential-tested against the same circomlibjs vectors). `devnet/REVIEW.md`
+is the full review of the devnet's EIP implementation and the integration:
+what maps cleanly (frame model, APPROVE including the paymaster-payment scope,
+on-chain verification), the two capability gaps that keep the spent-set and
+root-source bindings trusted rather than proven (no TXPARAM selector for
+`nonce_keys` or `recent_root_references`), and the operational findings from
+the live run (prefunded-key funding, broken gas estimation, the deploy cost
+model, and the mempool-only nature of the restricted-state rules).
 
 ## Security posture
 
-The five spend-circuit properties above are enforced in-circuit, and fixed
-denomination removes value arithmetic. End-to-end devnet soundness additionally
-requires four bindings in the pool's on-chain `VERIFY` logic: (1) the sender
-equals the pool's single pinned `POOL_SENDER` (EIP-8250 key domains are per
-sender, so the pin is what makes the spent set global; any other sender could
-double-spend the note); (2) the consumed nonce key set is exactly `[nf]` at
-`nonce_seq = 0` (EIP-8250); (3) exactly one recent-root reference carries the
-pool's own `source_id` and its root equals the claim's (EIP-8272); (4) exactly
-one of `out_cm`, `ctx` is zero (both nonzero would mint). `pool/envelope.py`
-runs each binding's attack. Because the nonce key is consumed at payment
-approval and survives later-frame reverts, the pool's post-approval frame must
-be revert-free (a duplicate append is a no-op), or a note burns.
-See [devnet/](devnet/README.md).
-
-Stated residual trust surface: leanVM's current ~124-bit classical / ~62-bit
-quantum hash security (so "PQ" is directional, not yet 128-bit); the circuit and
-contract are unaudited; the four contract-side bindings above are trusted, not
-proven in-circuit; the devnet must itself supply a leanVM proof verifier
-(precompile or native, none of the three EIPs provides one) and a funded
-payment path for `POOL_SENDER` (the fee story is an open problem, see
-devnet/); and this is a research prototype, not production software.
-
-Privacy limits: anonymity equals the number of indistinguishable unspent notes
-at spend time, a dynamic set that can be as small as 1 (a spend into a tiny pool
-is linkable), so wallets should wait for a sufficient set and avoid
-spend-soon-after-deposit timing. Spends all come from the pinned `POOL_SENDER`,
-which is what decorrelates users on the sending side; the deposit's funding
-address is still on-chain and must be decorrelated by the wallet, and note
-commitments travel to recipients out of band (that channel should be PQ
-encrypted too). By design there is no compliance or viewing-key mechanism.
-
-## License
-
-Apache-2.0 (see `LICENSE`). The Python model and circuit are original work;
-`circuits/pool_circuits.patch` modifies `leanEthereum/leanVM` (Apache-2.0) at
-commit `12e6151`; see `NOTICE`.
+- **Trusted setup**: `tooling/setup.sh` is a local, TESTBED-ONLY ceremony
+  (toxic-waste holder could forge membership and mint). `PTAU=...` plugs in a
+  public powers-of-tau; a real deployment also needs a multi-party phase 2.
+- **Not post-quantum**, by construction: BN254 pairings and Groth16.
+- **Privacy regresses versus fixed denomination, knowingly.** Internal
+  transfer amounts stay hidden, but shield and withdraw amounts (and fees)
+  are public, and exact-amount correlation between a deposit and a later
+  withdrawal is the classic deanonymization vector fixed denominations were
+  chosen to kill. This design trades that away to exercise the envelope;
+  wallets should use round amounts, delays, and partial withdrawals.
+- **Same-note-twice is refused by the envelope, not the circuit.** That is a
+  deliberate placement (it is exactly EIP-8250's duplicate-key rule doing the
+  work, which is what this build exists to test), but it means the key-set
+  binding is soundness-critical: a deployment whose VERIFY logic forgot the
+  duplicate check would double-count. The circuit could also enforce
+  `nf1 != nf2` for defense in depth; noted as a hardening option.
+- **Unaudited research code**, throughout.

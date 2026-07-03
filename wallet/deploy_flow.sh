@@ -1,36 +1,26 @@
 #!/usr/bin/env bash
-# Deploy the pool and run the real-proof flow against a live JSON-RPC node.
+# Deploy the BN254 pool and run the real-proof flow against a live JSON-RPC
+# node. There is NO attester. The Groth16 proof from the fixture is verified
+# on-chain by the deployed verifier, so the only keys involved are the
+# deployer's, the pinned sender's, and nobody vouches for anything.
 #
-# Default (no args): spin up a local anvil, deploy, and run
-# shield -> transfer -> withdraw with the real leanVM proofs from
-# smoke_fixture.json, signing attestations with a standalone key via
-# `cast wallet sign`. This is the faithful dress rehearsal for Sepolia.
-#
-# Sepolia (or any node): set the env vars below and run. Deployment is a
-# real, irreversible broadcast, so it is never done implicitly.
+# Default (no args): spin up a local anvil, deploy, run
+# shield -> transfer -> withdraw. For Sepolia (or any node) set:
 #
 #   RPC_URL         JSON-RPC endpoint (default: local anvil)
 #   DEPLOYER_PK     funded key that deploys and shields
 #   POOL_SENDER_PK  the pinned sender that submits spends
-#   ATTESTER_PK     the attester that signs (claim, proofHash)
-#   DENOM_WEI       denomination (default 1 ether)
 #
-# Requires: foundry (forge, cast, anvil), python3, and a built prover +
-# smoke_fixture.json (run ./smoke.sh once first, or gen_smoke.py).
+# Requires: foundry, python3, node, and a generated smoke_fixture.json
+# (run ./smoke.sh once first). The fixture's proofs pair with the committed
+# Groth16Verifier.sol; rerunning ../tooling/setup.sh invalidates both together.
 set -euo pipefail
 cd "$(dirname "$0")"
 CONTRACTS=../contracts
 FIX=smoke_fixture.json
 CONFIG=deploy_config.json
-DOMAIN=$(cast keccak "PQ_POOL_SPEND_ATTESTATION_V1")
-DENOM_WEI=${DENOM_WEI:-1000000000000000000}
 
 [ -f "$FIX" ] || { echo "no $FIX; run ./smoke.sh first"; exit 1; }
-# the standalone attester re-verifies the real proofs, so they must be present
-if [ ! -f artifacts/proof_transfer.json ]; then
-  echo "==> real proof artifacts missing; regenerating (needs a built prover)"
-  python3 gen_smoke.py
-fi
 
 ANVIL_PID=""
 cleanup() { [ -n "$ANVIL_PID" ] && kill "$ANVIL_PID" 2>/dev/null || true; }
@@ -45,23 +35,35 @@ if [ -z "${RPC_URL:-}" ]; then
   # standard anvil dev keys
   DEPLOYER_PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
   POOL_SENDER_PK=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
-  ATTESTER_PK=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
 fi
 
-j() { python3 -c "import json,sys;print(json.load(open('$FIX'))$1)"; }
+j() { python3 -c "import json,sys;v=json.load(open('$FIX'))$1;print(json.dumps(v) if isinstance(v,(list,dict)) else v)"; }
+# a proof tuple-fragment for cast: pA, pB, pC as nested [..] lists
+proof() { python3 -c "
+import json
+p = json.load(open('$FIX'))['$1']['proof']
+fmt = lambda v: '[' + ','.join(fmt(x) if isinstance(x, list) else str(int(x, 16)) for x in v) + ']'
+print(f\"{fmt(p['pA'])},{fmt(p['pB'])},{fmt(p['pC'])}\")"; }
+
 POOL_SENDER=$(cast wallet address --private-key "$POOL_SENDER_PK")
-ATTESTER=$(cast wallet address --private-key "$ATTESTER_PK")
 CHAINID=$(cast chain-id --rpc-url "$RPC_URL")
 DEPLOYER=$(cast wallet address --private-key "$DEPLOYER_PK")
-echo "==> chain $CHAINID  deployer $DEPLOYER  pool_sender $POOL_SENDER  attester $ATTESTER"
+echo "==> chain $CHAINID  deployer $DEPLOYER  pool_sender $POOL_SENDER  (no attester)"
 
 deployed() { grep -oE "Deployed to: 0x[0-9a-fA-F]{40}" | awk '{print $3}'; }
 FC="forge create --root $CONTRACTS --rpc-url $RPC_URL --private-key $DEPLOYER_PK --broadcast"
 
 echo "==> deploying"
 ROOTS=$($FC src/RecentRoots.sol:RecentRoots | deployed)
-VERIFIER=$($FC src/AttestedVerifier.sol:AttestedVerifier --constructor-args "$ATTESTER" | deployed)
-POOL=$($FC src/ShieldedPool.sol:ShieldedPool --constructor-args "$DENOM_WEI" "$POOL_SENDER" "$ROOTS" "$VERIFIER" | deployed)
+VERIFIER=$($FC src/Groth16Verifier.sol:Groth16Verifier | deployed)
+# the Poseidon halves deploy once each and link into the pool (EIP-170
+# headroom; split so each half also fits the hegota 2^24 deploy budget)
+T3=$($FC src/PoseidonT3.sol:PoseidonT3 | deployed)
+T4=$($FC src/PoseidonT4.sol:PoseidonT4 | deployed)
+POOL=$($FC src/ShieldedPool.sol:ShieldedPool \
+  --libraries "src/PoseidonT3.sol:PoseidonT3:$T3" \
+  --libraries "src/PoseidonT4.sol:PoseidonT4:$T4" \
+  --constructor-args "$POOL_SENDER" "$ROOTS" "$VERIFIER" | deployed)
 NONCES=$(cast call "$POOL" "nonces()(address)" --rpc-url "$RPC_URL")
 DEPLOY_BLOCK=$(cast block-number --rpc-url "$RPC_URL")
 echo "    pool $POOL  roots $ROOTS  verifier $VERIFIER  nonces $NONCES"
@@ -69,39 +71,54 @@ echo "    pool $POOL  roots $ROOTS  verifier $VERIFIER  nonces $NONCES"
 send() { cast send --rpc-url "$RPC_URL" "$@" >/dev/null; }
 call() { cast call --rpc-url "$RPC_URL" "$@"; }
 
-echo "==> shield cm_A"
-CM_A=$(j "['cm_a']")
-send --private-key "$DEPLOYER_PK" --value "$DENOM_WEI" "$POOL" "shield(bytes32)" "$CM_A"
+SPEND_SIG="(bytes32,uint64,bytes32,bytes32,bytes32,bytes32,uint256,uint256,bytes32,uint256[2],uint256[2][2],uint256[2])"
+spend_tuple() { # $1 = fixture key, $2 = root, $3 = slot
+  echo "($2,$3,$(j "['$1']['nf1']"),$(j "['$1']['nf2']"),$(j "['$1']['out_cm1']"),$(j "['$1']['out_cm2']"),$(j "['$1']['public_amount']"),$(j "['$1']['fee']"),$(j "['$1']['ctx']"),$(proof "$1"))"
+}
+
+echo "==> shield 1.0 ether into note A (contract hashes msg.value into cm)"
+send --private-key "$DEPLOYER_PK" --value "$(j "['shield_value']")" "$POOL" "shield(bytes32)" "$(j "['inner_a']")"
 SLOT_R1=$(call "$POOL" "lastRootSlot()(uint64)")
 R1=$(call "$POOL" "currentRoot()(bytes32)")
 [ "$R1" = "$(j "['transfer']['root']")" ] || { echo "R1 != fixture transfer root"; exit 1; }
 
-echo "==> transfer (attester verifies the real proof, then signs)"
-read -r T_SIG T_PH < <(ATTESTER_PK="$ATTESTER_PK" ./attest.sh "$CHAINID" "$POOL" \
-  "$(j "['transfer']['publics_file']")" "$(j "['transfer']['proof_file']")")
-SPEND="($R1,$SLOT_R1,$(j "['transfer']['nf']"),$(j "['transfer']['out_cm']"),$(j "['transfer']['ctx']"),$T_PH,$T_SIG)"
-send --private-key "$POOL_SENDER_PK" "$POOL" \
-  "transfer((bytes32,uint64,bytes32,bytes32,bytes32,bytes32,bytes))" "$SPEND"
+SENDER_BAL_0=$(cast balance "$POOL_SENDER" --rpc-url "$RPC_URL")
+
+echo "==> join-split transfer (two nullifiers as ONE 8250 key set; fee to sender)"
+send --private-key "$POOL_SENDER_PK" "$POOL" "transfer($SPEND_SIG)" "$(spend_tuple transfer "$R1" "$SLOT_R1")"
 SLOT_R2=$(call "$POOL" "lastRootSlot()(uint64)")
 R2=$(call "$POOL" "currentRoot()(bytes32)")
 [ "$R2" = "$(j "['withdraw']['root']")" ] || { echo "R2 != fixture withdraw root"; exit 1; }
 
-echo "==> withdraw (attester verifies the real proof, then signs)"
+echo "==> the same-note-twice attack (real proof, nf1 == nf2): must be refused"
+if cast send --rpc-url "$RPC_URL" --private-key "$POOL_SENDER_PK" "$POOL" \
+  "transfer($SPEND_SIG)" "$(spend_tuple attack_same_note "$R1" "$SLOT_R1")" >/dev/null 2>&1; then
+  echo "    ATTACK ACCEPTED — the key-set duplicate rule failed"; exit 1
+fi
+echo "    refused (duplicate key in the 8250 set)"
+
+echo "==> withdraw (publicAmount to recipient, fee to sender)"
 RECIPIENT=$(j "['recipient']")
 BAL_BEFORE=$(cast balance "$RECIPIENT" --rpc-url "$RPC_URL")
-read -r W_SIG W_PH < <(ATTESTER_PK="$ATTESTER_PK" ./attest.sh "$CHAINID" "$POOL" \
-  "$(j "['withdraw']['publics_file']")" "$(j "['withdraw']['proof_file']")")
-WSPEND="($R2,$SLOT_R2,$(j "['withdraw']['nf']"),$(j "['withdraw']['out_cm']"),$(j "['withdraw']['ctx']"),$W_PH,$W_SIG)"
-send --private-key "$POOL_SENDER_PK" "$POOL" \
-  "withdraw((bytes32,uint64,bytes32,bytes32,bytes32,bytes32,bytes),address)" "$WSPEND" "$RECIPIENT"
+send --private-key "$POOL_SENDER_PK" "$POOL" "withdraw($SPEND_SIG,address)" \
+  "$(spend_tuple withdraw "$R2" "$SLOT_R2")" "$RECIPIENT"
 BAL_AFTER=$(cast balance "$RECIPIENT" --rpc-url "$RPC_URL")
 echo "    recipient balance $BAL_BEFORE -> $BAL_AFTER"
-[ "$BAL_AFTER" != "$BAL_BEFORE" ] || { echo "recipient not paid"; exit 1; }
+[ "$BAL_AFTER" = "$((BAL_BEFORE + $(j "['withdraw']['public_amount']")))" ] || { echo "recipient not paid publicAmount"; exit 1; }
 
-python3 - "$CHAINID" "$POOL" "$ROOTS" "$VERIFIER" "$NONCES" "$ATTESTER" "$POOL_SENDER" "$DENOM_WEI" "$DEPLOY_BLOCK" <<'PY'
+# the trustless-paymaster loop: the pinned sender was reimbursed both fees
+# from shielded value (anvil charges gas, so assert net = fees - gas > 0
+# relative to a gasless baseline by checking the pool paid the fees out)
+POOL_BAL=$(cast balance "$POOL" --rpc-url "$RPC_URL")
+EXPECT=$(python3 -c "import json;f=json.load(open('$FIX'));print(int(f['shield_value'])-int(f['withdraw']['public_amount'])-int(f['transfer']['fee'])-int(f['withdraw']['fee']))")
+[ "$POOL_BAL" = "$EXPECT" ] || { echo "pool balance $POOL_BAL != expected $EXPECT (fees not paid?)"; exit 1; }
+echo "    pool balance == the one unspent change note; both fees left to the sender"
+
+python3 - "$CHAINID" "$POOL" "$ROOTS" "$VERIFIER" "$NONCES" "$POSEIDON" "$POOL_SENDER" "$DEPLOY_BLOCK" <<'PY'
 import json, sys
-k = ["chainId","pool","roots","verifier","nonces","attester","poolSender","denominationWei","deploymentBlock"]
+k = ["chainId","pool","roots","verifier","nonces","poseidon","poolSender","deploymentBlock"]
 json.dump(dict(zip(k, sys.argv[1:])), open("deploy_config.json","w"), indent=1)
 PY
 echo "==> flow complete; wrote $CONFIG"
-echo "    shield + transfer + withdraw accepted with real leanVM proofs over live RPC."
+echo "    shield + join-split transfer + withdraw accepted, same-note attack refused,"
+echo "    fees reimbursed the submitter: multi-key 8250 + paymaster loop, live."
