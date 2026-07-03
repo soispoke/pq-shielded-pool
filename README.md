@@ -1,6 +1,6 @@
 # PQ shielded pool
 
-A minimal, post-quantum, Tornado-style privacy pool for Ethereum. Fixed
+A minimal, post-quantum privacy pool for Ethereum. Fixed
 denomination, no token, no governance, no admin key, no compliance hooks: an
 immutable contract with exactly three operations (shield, transfer, withdraw)
 and a leanVM STARK that proves ownership without revealing it.
