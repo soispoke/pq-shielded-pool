@@ -3,8 +3,8 @@
 A minimal, immutable shielded pool for Ethereum. Three operations (shield,
 transfer, withdraw), no token, no governance, no admin key. Notes hold an
 arbitrary value; a spend is a 2-in/2-out join-split proven by a Groth16 SNARK
-(circom + snarkjs) and verified on-chain through the BN254 pairing precompiles,
-so no off-chain attester is involved.
+(circom + snarkjs) and verified onchain through the BN254 pairing precompiles,
+so no offchain attester is involved.
 
 It runs as an EIP-8141 frame-native application: a spend is one frame
 transaction whose proof is verified inside the SENDER frame. The full shield →
@@ -15,7 +15,7 @@ devnet; addresses, transaction hashes, and gas are in
 ## How a spend works
 
 A note is `cm = Poseidon(TAG_LEAF, Poseidon(owner_pk, rho), value)`; `shield`
-hashes `msg.value` into the commitment on-chain, so a deposit's value cannot be
+hashes `msg.value` into the commitment onchain, so a deposit's value cannot be
 misstated. A spend consumes two input notes, creates two output notes (payment
 and change), and proves in-circuit:
 
@@ -37,12 +37,12 @@ value to `msg.sender`.
 The pool enforces four checks around each proof:
 
 1. the sender is the pinned `POOL_SENDER`;
-2. the two nullifiers are consumed as one keyed-nonce set `{nf1, nf2}`
+2. the 2 nullifiers are consumed as one keyed-nonce set `{nf1, nf2}`
    (EIP-8250: shared `nonce_seq = 0`, atomic all-or-nothing);
 3. the claim's root is one of the pool's recent roots (EIP-8272);
 4. the operation shape is well-formed (transfer vs withdraw).
 
-Consuming the two nullifiers as a set makes the duplicate-key rule the defense
+Consuming the 2 nullifiers as a set makes the duplicate-key rule the defense
 against spending one note through both inputs: such a spend has `nf1 == nf2`,
 which the circuit accepts but the set consumption rejects, so it reverts and
 spends nothing.
@@ -66,7 +66,7 @@ devnet/                frame-transaction tooling and the devnet write-up (REVIEW
 
 ```
 cd tooling && npm ci && ./setup.sh   # compile the circuit, run a TESTBED trusted setup
-cd ../wallet && ./smoke.sh           # generate real proofs, verify off-chain, run on-chain
+cd ../wallet && ./smoke.sh           # generate real proofs, verify offchain, run onchain
 ./deploy_flow.sh                     # deploy and run the full flow on a local node
 ```
 
@@ -98,7 +98,7 @@ these figures; see [devnet/REVIEW.md](devnet/REVIEW.md).
   powers-of-tau; a real deployment also needs a multi-party phase 2.
 - **Not post-quantum.** Security rests on BN254 pairings and Groth16.
 - **Amounts are public.** Shield and withdraw amounts and fees are visible
-  on-chain; only internal transfer amounts are hidden, and equal deposit and
+  onchain; only internal transfer amounts are hidden, and equal deposit and
   withdrawal amounts are linkable.
 - **The duplicate-key check is soundness-critical.** Spending one note twice is
   rejected by the nullifier-set consumption, not by the circuit; a deployment
