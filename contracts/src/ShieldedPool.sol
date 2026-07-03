@@ -71,6 +71,7 @@ contract ShieldedPool {
     error ZeroNullifier();
     error RootNotRecentForPool();
     error ProofInvalid();
+    error KeySetMismatch();
     error TransferShape();
     error WithdrawShape();
     error CtxDoesNotNameRecipient();
@@ -145,21 +146,48 @@ contract ShieldedPool {
         if (!ok) revert PayoutFailed();
     }
 
-    /// The binding checklist from devnet/REVIEW.md, key set generalised.
-    function _spend(Spend calldata s) internal {
-        // 1. pinned sender: EIP-8250 key domains are per sender, so this pin
-        //    is what makes (POOL_SENDER, {nf}) a global spent set
-        if (msg.sender != POOL_SENDER) revert NotPoolSender();
+    /// Spend validity independent of who submits it: the non-zero nullifiers,
+    /// the EIP-8272 recent-root binding, and the Groth16 proof over the
+    /// recomputed claim. VIEW-only, so it is legal inside a VERIFY (static)
+    /// frame: a paymaster staticcalls this to decide whether to APPROVE, and
+    /// the protocol then consumes the nullifiers as keyed nonces at approval.
+    /// It does not check the pinned sender (a VERIFY frame runs as ENTRY_POINT,
+    /// not tx.sender), so that binding stays in the SENDER-frame path (_spend).
+    /// Reverts on any failure; returns the claim so a caller can bind to it.
+    function verifySpend(Spend calldata s) public view returns (bytes32 claim) {
         if (s.nf1 == bytes32(0) || s.nf2 == bytes32(0)) revert ZeroNullifier();
-        // 3. the referenced root is this pool's own recent root
         if (!roots.check(sourceId(), s.slot, s.root)) revert RootNotRecentForPool();
-        // recompute the claim from the publics; the proof is valid only for
-        // exactly this claim (the single public signal)
-        bytes32 claim = computeClaim(s);
+        claim = computeClaim(s);
         if (!verifier.verifyProof(s.pA, s.pB, s.pC, [uint256(claim)])) revert ProofInvalid();
-        // 2. consume exactly {nf1, nf2} as ONE key set at nonce_seq 0
-        //    (atomic; a duplicate key — the same note spent through both
-        //    inputs — is refused here)
+    }
+
+    /// The EIP-8250 spent-set binding as a pure check: the transaction's
+    /// `nonce_keys` must be exactly the two proven nullifiers, distinct and
+    /// sorted. Once the devnet exposes a `nonce_keys` TXPARAM selector, a
+    /// VERIFY-frame paymaster reads the envelope's keys and calls this, so the
+    /// consumed key set is proven equal to the nullifiers the proof commits to
+    /// rather than trusted. (Today the pool enforces the same set from the
+    /// SENDER frame via its own NonceManager; see _spend.)
+    function checkKeySet(Spend calldata s, bytes32[] calldata nonceKeys) public pure {
+        if (nonceKeys.length != 2 || s.nf1 == s.nf2) revert KeySetMismatch();
+        bytes32 lo = s.nf1;
+        bytes32 hi = s.nf2;
+        if (uint256(lo) > uint256(hi)) (lo, hi) = (s.nf2, s.nf1);
+        if (nonceKeys[0] != lo || nonceKeys[1] != hi) revert KeySetMismatch();
+    }
+
+    /// SENDER-frame binding checklist (see devnet/REVIEW.md). Today's shape
+    /// verifies the proof here and consumes the nullifiers through the pool's
+    /// own NonceManager. The faithful shape moves the proof check to a VERIFY
+    /// frame (verifySpend) and the consumption to protocol keyed nonces bound
+    /// by checkKeySet.
+    function _spend(Spend calldata s) internal {
+        // pinned sender: EIP-8250 key domains are per sender, so this pin is
+        // what makes (POOL_SENDER, {nf}) a global spent set
+        if (msg.sender != POOL_SENDER) revert NotPoolSender();
+        verifySpend(s);
+        // consume exactly {nf1, nf2} as ONE key set at nonce_seq 0 (atomic; a
+        // duplicate key, the same note through both inputs, is refused here)
         bytes32[] memory keys = new bytes32[](2);
         keys[0] = s.nf1;
         keys[1] = s.nf2;

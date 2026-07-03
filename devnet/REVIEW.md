@@ -261,6 +261,35 @@ definition, read from the envelope via the TXPARAM selectors of gaps 1 and 2.
 Those selectors are therefore not only what turns the trusted bindings into
 proven ones; they are what makes the spend FOCIL-enforceable.
 
+**What is done on the pool side, assuming the devnet upgrades.** The proof
+check is now factored so the faithful shape is ready the moment the devnet
+raises `MAX_VERIFY_GAS` and exposes the `nonce_keys` selector, and the split is
+tested (contracts/test/ShieldedPool.t.sol):
+
+- `ShieldedPool.verifySpend(Spend) view returns (bytes32 claim)` is the whole
+  spend validity check (non-zero nullifiers, EIP-8272 recent-root binding, and
+  the Groth16 proof over the recomputed claim), and nothing else. It is `view`,
+  so it runs under `STATICCALL`, which is what a VERIFY frame is: a paymaster
+  targets it, staticcalls `verifySpend`, and `APPROVE`s payment if it returns.
+  A test asserts it succeeds under a raw `staticcall` (proving no state writes)
+  and returns the claim. It deliberately omits the pinned-sender check, since a
+  VERIFY frame runs as ENTRY_POINT rather than `tx.sender`; that binding stays
+  in the SENDER-frame path.
+- `ShieldedPool.checkKeySet(Spend, bytes32[] nonceKeys) pure` is the EIP-8250
+  spent-set binding as a pure function: it asserts the transaction's
+  `nonce_keys` are exactly the two proven nullifiers, distinct and sorted. Once
+  the `nonce_keys` selector exists, the paymaster reads the envelope keys via
+  `TXPARAMLOAD` and calls this, turning the spent-set binding from trusted into
+  proven.
+
+What remains is entirely devnet-side and out of the pool's hands: the raised
+`MAX_VERIFY_GAS`, the `nonce_keys` / `recent_root_references` TXPARAM selectors,
+and a small `APPROVE`-emitting paymaster wrapper (the paymaster's only job
+beyond `verifySpend` + `checkKeySet` is to emit the `APPROVE` opcode, which no
+vanilla-EVM contract can do). The SENDER frame then shrinks to the state
+changes: append the two output commitments and pay out, with the nullifiers
+already consumed as protocol keyed nonces at approval.
+
 ## The live run (2026-07-03)
 
 The full flow ran end to end on the public network, deployed from genesis

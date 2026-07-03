@@ -315,6 +315,57 @@ contract ShieldedPoolBN254Test {
         // lifecycle test; here, assert the empty root only.
     }
 
+    // ---- VERIFY-frame readiness (for a devnet that raises MAX_VERIFY_GAS and
+    //      exposes a nonce_keys TXPARAM selector) ----
+
+    /// verifySpend must run under STATICCALL, so it is legal inside a VERIFY
+    /// (static) frame where a paymaster staticcalls it to gate APPROVE. A
+    /// successful staticcall proves it writes no state; it returns the claim.
+    function test_verifySpend_is_static_and_returns_claim() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        (bool ok, bytes memory ret) =
+            address(pool).staticcall(abi.encodeWithSelector(ShieldedPool.verifySpend.selector, s));
+        assertTrue(ok, "verifySpend must succeed under staticcall (VERIFY-frame legal)");
+        assertTrue(abi.decode(ret, (bytes32)) == pool.computeClaim(s), "verifySpend returned the wrong claim");
+    }
+
+    /// A proof that does not match its public claim is rejected by verifySpend.
+    function test_verifySpend_rejects_mismatched_proof() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        s.outCm1 = bytes32(uint256(42)); // canonical, but not the proven output
+        vm.expectRevert(ShieldedPool.ProofInvalid.selector);
+        pool.verifySpend(s);
+    }
+
+    /// checkKeySet proves the envelope's nonce_keys are exactly the two
+    /// nullifiers (distinct, sorted): the binding a VERIFY-frame paymaster
+    /// makes once the devnet exposes a nonce_keys selector.
+    function test_checkKeySet_binds_keys_to_nullifiers() public {
+        ShieldedPool.Spend memory s = _spendOf(".transfer", 1);
+        bytes32 lo = s.nf1;
+        bytes32 hi = s.nf2;
+        if (uint256(lo) > uint256(hi)) { lo = s.nf2; hi = s.nf1; }
+
+        bytes32[] memory good = new bytes32[](2);
+        good[0] = lo; good[1] = hi;
+        pool.checkKeySet(s, good); // exact set, sorted: accepted (no revert)
+
+        bytes32[] memory unsorted = new bytes32[](2);
+        unsorted[0] = hi; unsorted[1] = lo;
+        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
+        pool.checkKeySet(s, unsorted);
+
+        bytes32[] memory wrong = new bytes32[](2);
+        wrong[0] = lo; wrong[1] = bytes32(uint256(hi) ^ 1);
+        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
+        pool.checkKeySet(s, wrong);
+
+        bytes32[] memory tooFew = new bytes32[](1);
+        tooFew[0] = lo;
+        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
+        pool.checkKeySet(s, tooFew);
+    }
+
     // minimal assert
     function assertTrue(bool c, string memory m) internal pure {
         require(c, m);
