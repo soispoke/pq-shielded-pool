@@ -307,9 +307,18 @@ cap, so a proof-in-VERIFY spend needs a custom mempool or direct submission.
 The exec frame is dominated by the two Merkle appends (40 Poseidon hash2,
 ~1.48M); shield is one append plus the commitment hash and carries no proof.
 About 50k of the exec figure is today's keyed-nonce consumption, which moves to
-the approval side in the faithful shape. These are vanilla-EVM numbers; the
-devnet's EIP-8037 two-dimensional accounting raises them, and inlining Poseidon
-or batching the two appends into one root recompute would cut both columns.
+the approval side in the faithful shape. These are vanilla-EVM numbers, and
+EIP-8037 changes only the exec column: the state dimension charges writes
+exclusively (`cost_per_state_byte = 1530`, so a fresh storage slot is
+64 × 1530 = 97,920, a new account 120 × 1530 = 183,600, code deposit
+1,530/byte; `gas_cost.rs`), while reads, hashing, precompiles, and calldata
+stay regular-dimension. A static VERIFY frame cannot write state, so its
+column carries over essentially unchanged. The live runs confirm this to the
+gas: the transfer's +658k over vanilla matches its ~6 fresh storage slots
+(2 leaves, 2 root-ring entries, 2 nonce slots ≈ 588k) plus rewrites, and the
+two live withdraws differ by exactly 183,600, the one-time new-account charge
+for the recipient's first payout. Inlining Poseidon or batching the two
+appends into one root recompute would cut both columns.
 
 ## The live run (2026-07-03)
 
