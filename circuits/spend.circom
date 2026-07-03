@@ -3,8 +3,7 @@ pragma circom 2.0.8;
 // Shielded-pool JOIN-SPLIT spend circuit, BN254 edition (Groth16 / circom).
 //
 // Arbitrary-value notes: a spend consumes up to two input notes and creates
-// two output notes, with a public withdrawal amount and a public fee. This
-// is the Tornado-Nova-shaped generalisation of the fixed-denomination spend,
+// two output notes, with a public withdrawal amount and a public fee. It is
 // built to exercise two envelope features end to end:
 //
 //   - EIP-8250 MULTI-KEY nonces: the two nullifiers are consumed as ONE

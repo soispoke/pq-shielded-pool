@@ -1,4 +1,4 @@
-Minimal shielded pool — a minimal Tornado-style privacy protocol prototype (BN254 / Groth16)
+Minimal shielded pool — a BN254 / Groth16 shielded pool for Ethereum
 
 Original sources (the spend circuit, the Python reference and generators, the
 pool contract, the wallet, and the devnet tooling) are licensed under

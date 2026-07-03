@@ -1,155 +1,107 @@
 # Minimal shielded pool
 
-A minimal, immutable privacy pool prototype: three operations
-(shield, transfer, withdraw), no token, no governance, no admin key. Notes carry an arbitrary value, a spend is a 2-in/2-out
-join-split, and the proof is a Groth16 SNARK (circom + snarkjs) verified
-onchain through the BN254 pairing precompiles, so there is no attester and
-nobody to compromise. It has run end to end on lambdaclass/ethrex's Hegotá
-devnet as a frame-native application, the full shield -> transfer -> withdraw
-flow mined live with the proof checked inside the SENDER frame (see
-[devnet/REVIEW.md](devnet/REVIEW.md)).
+A minimal, immutable shielded pool for Ethereum. Three operations (shield,
+transfer, withdraw), no token, no governance, no admin key. Notes hold an
+arbitrary value; a spend is a 2-in/2-out join-split proven by a Groth16 SNARK
+(circom + snarkjs) and verified on-chain through the BN254 pairing precompiles,
+so no off-chain attester is involved.
 
-Built to answer two envelope questions a fixed-denomination design cannot reach:
+It runs as an EIP-8141 frame-native application: a spend is one frame
+transaction whose proof is verified inside the SENDER frame. The full shield →
+transfer → withdraw flow has run end to end on lambdaclass/ethrex's Hegotá
+devnet; addresses, transaction hashes, and gas are in
+[devnet/REVIEW.md](devnet/REVIEW.md).
 
-1. **EIP-8250 multi-key nonces, exercised for real.** A join-split spend
-   consumes two input notes, so it exposes two nullifiers, and they are
-   consumed as ONE keyed-nonce set (`consumeFreshMany`): shared
-   `nonce_seq = 0`, atomic all-or-nothing, bounded by `MAX_NONCE_KEYS = 16`,
-   per-sender domains. The battery's star witness is a REAL, circuit-valid
-   proof that spends one note through both inputs (`nf1 == nf2`, conservation
-   satisfied at twice the value); nothing in the proof layer refuses it, and
-   the duplicate-key rule of the set consumption is what stands between it
-   and a double-count. It reverts there, consuming nothing.
-2. **The trustless-paymaster fee loop.** Every spend binds a `fee` inside the
-   claim, and the contract pays it to `msg.sender` from shielded value. The
-   fixed-denomination design foreclosed this ("no value field, no fee
-   skimming"); here the pinned sender is reimbursed by the very spends it
-   submits, which is the Sepolia-testable half of an EIP-8141 trustless
-   paymaster (see [devnet/REVIEW.md](devnet/REVIEW.md)).
+## How a spend works
 
-The trade's cost, against a fixed-denomination post-quantum design: pairing-based
-(not post-quantum) cryptography and a circuit-specific trusted setup.
+A note is `cm = Poseidon(TAG_LEAF, Poseidon(owner_pk, rho), value)`; `shield`
+hashes `msg.value` into the commitment on-chain, so a deposit's value cannot be
+misstated. A spend consumes two input notes, creates two output notes (payment
+and change), and proves in-circuit:
 
-## The join-split design
+- **membership** of each non-zero input at an anchored Merkle root (depth 20).
+  A zero-value input is a dummy: its nullifier derives from a fabricated
+  commitment and cannot collide with a real note, so a single note can be spent
+  through the two-input circuit.
+- **conservation** `v_in1 + v_in2 = v_out1 + v_out2 + publicAmount + fee`, with
+  each value range-checked to 128 bits.
+- a single public **claim**
+  `Poseidon(TAG_CLAIM, P3(root, nf1, nf2), P3(outCm1, outCm2, P3(publicAmount, fee, ctx)))`.
 
-Notes carry a 128-bit value: `cm = Poseidon(TAG_LEAF, inner, value)` with
-`inner = Poseidon2(owner_pk, rho)`. A recipient reveals only `inner`; the
-payer chooses the value. `shield` hashes `msg.value` into the commitment
-ON-CHAIN, so a deposit's value is what was actually deposited. A spend takes
-two inputs and makes two outputs (payment + change), proving in-circuit:
+Transfer sets `publicAmount = 0` and `ctx = 0`; withdraw sets `publicAmount > 0`
+and `ctx` naming the recipient. Either may carry a `fee`, paid from shielded
+value to `msg.sender`.
 
-- membership of each nonzero-value input at the anchored root (a zero-value
-  input is a dummy, for spending a single note through the 2-input circuit:
-  it contributes nothing to conservation, and its nullifier derives from its
-  own fabricated commitment, so it can never collide with a real note's);
-- value conservation `v_in1 + v_in2 = v_out1 + v_out2 + publicAmount + fee`
-  over six 128-bit range checks (the sum is < 2^131, far from the field);
-- the claim, the single public signal:
-  `claim = Poseidon(TAG_CLAIM, P3(root, nf1, nf2), P3(outCm1, outCm2, P3(publicAmount, fee, ctx)))`.
+## Contracts
 
-Transfer has `publicAmount = 0, ctx = 0`; withdraw has `publicAmount > 0` and
-`ctx` naming the recipient. Both may carry a fee. The four contract-side
-VERIFY bindings (pinned sender, key set, root source, operation shape) hold,
-with the key set generalised: the consumed nonce-key set must be exactly
-`{nf1, nf2}`, no extras. `NonceManager` (EIP-8250 emulation, with
-`consumeFreshMany`) and `RecentRoots` (EIP-8272 emulation) live in
-[`contracts/src/`](contracts/src/).
+The pool enforces four checks around each proof:
 
-## Layout
+1. the sender is the pinned `POOL_SENDER`;
+2. the two nullifiers are consumed as one keyed-nonce set `{nf1, nf2}`
+   (EIP-8250: shared `nonce_seq = 0`, atomic all-or-nothing);
+3. the claim's root is one of the pool's recent roots (EIP-8272);
+4. the operation shape is well-formed (transfer vs withdraw).
+
+Consuming the two nullifiers as a set makes the duplicate-key rule the defense
+against spending one note through both inputs: such a spend has `nf1 == nf2`,
+which the circuit accepts but the set consumption rejects, so it reverts and
+spends nothing.
 
 ```
-circuits/spend.circom    the join-split circuit (2-in/2-out, values, fee)
-reference/               poseidon_bn254.py (Python reference vs circomlibjs
-                         vectors) + gen_poseidon_sol.py (Solidity generator)
-vectors/                 differential vectors exported from circomlibjs
-tooling/                 pinned npm deps, export_vectors.js, setup.sh
 contracts/src/
-  PoseidonT3/T4.sol      GENERATED split EXTERNAL libraries (via-IR inlining
-                         busts EIP-170, and each half fits the hegota 2^24
-                         deploy budget); PoseidonBN254.sol is the facade
-  Groth16Verifier.sol    GENERATED by snarkjs (GPL-3.0 header, see NOTICE)
-  NonceManager.sol       EIP-8250 keyed-nonce emulation (consumeFreshMany)
-  RecentRoots.sol        EIP-8272 recent-roots emulation
-  ShieldedPool.sol       the join-split pool (4.9 KB runtime, linked)
-contracts/test/          35 tests: the attack battery with REAL proofs
-                         (incl. the same-note-twice star witness), multi-key
-                         set semantics in isolation, Poseidon differentials
-wallet/                  wallet.py (value notes, dummies, witness builder),
-                         gen_smoke.py (real proofs + the adversarial proof),
-                         smoke.sh, deploy_flow.sh (runs the attack live)
+  ShieldedPool.sol     the pool: Merkle tree, shield/transfer/withdraw, the four checks
+  NonceManager.sol     EIP-8250 keyed nonces (consumeFreshMany, MAX_NONCE_KEYS = 16)
+  RecentRoots.sol      EIP-8272 recent-roots ring
+  Groth16Verifier.sol  snarkjs verifier (GENERATED; GPL-3.0, see NOTICE)
+  PoseidonT3/T4.sol    Poseidon over BN254 (GENERATED); PoseidonBN254.sol is the facade
+circuits/spend.circom  the 2-in/2-out join-split circuit
+reference/             Python Poseidon reference and the Solidity generator
+vectors/               Poseidon test vectors exported from circomlibjs
+tooling/               npm deps, circuit compile and trusted-setup script
+wallet/                witness builder, proof generation, and end-to-end scripts
+devnet/                frame-transaction tooling and the devnet write-up (REVIEW.md)
 ```
 
 ## Run
 
 ```
-cd tooling && npm ci && ./setup.sh    # compile circuit + TESTBED trusted setup
-cd ../wallet && ./smoke.sh            # real proofs, off-chain verify, forge on-chain
-./deploy_flow.sh                      # deploy + full flow + live attack on anvil
+cd tooling && npm ci && ./setup.sh   # compile the circuit, run a TESTBED trusted setup
+cd ../wallet && ./smoke.sh           # generate real proofs, verify off-chain, run on-chain
+./deploy_flow.sh                     # deploy and run the full flow on a local node
 ```
 
-`forge test` runs unaided from a fresh clone: the committed fixture's proofs
-pair with the committed `Groth16Verifier.sol`. Re-running `setup.sh`
-re-randomises the ceremony and requires `gen_smoke.py` again; the two
-artifacts only ever ship together.
+`forge test` runs from a fresh clone: the committed proof fixtures pair with the
+committed `Groth16Verifier.sol`. Re-running `setup.sh` regenerates the ceremony
+and the fixtures together.
 
 ## Measured
 
-14,069 R1CS constraints at depth 20; proving ~600 ms in snarkjs (Node,
-M5 Max); 256-byte proofs. On-chain (via-ir, optimizer 200, external Poseidon
-library):
+Standard-EVM figures (via-IR, optimizer 200, Poseidon as an external library).
+Depth 20, 14,069 R1CS constraints, ~600 ms to prove (snarkjs, Node), 256-byte
+proofs.
 
-| operation | gas | what it pays for |
-|---|---:|---|
-| Groth16 verify | ~188k | the real proof check, in-EVM |
-| shield | ~1.11M | commitment hash + 20 tree levels |
-| transfer | ~2.48M | claim (4x hash3) + verify + TWO appends + fee payout |
-| withdraw | ~2.51M | same + publicAmount payout |
+| operation | gas |
+|---|---:|
+| Groth16 verify | ~188k |
+| shield | ~1.11M |
+| transfer | ~2.48M |
+| withdraw | ~2.51M |
 
-Every join-split appends two output commitments (40 Poseidon levels), twice
-the append cost of a single-output design. The external-library
-switch also prices each hash call with DELEGATECALL overhead (hash2 ~37k,
-hash3 ~112k); if this ever matters, batching the two appends into one
-root recomputation is the obvious headroom. A malformed proof still burns the
-submitter's full gas stipend before reverting (pairing-precompile behaviour);
-wallets pre-verify off-chain.
+Each spend appends two output commitments (two Merkle appends of 20 levels
+each). On the Hegotá devnet, EIP-8037's two-dimensional gas accounting raises
+these figures; see [devnet/REVIEW.md](devnet/REVIEW.md).
 
-## Running on a real 8141/8250/8272 devnet
+## Limitations
 
-`devnet/` plugs the pool onto lambdaclass/ethrex's Hegotá devnet as a
-frame-native application: each interaction rides a type-0x06 frame transaction
-(`pool_frametx.py`), and because a SENDER frame runs real EVM, the Groth16
-proof is verified **on-chain in-frame** with no attester. The full flow ran
-live on the public devnet on 2026-07-03: shield (1 ETH), join-split transfer,
-and withdraw all mined as frame transactions, with the recipient ending at
-exactly the proven public amount (addresses, tx hashes, and gas numbers in
-`devnet/REVIEW.md`, "The live run"). Deploying under EIP-8037 gas accounting
-(~1,545 gas per byte of runtime, 2^24 per-tx cap) required splitting the
-Poseidon library into `PoseidonT3`/`PoseidonT4` (`split_poseidon.py`,
-differential-tested against the same circomlibjs vectors). `devnet/REVIEW.md`
-is the full review of the devnet's EIP implementation and the integration:
-what maps cleanly (frame model, APPROVE including the paymaster-payment scope,
-on-chain verification), the two capability gaps that keep the spent-set and
-root-source bindings trusted rather than proven (no TXPARAM selector for
-`nonce_keys` or `recent_root_references`), and the operational findings from
-the live run (prefunded-key funding, broken gas estimation, the deploy cost
-model, and the mempool-only nature of the restricted-state rules).
-
-## Security posture
-
-- **Trusted setup**: `tooling/setup.sh` is a local, TESTBED-ONLY ceremony
-  (toxic-waste holder could forge membership and mint). `PTAU=...` plugs in a
-  public powers-of-tau; a real deployment also needs a multi-party phase 2.
-- **Not post-quantum**, by construction: BN254 pairings and Groth16.
-- **Privacy regresses versus fixed denomination, knowingly.** Internal
-  transfer amounts stay hidden, but shield and withdraw amounts (and fees)
-  are public, and exact-amount correlation between a deposit and a later
-  withdrawal is the classic deanonymization vector fixed denominations were
-  chosen to kill. This design trades that away to exercise the envelope;
-  wallets should use round amounts, delays, and partial withdrawals.
-- **Same-note-twice is refused by the envelope, not the circuit.** That is a
-  deliberate placement (it is exactly EIP-8250's duplicate-key rule doing the
-  work, which is what this build exists to test), but it means the key-set
-  binding is soundness-critical: a deployment whose VERIFY logic forgot the
-  duplicate check would double-count. The circuit could also enforce
-  `nf1 != nf2` for defense in depth; noted as a hardening option.
-- **Unaudited research code**, throughout.
+- **Trusted setup.** `tooling/setup.sh` runs a local, testbed-only ceremony
+  whose toxic waste could forge membership. `PTAU=<file>` supplies a public
+  powers-of-tau; a real deployment also needs a multi-party phase 2.
+- **Not post-quantum.** Security rests on BN254 pairings and Groth16.
+- **Amounts are public.** Shield and withdraw amounts and fees are visible
+  on-chain; only internal transfer amounts are hidden, and equal deposit and
+  withdrawal amounts are linkable.
+- **The duplicate-key check is soundness-critical.** Spending one note twice is
+  rejected by the nullifier-set consumption, not by the circuit; a deployment
+  that skipped that check would double-count. Enforcing `nf1 != nf2` in-circuit
+  is a possible hardening.
+- **Unaudited research code.**
