@@ -1,10 +1,9 @@
 # Minimal shielded pool
 
-A minimal, immutable, Tornado-style privacy pool for Ethereum: three operations
-(shield, transfer, withdraw), no token, no governance, no admin key, no
-compliance hooks. Notes carry an arbitrary value, a spend is a 2-in/2-out
+A minimal, immutable privacy pool prototype: three operations
+(shield, transfer, withdraw), no token, no governance, no admin key. Notes carry an arbitrary value, a spend is a 2-in/2-out
 join-split, and the proof is a Groth16 SNARK (circom + snarkjs) verified
-**on-chain** through the BN254 pairing precompiles, so there is no attester and
+onchain through the BN254 pairing precompiles, so there is no attester and
 nobody to compromise. It has run end to end on lambdaclass/ethrex's Hegotá
 devnet as a frame-native application, the full shield -> transfer -> withdraw
 flow mined live with the proof checked inside the SENDER frame (see
