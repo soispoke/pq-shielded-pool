@@ -42,7 +42,7 @@ The pool enforces four checks around each proof:
 3. the claim's root is one of the pool's recent roots (EIP-8272);
 4. the operation shape is well-formed (transfer vs withdraw).
 
-Consuming the two nullifiers as a set makes the duplicate-key rule the defense
+Consuming the 2 nullifiers as a set makes the duplicate-key rule the defense
 against spending one note through both inputs: such a spend has `nf1 == nf2`,
 which the circuit accepts but the set consumption rejects, so it reverts and
 spends nothing.
