@@ -39,6 +39,8 @@ contract ShieldedPoolBN254Test {
     address constant POOL_SENDER = address(0x5EEDED);
     string constant FIX = "../wallet/smoke_fixture.json";
 
+    event log_named_uint(string key, uint256 val); // decoded by forge at -vv
+
     function setUp() public {
         vm.roll(1000);
         roots = new RecentRoots();
@@ -364,6 +366,53 @@ contract ShieldedPoolBN254Test {
         tooFew[0] = lo;
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
         pool.checkKeySet(s, tooFew);
+    }
+
+    /// Gas split per operation: what a VERIFY frame would spend on the proof
+    /// check (verifySpend + the checkKeySet binding) vs what the SENDER/exec
+    /// frame spends on state. Run: forge test --mt test_gas_frame_split -vv
+    function test_gas_frame_split() public {
+        uint256 g;
+
+        // shield: no proof, so nothing runs in a VERIFY frame beyond the
+        // sender's self-verify signature; the whole cost is the exec deposit.
+        g = gasleft();
+        pool.shield{value: _u(".shield_value")}(_s(".inner_a"));
+        emit log_named_uint("shield.exec", g - gasleft());
+        uint64 slot = pool.lastRootSlot();
+        vm.roll(block.number + 1);
+
+        // transfer: VERIFY (verifySpend) + the key-set binding, then total.
+        ShieldedPool.Spend memory ts = _spendOf(".transfer", slot);
+        g = gasleft();
+        pool.verifySpend(ts);
+        emit log_named_uint("transfer.verify", g - gasleft());
+
+        bytes32[] memory keys = new bytes32[](2);
+        keys[0] = ts.nf1; keys[1] = ts.nf2;
+        if (uint256(keys[0]) > uint256(keys[1])) (keys[0], keys[1]) = (ts.nf2, ts.nf1);
+        g = gasleft();
+        pool.checkKeySet(ts, keys);
+        emit log_named_uint("transfer.checkKeySet", g - gasleft());
+
+        vm.prank(POOL_SENDER);
+        g = gasleft();
+        pool.transfer(ts);
+        emit log_named_uint("transfer.total", g - gasleft());
+        uint64 slotR2 = pool.lastRootSlot();
+        vm.roll(uint256(slotR2) + 2); // past the publish slot so the root is usable
+
+        // withdraw: VERIFY (verifySpend), then total.
+        address payable recipient = payable(vm.parseAddress(vm.parseJsonString(j, ".recipient")));
+        ShieldedPool.Spend memory ws = _spendOf(".withdraw", slotR2);
+        g = gasleft();
+        pool.verifySpend(ws);
+        emit log_named_uint("withdraw.verify", g - gasleft());
+
+        vm.prank(POOL_SENDER);
+        g = gasleft();
+        pool.withdraw(ws, recipient);
+        emit log_named_uint("withdraw.total", g - gasleft());
     }
 
     // minimal assert

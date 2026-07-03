@@ -290,6 +290,27 @@ vanilla-EVM contract can do). The SENDER frame then shrinks to the state
 changes: append the two output commitments and pay out, with the nullifiers
 already consumed as protocol keyed nonces at approval.
 
+**Measured gas split** (standard EVM, `forge test --mt test_gas_frame_split`),
+per operation, VERIFY frame (the proof check) vs exec frame (state changes):
+
+| operation | VERIFY frame (proof) | exec frame (state) | full |
+|---|---:|---:|---:|
+| shield   | none (no proof)     | ~1.40M | ~1.40M |
+| transfer | ~649k               | ~1.57M | ~2.21M |
+| withdraw | ~646k               | ~1.60M | ~2.24M |
+
+VERIFY is `verifySpend` plus `checkKeySet` (~3k): the Groth16 pairing check
+(~188k) and the claim recompute (four Poseidon hash3 calls, ~448k through the
+external library's DELEGATECALL). It sits well under the FOCIL draft's
+`MAX_VERIFY_GAS_PER_TX = 2^20` (~1.05M) but ~6.5x over EIP-8141's 100k mempool
+cap, so a proof-in-VERIFY spend needs a custom mempool or direct submission.
+The exec frame is dominated by the two Merkle appends (40 Poseidon hash2,
+~1.48M); shield is one append plus the commitment hash and carries no proof.
+About 50k of the exec figure is today's keyed-nonce consumption, which moves to
+the approval side in the faithful shape. These are vanilla-EVM numbers; the
+devnet's EIP-8037 two-dimensional accounting raises them, and inlining Poseidon
+or batching the two appends into one root recompute would cut both columns.
+
 ## The live run (2026-07-03)
 
 The full flow ran end to end on the public network, deployed from genesis
