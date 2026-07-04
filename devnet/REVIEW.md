@@ -353,8 +353,8 @@ so the Sepolia-sized 3M frame would not have been safe):
 The slot values ride in as `_slot_transfer` / `_slot_withdraw` in
 `deploy_config.json` (the receipt block numbers, since `eth_call` cannot read
 the pool's state here). `frametx.py` is the envelope encoder, `run_live.sh`
-the deploy driver, `frame_deploy.py` the deploy-frame probe used for finding
-5, and `deploy_config.json` in this directory holds the live addresses.
+the deploy driver, and `deploy_config.json` in this directory holds the live
+addresses.
 
 ## Bottom line
 

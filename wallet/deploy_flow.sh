@@ -82,20 +82,19 @@ SLOT_R1=$(call "$POOL" "lastRootSlot()(uint64)")
 R1=$(call "$POOL" "currentRoot()(bytes32)")
 [ "$R1" = "$(j "['transfer']['root']")" ] || { echo "R1 != fixture transfer root"; exit 1; }
 
-SENDER_BAL_0=$(cast balance "$POOL_SENDER" --rpc-url "$RPC_URL")
+echo "==> the same-note-twice attack (real proof, nf1 == nf2): must be refused"
+if cast send --rpc-url "$RPC_URL" --private-key "$POOL_SENDER_PK" "$POOL" \
+  "transfer($SPEND_SIG)" "$(spend_tuple attack_same_note "$R1" "$SLOT_R1")" >/dev/null 2>&1; then
+  echo "    ATTACK ACCEPTED, the key-set duplicate rule failed"; exit 1
+fi
+echo "    refused (duplicate key in the 8250 set)"
+
 
 echo "==> join-split transfer (two nullifiers as ONE 8250 key set; fee to sender)"
 send --private-key "$POOL_SENDER_PK" "$POOL" "transfer($SPEND_SIG)" "$(spend_tuple transfer "$R1" "$SLOT_R1")"
 SLOT_R2=$(call "$POOL" "lastRootSlot()(uint64)")
 R2=$(call "$POOL" "currentRoot()(bytes32)")
 [ "$R2" = "$(j "['withdraw']['root']")" ] || { echo "R2 != fixture withdraw root"; exit 1; }
-
-echo "==> the same-note-twice attack (real proof, nf1 == nf2): must be refused"
-if cast send --rpc-url "$RPC_URL" --private-key "$POOL_SENDER_PK" "$POOL" \
-  "transfer($SPEND_SIG)" "$(spend_tuple attack_same_note "$R1" "$SLOT_R1")" >/dev/null 2>&1; then
-  echo "    ATTACK ACCEPTED — the key-set duplicate rule failed"; exit 1
-fi
-echo "    refused (duplicate key in the 8250 set)"
 
 echo "==> withdraw (publicAmount to recipient, fee to sender)"
 RECIPIENT=$(j "['recipient']")
@@ -104,7 +103,7 @@ send --private-key "$POOL_SENDER_PK" "$POOL" "withdraw($SPEND_SIG,address)" \
   "$(spend_tuple withdraw "$R2" "$SLOT_R2")" "$RECIPIENT"
 BAL_AFTER=$(cast balance "$RECIPIENT" --rpc-url "$RPC_URL")
 echo "    recipient balance $BAL_BEFORE -> $BAL_AFTER"
-[ "$BAL_AFTER" = "$((BAL_BEFORE + $(j "['withdraw']['public_amount']")))" ] || { echo "recipient not paid publicAmount"; exit 1; }
+python3 -c "import sys;sys.exit(0 if int('$BAL_AFTER')==int('$BAL_BEFORE')+$(j "['withdraw']['public_amount']") else 1)" || { echo "recipient not paid publicAmount"; exit 1; }
 
 # the trustless-paymaster loop: the pinned sender was reimbursed both fees
 # from shielded value (anvil charges gas, so assert net = fees - gas > 0

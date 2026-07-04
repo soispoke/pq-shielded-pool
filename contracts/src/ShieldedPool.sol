@@ -49,6 +49,7 @@ contract ShieldedPool {
     NonceManager public immutable nonces;
     RecentRoots public immutable roots;
     Groth16Verifier public immutable verifier;
+    bytes32 public immutable sourceId; // EIP-8272 (address(this), SALT), fixed at deploy
 
     bytes32[DEPTH] public zeros; // zeros[l] = root of an all-zero depth-l subtree
     bytes32[DEPTH] public filledSubtrees;
@@ -81,6 +82,7 @@ contract ShieldedPool {
         POOL_SENDER = poolSender;
         roots = roots_;
         verifier = verifier_;
+        sourceId = roots_.sourceIdOf(address(this), SALT);
         nonces = new NonceManager(address(this));
         bytes32 z = bytes32(0);
         for (uint32 l = 0; l < DEPTH; l++) {
@@ -92,9 +94,6 @@ contract ShieldedPool {
         _publishRoot();
     }
 
-    function sourceId() public view returns (bytes32) {
-        return roots.sourceIdOf(address(this), SALT);
-    }
 
     // ---- operations ----
 
@@ -109,7 +108,8 @@ contract ShieldedPool {
         // a duplicate commitment shares one nullifier, so the second deposit
         // would be permanently unspendable; reject it (wallets use a fresh rho)
         if (isLeaf[cm]) revert DuplicateCommitment();
-        return _append(cm);
+        index = _append(cm);
+        _publishRoot();
     }
 
     struct Spend {
@@ -156,7 +156,7 @@ contract ShieldedPool {
     /// Reverts on any failure; returns the claim so a caller can bind to it.
     function verifySpend(Spend calldata s) public view returns (bytes32 claim) {
         if (s.nf1 == bytes32(0) || s.nf2 == bytes32(0)) revert ZeroNullifier();
-        if (!roots.check(sourceId(), s.slot, s.root)) revert RootNotRecentForPool();
+        if (!roots.check(sourceId, s.slot, s.root)) revert RootNotRecentForPool();
         claim = computeClaim(s);
         if (!verifier.verifyProof(s.pA, s.pB, s.pC, [uint256(claim)])) revert ProofInvalid();
     }
@@ -197,11 +197,16 @@ contract ShieldedPool {
     }
 
     /// Post-consumption state changes shared by both operations: append the
-    /// two output notes (duplicate appends are no-ops, never reverts), then
-    /// reimburse the submitter.
+    /// two output notes (duplicate appends are no-ops, never reverts), publish
+    /// the new root once, then reimburse the submitter. Note the asymmetry: a
+    /// failing fee/withdraw payout (PayoutFailed) or a full tree (TreeFull)
+    /// reverts here, AFTER approval; harmless in this emulation (the whole tx
+    /// reverts and nonces are restored), but under EIP-8250 approval-time
+    /// consumption a post-approval revert would burn the nullifiers.
     function _settle(Spend calldata s) internal {
         if (!isLeaf[s.outCm1]) _append(s.outCm1);
         if (!isLeaf[s.outCm2]) _append(s.outCm2);
+        _publishRoot();
         if (s.fee != 0) {
             emit FeePaid(msg.sender, s.fee);
             (bool ok,) = msg.sender.call{value: s.fee}("");
@@ -256,10 +261,12 @@ contract ShieldedPool {
             idx >>= 1;
         }
         currentRoot = node;
-        _publishRoot();
         emit LeafAppended(cm, index, node, uint64(block.number));
     }
 
+    /// Publish currentRoot to the EIP-8272 ring. Callers publish ONCE per
+    /// operation after all appends: a spend's two appends land in the same
+    /// slot, so the intermediate root would only be overwritten by the final.
     function _publishRoot() internal {
         lastRootSlot = uint64(block.number);
         roots.write(SALT, currentRoot);

@@ -368,6 +368,41 @@ contract ShieldedPoolBN254Test {
         pool.checkKeySet(s, tooFew);
     }
 
+    // BN254 scalar field modulus, for the aliasing test below.
+    uint256 constant P = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
+
+    /// A nullifier is only canonical in [0, P). Poseidon reduces its inputs
+    /// mod P, so nf + P hashes identically to nf: without the NotCanonical
+    /// guard in computeClaim, the same proof would re-verify under a fresh
+    /// nonce key (nf + P) and double-spend. This asserts the guard fires.
+    function test_verifySpend_rejects_noncanonical_nullifier() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        s.nf1 = bytes32(uint256(s.nf1) + P);
+        vm.expectRevert(ShieldedPool.NotCanonical.selector);
+        pool.verifySpend(s);
+    }
+
+    /// checkKeySet rejects a set whose two nullifiers are equal (nf1 == nf2):
+    /// the same-note-through-both-inputs witness, refused by the duplicate-key
+    /// clause that is the sole barrier in the VERIFY-frame shape.
+    function test_checkKeySet_rejects_duplicate_nullifier() public {
+        ShieldedPool.Spend memory s = _spendOf(".attack_same_note", 1); // nf1 == nf2
+        bytes32[] memory keys = new bytes32[](2);
+        keys[0] = s.nf1; keys[1] = s.nf2;
+        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
+        pool.checkKeySet(s, keys);
+    }
+
+    /// A root is usable only from its publish slot + 1 (EIP-8272 window lower
+    /// bound). A spend referencing it in the same block it was published must
+    /// fail, or a same-block reorg could reference a root that never settled.
+    function test_root_not_usable_at_publish_slot() public {
+        pool.shield{value: _u(".shield_value")}(_s(".inner_a"));
+        ShieldedPool.Spend memory s = _spendOf(".transfer", pool.lastRootSlot());
+        vm.expectRevert(ShieldedPool.RootNotRecentForPool.selector); // no roll: current == slot
+        pool.verifySpend(s);
+    }
+
     /// Gas split per operation: what a VERIFY frame would spend on the proof
     /// check (verifySpend + the checkKeySet binding) vs what the SENDER/exec
     /// frame spends on state. Run: forge test --mt test_gas_frame_split -vv

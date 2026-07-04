@@ -121,8 +121,11 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None):
     for _ in range(30):
         rcpt = rpc(url, "eth_getTransactionReceipt", [txhash])
         if rcpt:
+            status = int(rcpt.get('status', '0x0'), 16)
             print(f"  MINED block={int(rcpt['blockNumber'],16)} type={rcpt.get('type')} "
                   f"status={rcpt.get('status')} gasUsed={int(rcpt.get('gasUsed','0x0'),16)}")
+            if status != 1:
+                raise SystemExit(f'  tx reverted (status {rcpt.get("status")}); aborting')
             return rcpt
         time.sleep(2)
     raise SystemExit("  not mined within timeout")
@@ -146,12 +149,12 @@ def main():
         build_and_send(url, pk, pool, value, calldata)
     elif op == "transfer":
         e = fix["transfer"]
-        e = {**e, "slot": cfg.get("_slot_transfer", 0)}
+        e = {**e, "slot": cfg["_slot_transfer"]}
         calldata = cast_calldata(f"transfer({SPEND_TUPLE})", spend_args(e))
         print("join-split transfer via frame tx (proof verified on-chain in the SENDER frame)")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces)
     elif op == "withdraw":
-        e = {**fix["withdraw"], "slot": cfg.get("_slot_withdraw", 0)}
+        e = {**fix["withdraw"], "slot": cfg["_slot_withdraw"]}
         calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address)", spend_args(e), fix["recipient"])
         print("join-split withdraw via frame tx")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces)

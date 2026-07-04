@@ -9,6 +9,7 @@ Wire layout (ethrex hegota-devnet), verified against the repo golden vector:
   signature = rlp([scheme, signer, msg, signature_bytes])
   sig_hash  = keccak256(0x06 || rlp(envelope with empty-msg signatures' bytes elided))
 """
+import sys
 from eth_hash.auto import keccak
 
 # ---------- minimal RLP ----------
@@ -113,3 +114,4 @@ if __name__ == "__main__":
     if got_sh != EXPECT_SIGHASH:
         print("  expected:", EXPECT_SIGHASH)
         print("  got:     ", got_sh)
+    sys.exit(0 if got_rlp == EXPECT_RLP and got_sh == EXPECT_SIGHASH else 1)

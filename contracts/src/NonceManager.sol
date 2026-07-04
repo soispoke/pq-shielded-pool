@@ -30,15 +30,6 @@ contract NonceManager {
         return seq[slotOf(sender, key)];
     }
 
-    /// Consume `key` for `sender` at sequence 0 (a fresh single-use key, the
-    /// nullifier pattern). Reverts if the key was already used for this sender.
-    function consumeFresh(address sender, bytes32 key) external {
-        if (msg.sender != pool) revert NotPool();
-        bytes32 s = slotOf(sender, key);
-        if (seq[s] != 0) revert NonceKeyAlreadyUsed();
-        seq[s] = 1;
-    }
-
     uint256 public constant MAX_NONCE_KEYS = 16;
 
     error EmptyKeySet();

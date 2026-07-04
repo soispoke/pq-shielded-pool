@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Split PoseidonBN254.sol into PoseidonT3.sol (hash2+C3) and PoseidonT4.sol
-(hash3+C4), hoisting the repeated field-modulus PUSH32 literal into a local
-`p` so each library's runtime fits the hegota devnet's 2^24 per-tx gas cap
+(hash3+C4), hoisting the repeated field-modulus PUSH32 literal into scratch
+memory (slot 0x00) so each library's runtime fits the hegota devnet's 2^24 per-tx gas cap
 (code deposit costs ~1545 gas/byte there under EIP-8037 accounting).
 PoseidonBN254.sol becomes a thin internal wrapper; callers are unchanged."""
-import re, sys
+import re
 
 SRC = "src/PoseidonBN254.sol"
 LIT = "21888242871839275222246405745257275088548364400416034343698204186575808495617"

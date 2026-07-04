@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Live deploy of the BN254 join-split pool to a JSON-RPC node, then the
-# frame-native flow via pool_frametx.py. Deployment is plain contract-creation
+# Deploy the BN254 join-split pool to a JSON-RPC node. This script deploys
+# only; run the shield/transfer/withdraw flow with pool_frametx.py afterward
+# (see the closing note). Deployment is plain contract-creation
 # (this works on the Hegotá devnet; the earlier "no deploy path" finding was a
 # funding artifact, see REVIEW.md finding 4); the spends are EIP-8141 frame
 # transactions with the Groth16 proof verified on-chain in the SENDER frame.
