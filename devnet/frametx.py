@@ -49,8 +49,7 @@ class Frame:
                          rlp_int(self.gas_limit), rlp_int(self.value), rlp_bytes(self.data)])
 
 class FrameSig:
-    SECP256K1 = 0
-    P256 = 1
+    SECP256K1 = 0  # wire enum also defines 1 = P256, unused here
     def __init__(self, scheme, signer, msg, signature):
         self.scheme, self.signer, self.msg, self.signature = scheme, signer, msg, signature
     def rlp(self, elide=False):

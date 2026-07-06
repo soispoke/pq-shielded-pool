@@ -34,10 +34,22 @@ What this integration does NOT do, and why (see REVIEW.md):
     pool reads its own RecentRoots. The devnet does not deliver the slot to
     the EL yet, and no opcode exposes the refs to the pool.
 
+The `--proof-in-verify` flag builds the FAITHFUL shape instead, in the
+EIP-8141 [only_verify, pay] grammar: an execution-scope self-verify frame
+followed by a payment-scope pay frame targeting the proof-gated paymaster
+(paymaster.py), which staticcalls pool.verifySpend and APPROVEs payment only
+on a valid proof, so the proof is checked before any approval. This grammar
+mines on the devnet (validated 2026-07-05 via OpenSponsor). Two devnet-side
+conditions still gate a real proof-in-VERIFY spend on the PUBLIC endpoint:
+verifySpend ~243k busts MAX_VERIFY_GAS = 100k, and the paymaster's STATICCALL
+is banned by the mempool ERC-7562 observer, so the spend submits
+builder-direct (which it must anyway, since nonce_keys=[nf1,nf2] is not
+public-mempool admissible). The paymaster must be funded: it is the payer.
+
 Usage:
   pool_frametx.py <rpc> deploy-config.json fixture.json shield   <priv>
-  pool_frametx.py <rpc> deploy-config.json fixture.json transfer <pool_sender_priv>
-  pool_frametx.py <rpc> deploy-config.json fixture.json withdraw <pool_sender_priv>
+  pool_frametx.py <rpc> deploy-config.json fixture.json transfer <pool_sender_priv> [--proof-in-verify]
+  pool_frametx.py <rpc> deploy-config.json fixture.json withdraw <pool_sender_priv> [--proof-in-verify]
 """
 import json
 import subprocess
@@ -82,7 +94,7 @@ def spend_args(entry):
             f'{entry["fee"]},{entry["ctx"]},{pair(p["pA"])},{pb},{pair(p["pC"])})')
 
 
-def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None):
+def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_verify=None):
     sender = int.from_bytes(pk.public_key.to_canonical_address(), "big")
     chain_id = int(rpc(url, "eth_chainId", []), 16)
     nonce = int(rpc(url, "eth_getTransactionCount", [pk.public_key.to_checksum_address(), "latest"]), 16)
@@ -94,17 +106,37 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None):
     nonce_seq = 0 if protocol_nonces else nonce
 
     def build():
+        if proof_verify:
+            # The FAITHFUL shape, EIP-8141 [only_verify, pay] grammar (validated
+            # live via OpenSponsor on 2026-07-05). Frame 0 self-verifies for the
+            # EXECUTION scope only (0x02, target sender). Frame 1 is the pay
+            # frame (0x01, PAYMENT scope) targeting the proof-gated paymaster,
+            # which staticcalls pool.verifySpend and APPROVEs payment only on a
+            # valid proof; the paymaster must be funded (it is the payer). Two
+            # devnet-side conditions still gate inclusion on the PUBLIC endpoint
+            # (both documented in REVIEW.md): verifySpend ~243k busts
+            # MAX_VERIFY_GAS = 100k, and the paymaster's STATICCALL is banned by
+            # the mempool ERC-7562 observer, so a real spend submits
+            # builder-direct (which it must anyway for nonce_keys=[nf1,nf2]).
+            paymaster, vcalldata = proof_verify
+            frames = [
+                Frame(mode=1, flags=0x02, target=sender, gas_limit=20_000, value=0, data=b""),
+                Frame(mode=1, flags=0x01, target=paymaster, gas_limit=300_000, value=0, data=vcalldata),
+            ]
+        else:
+            # Today's shape: one self-verify frame approves execution AND payment
+            # (0x03), so the sender is its own payer. VERIFY stays under
+            # FRAME_TX_MAX_VERIFY_GAS = 100k, which caps Σ(prefix frame gas) +
+            # signature cost; 100k exactly is rejected.
+            frames = [Frame(mode=1, flags=0x03, target=sender, gas_limit=80_000, value=0, data=b"")]
+        # The SENDER frame is not part of the capped prefix. EIP-8037
+        # state-dimension accounting inflates receipt gas ~2-4x over
+        # Sepolia numbers, so size the execution frame generously.
+        frames.append(Frame(mode=2, flags=0, target=pool, gas_limit=10_000_000,
+                            value=value, data=calldata))
         tx = FrameTx(
             chain_id=chain_id, nonce_keys=nonce_keys, nonce_seq=nonce_seq, sender=sender,
-            frames=[
-                # VERIFY stays under FRAME_TX_MAX_VERIFY_GAS = 100k, which caps
-                # Σ(prefix frame gas) + signature cost; 100k exactly is rejected.
-                Frame(mode=1, flags=0x03, target=sender, gas_limit=80_000, value=0, data=b""),
-                # The SENDER frame is not part of the capped prefix. EIP-8037
-                # state-dimension accounting inflates receipt gas ~2-4x over
-                # Sepolia numbers, so size the execution frame generously.
-                Frame(mode=2, flags=0, target=pool, gas_limit=10_000_000, value=value, data=calldata),
-            ],
+            frames=frames,
             signatures=[FrameSig(FrameSig.SECP256K1, sender, b"", b"")],
             max_priority_fee=max_priority, max_fee=max_fee)
         s = pk.sign_msg_hash(tx.sig_hash())
@@ -137,10 +169,22 @@ def main():
     fix = json.loads(open(fix_path).read())
     pool = int(cfg["pool"], 16)
     pk = keys.PrivateKey(bytes.fromhex(priv.removeprefix("0x")))
+    # --proof-in-verify implies protocol nonces: the ProofPaymaster binds the
+    # envelope's nonce_keys to the proven nullifiers (NONCEKEYLOAD), so the two
+    # nullifiers MUST be the transaction's key set.
+    proof_in_verify = "--proof-in-verify" in sys.argv and op in ("transfer", "withdraw")
     protocol_nonces = None
-    if "--protocol-nonces" in sys.argv and op in ("transfer", "withdraw"):
+    if ("--protocol-nonces" in sys.argv or proof_in_verify) and op in ("transfer", "withdraw"):
         e = fix[op]
         protocol_nonces = sorted([int(e["nf1"], 16), int(e["nf2"], 16)])  # strictly increasing
+
+    def verify_frame(e):
+        """The faithful-shape VERIFY frame: ProofPaymaster target, verifySpend data.
+        The paymaster binds nonce_keys == {nf1, nf2} and staticcalls verifySpend."""
+        if not proof_in_verify:
+            return None
+        return (int(cfg["paymaster"], 16),
+                cast_calldata(f"verifySpend({SPEND_TUPLE})", spend_args(e)))
 
     if op == "shield":
         value = int(fix["shield_value"])
@@ -148,16 +192,15 @@ def main():
         print(f"shield {value} wei via frame tx -> pool {cfg['pool']}")
         build_and_send(url, pk, pool, value, calldata)
     elif op == "transfer":
-        e = fix["transfer"]
-        e = {**e, "slot": cfg["_slot_transfer"]}
+        e = {**fix["transfer"], "slot": cfg["_slot_transfer"]}
         calldata = cast_calldata(f"transfer({SPEND_TUPLE})", spend_args(e))
         print("join-split transfer via frame tx (proof verified on-chain in the SENDER frame)")
-        build_and_send(url, pk, pool, 0, calldata, protocol_nonces)
+        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e))
     elif op == "withdraw":
         e = {**fix["withdraw"], "slot": cfg["_slot_withdraw"]}
         calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address)", spend_args(e), fix["recipient"])
         print("join-split withdraw via frame tx")
-        build_and_send(url, pk, pool, 0, calldata, protocol_nonces)
+        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e))
     else:
         raise SystemExit(f"unknown op {op}")
 

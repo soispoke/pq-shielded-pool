@@ -3,4 +3,5 @@ __pycache__/
 .DS_Store
 .venv/
 venv/
-wallet/deploy_config.json
+build/
+wallet/artifacts/

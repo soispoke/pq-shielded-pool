@@ -18,7 +18,6 @@ set -euo pipefail
 cd "$(dirname "$0")"
 CONTRACTS=../contracts
 FIX=smoke_fixture.json
-CONFIG=deploy_config.json
 
 [ -f "$FIX" ] || { echo "no $FIX; run ./smoke.sh first"; exit 1; }
 
@@ -57,15 +56,19 @@ echo "==> deploying"
 ROOTS=$($FC src/RecentRoots.sol:RecentRoots | deployed)
 VERIFIER=$($FC src/Groth16Verifier.sol:Groth16Verifier | deployed)
 # the Poseidon halves deploy once each and link into the pool (EIP-170
-# headroom; split so each half also fits the hegota 2^24 deploy budget)
+# headroom; split so each half also fits the hegota 2^24 deploy budget).
+# T4 deploys under the legacy libsmall profile: via-IR roughly doubles its
+# hash3 runtime cost (111,611 vs 58,413 gas; since the publics are bound
+# directly by the verifier, hash3 runs only in shield's commitment). T3 goes
+# the other way (hash2 34,960 via-IR vs 41,938 legacy), so it keeps the
+# default profile.
 T3=$($FC src/PoseidonT3.sol:PoseidonT3 | deployed)
-T4=$($FC src/PoseidonT4.sol:PoseidonT4 | deployed)
+T4=$(FOUNDRY_PROFILE=libsmall $FC src/PoseidonT4.sol:PoseidonT4 | deployed)
 POOL=$($FC src/ShieldedPool.sol:ShieldedPool \
   --libraries "src/PoseidonT3.sol:PoseidonT3:$T3" \
   --libraries "src/PoseidonT4.sol:PoseidonT4:$T4" \
   --constructor-args "$POOL_SENDER" "$ROOTS" "$VERIFIER" | deployed)
 NONCES=$(cast call "$POOL" "nonces()(address)" --rpc-url "$RPC_URL")
-DEPLOY_BLOCK=$(cast block-number --rpc-url "$RPC_URL")
 echo "    pool $POOL  roots $ROOTS  verifier $VERIFIER  nonces $NONCES"
 
 send() { cast send --rpc-url "$RPC_URL" "$@" >/dev/null; }
@@ -113,11 +116,6 @@ EXPECT=$(python3 -c "import json;f=json.load(open('$FIX'));print(int(f['shield_v
 [ "$POOL_BAL" = "$EXPECT" ] || { echo "pool balance $POOL_BAL != expected $EXPECT (fees not paid?)"; exit 1; }
 echo "    pool balance == the one unspent change note; both fees left to the sender"
 
-python3 - "$CHAINID" "$POOL" "$ROOTS" "$VERIFIER" "$NONCES" "$T3" "$T4" "$POOL_SENDER" "$DEPLOY_BLOCK" <<'PY'
-import json, sys
-k = ["chainId","pool","roots","verifier","nonces","poseidonT3","poseidonT4","poolSender","deploymentBlock"]
-json.dump(dict(zip(k, sys.argv[1:])), open("deploy_config.json","w"), indent=1)
-PY
-echo "==> flow complete; wrote $CONFIG"
+echo "==> flow complete"
 echo "    shield + join-split transfer + withdraw accepted, same-note attack refused,"
 echo "    fees reimbursed the submitter: multi-key 8250 + paymaster loop, live."

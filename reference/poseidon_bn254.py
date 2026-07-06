@@ -11,7 +11,7 @@ the same circomlibjs package the circuit's poseidon.circom pairs with.
 `python3 poseidon_bn254.py` checks every vector in
 ../vectors/poseidon_bn254_vectors.json (computed by two independent
 circomlibjs implementations and asserted equal at export), including the
-pool's tagged owner_pk / cm / nf / claim chain and the depth-20
+pool's tagged owner_pk / cm / nf / out_cm chain and the depth-20
 incremental-tree fixtures. This file is the wallet-side building block and
 the source the Solidity library is checked against.
 """
@@ -47,7 +47,7 @@ def poseidon(inputs):
 
 
 # ---- the pool's tagged-hash shapes (mirrors ../circuits/spend.circom) ----
-TAG_PK, TAG_LEAF, TAG_NULL, TAG_CLAIM = 1, 2, 3, 4
+TAG_PK, TAG_LEAF, TAG_NULL = 1, 2, 3
 
 
 def p2(a, b):
@@ -89,10 +89,6 @@ def _check():
     out_cm1 = tagged(TAG_LEAF, c["out_inner1"], c["out_value1"])
     out_cm2 = tagged(TAG_LEAF, c["out_inner2"], c["out_value2"])
     assert out_cm1 == c["out_cm1"] and out_cm2 == c["out_cm2"], "out_cm mismatch"
-    claim = tagged(TAG_CLAIM, p3(c["root"], nf, nf2),
-                   p3(out_cm1, out_cm2,
-                      p3(c["public_amount"], c["fee"], c["ctx"])))
-    assert claim == c["claim"], "claim mismatch"
 
     t = vecs["tree"]
     zeros = [0]

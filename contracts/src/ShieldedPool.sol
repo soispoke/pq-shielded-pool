@@ -19,7 +19,7 @@ import {RecentRoots} from "./RecentRoots.sol";
 ///            generalises to: consumed set == exactly {nf1, nf2}, no extras.
 ///
 ///         2. The TRUSTLESS-PAYMASTER fee binding. Every spend carries a
-///            `fee` bound inside the claim; the contract pays it to
+///            `fee` bound as a proof public signal; the contract pays it to
 ///            msg.sender from shielded value. On Sepolia msg.sender is the
 ///            pinned POOL_SENDER, so the pinned sender is reimbursed by the
 ///            notes it submits for: the fee story that the fixed-denomination
@@ -51,8 +51,9 @@ contract ShieldedPool {
     Groth16Verifier public immutable verifier;
     bytes32 public immutable sourceId; // EIP-8272 (address(this), SALT), fixed at deploy
 
-    bytes32[DEPTH] public zeros; // zeros[l] = root of an all-zero depth-l subtree
-    bytes32[DEPTH] public filledSubtrees;
+    // filledSubtrees[l] = the latest completed left subtree at level l; slot
+    // DEPTH is written (and read) only by the leaf that fills the tree.
+    bytes32[DEPTH + 1] public filledSubtrees;
     uint32 public nextIndex;
     bytes32 public currentRoot;
     uint64 public lastRootSlot; // the slot currentRoot was published at (EIP-8272)
@@ -84,13 +85,10 @@ contract ShieldedPool {
         verifier = verifier_;
         sourceId = roots_.sourceIdOf(address(this), SALT);
         nonces = new NonceManager(address(this));
-        bytes32 z = bytes32(0);
         for (uint32 l = 0; l < DEPTH; l++) {
-            zeros[l] = z;
-            filledSubtrees[l] = z;
-            z = _hashPair(z, z);
+            filledSubtrees[l] = _zeros(l);
         }
-        currentRoot = z;
+        currentRoot = _zeros(DEPTH);
         _publishRoot();
     }
 
@@ -108,7 +106,9 @@ contract ShieldedPool {
         // a duplicate commitment shares one nullifier, so the second deposit
         // would be permanently unspendable; reject it (wallets use a fresh rho)
         if (isLeaf[cm]) revert DuplicateCommitment();
-        index = _append(cm);
+        index = _insert(cm);
+        currentRoot = _computeRoot();
+        emit LeafAppended(cm, index, currentRoot, uint64(block.number));
         _publishRoot();
     }
 
@@ -147,18 +147,27 @@ contract ShieldedPool {
     }
 
     /// Spend validity independent of who submits it: the non-zero nullifiers,
-    /// the EIP-8272 recent-root binding, and the Groth16 proof over the
-    /// recomputed claim. VIEW-only, so it is legal inside a VERIFY (static)
+    /// the EIP-8272 recent-root binding, and the Groth16 proof over the eight
+    /// public signals, bound directly in the circuit's order (outputs first,
+    /// then public inputs). VIEW-only, so it is legal inside a VERIFY (static)
     /// frame: a paymaster staticcalls this to decide whether to APPROVE, and
     /// the protocol then consumes the nullifiers as keyed nonces at approval.
     /// It does not check the pinned sender (a VERIFY frame runs as ENTRY_POINT,
     /// not tx.sender), so that binding stays in the SENDER-frame path (_spend).
-    /// Reverts on any failure; returns the claim so a caller can bind to it.
-    function verifySpend(Spend calldata s) public view returns (bytes32 claim) {
+    /// Reverts on any failure. The canonicity and range guards duplicate the
+    /// verifier's own field checks and the circuit's 128-bit range checks;
+    /// they are kept for the named errors and as defense in depth.
+    function verifySpend(Spend calldata s) public view {
         if (s.nf1 == bytes32(0) || s.nf2 == bytes32(0)) revert ZeroNullifier();
         if (!roots.check(sourceId, s.slot, s.root)) revert RootNotRecentForPool();
-        claim = computeClaim(s);
-        if (!verifier.verifyProof(s.pA, s.pB, s.pC, [uint256(claim)])) revert ProofInvalid();
+        if (uint256(s.root) >= P || uint256(s.nf1) >= P || uint256(s.nf2) >= P
+            || uint256(s.outCm1) >= P || uint256(s.outCm2) >= P || uint256(s.ctx) >= P) {
+            revert NotCanonical();
+        }
+        if (s.publicAmount >= MAX_VALUE || s.fee >= MAX_VALUE) revert ValueTooLarge();
+        if (!verifier.verifyProof(s.pA, s.pB, s.pC,
+            [uint256(s.nf1), uint256(s.nf2), uint256(s.outCm1), uint256(s.outCm2),
+             uint256(s.root), s.publicAmount, s.fee, uint256(s.ctx)])) revert ProofInvalid();
     }
 
     /// The EIP-8250 spent-set binding as a pure check: the transaction's
@@ -196,16 +205,27 @@ contract ShieldedPool {
         emit NoteSpent(s.nf2);
     }
 
-    /// Post-consumption state changes shared by both operations: append the
-    /// two output notes (duplicate appends are no-ops, never reverts), publish
-    /// the new root once, then reimburse the submitter. Note the asymmetry: a
-    /// failing fee/withdraw payout (PayoutFailed) or a full tree (TreeFull)
-    /// reverts here, AFTER approval; harmless in this emulation (the whole tx
-    /// reverts and nonces are restored), but under EIP-8250 approval-time
-    /// consumption a post-approval revert would burn the nullifiers.
+    /// Post-consumption state changes shared by both operations: insert the
+    /// two output notes (duplicate inserts are no-ops, never reverts),
+    /// recompute and publish the new root once, then reimburse the submitter.
+    /// Note the asymmetry: a failing fee/withdraw payout (PayoutFailed) or a
+    /// full tree (TreeFull) reverts here, AFTER approval; harmless in this
+    /// emulation (the whole tx reverts and nonces are restored), but under
+    /// EIP-8250 approval-time consumption a post-approval revert would burn
+    /// the nullifiers.
     function _settle(Spend calldata s) internal {
-        if (!isLeaf[s.outCm1]) _append(s.outCm1);
-        if (!isLeaf[s.outCm2]) _append(s.outCm2);
+        uint32 i1;
+        uint32 i2;
+        bool new1 = !isLeaf[s.outCm1];
+        if (new1) i1 = _insert(s.outCm1);
+        bool new2 = !isLeaf[s.outCm2];
+        if (new2) i2 = _insert(s.outCm2);
+        if (new1 || new2) {
+            currentRoot = _computeRoot();
+            uint64 slot = uint64(block.number);
+            if (new1) emit LeafAppended(s.outCm1, i1, currentRoot, slot);
+            if (new2) emit LeafAppended(s.outCm2, i2, currentRoot, slot);
+        }
         _publishRoot();
         if (s.fee != 0) {
             emit FeePaid(msg.sender, s.fee);
@@ -214,23 +234,7 @@ contract ShieldedPool {
         }
     }
 
-    // ---- claim and encodings ----
-
-    /// claim = Poseidon(TAG_CLAIM, P3(root, nf1, nf2),
-    ///                  P3(outCm1, outCm2, P3(publicAmount, fee, ctx)));
-    /// rejects non-canonical digests and out-of-range amounts (the circuit
-    /// range-checks 128 bits, so larger values could never have a proof).
-    function computeClaim(Spend calldata s) public pure returns (bytes32) {
-        if (uint256(s.root) >= P || uint256(s.nf1) >= P || uint256(s.nf2) >= P
-            || uint256(s.outCm1) >= P || uint256(s.outCm2) >= P || uint256(s.ctx) >= P) {
-            revert NotCanonical();
-        }
-        if (s.publicAmount >= MAX_VALUE || s.fee >= MAX_VALUE) revert ValueTooLarge();
-        uint256 c1 = PoseidonBN254.hash3(uint256(s.root), uint256(s.nf1), uint256(s.nf2));
-        uint256 c3 = PoseidonBN254.hash3(s.publicAmount, s.fee, uint256(s.ctx));
-        uint256 c2 = PoseidonBN254.hash3(uint256(s.outCm1), uint256(s.outCm2), c3);
-        return bytes32(PoseidonBN254.hash3(4, c1, c2));
-    }
+    // ---- encodings ----
 
     /// The withdraw context digest for a recipient: the address itself as one
     /// field element (a uint160 is always canonical). Must match the wallet.
@@ -244,29 +248,74 @@ contract ShieldedPool {
         return bytes32(PoseidonBN254.hash2(uint256(l), uint256(r)));
     }
 
-    function _append(bytes32 cm) internal returns (uint32 index) {
+    /// Write-only frontier insert (deposit-contract style): hash up while the
+    /// index bit is 1, absorbing the filled left sibling, then record the
+    /// completed subtree once at the first 0 bit. The root is recomputed
+    /// separately (_computeRoot), so an operation inserting two leaves pays
+    /// the 20-level path to the root once instead of twice, and every
+    /// filledSubtrees write is one that a later hash actually reads.
+    function _insert(bytes32 cm) internal returns (uint32 index) {
         index = nextIndex;
         if (index >= uint32(1) << DEPTH) revert TreeFull();
         nextIndex = index + 1;
         isLeaf[cm] = true;
         bytes32 node = cm;
         uint32 idx = index;
-        for (uint32 l = 0; l < DEPTH; l++) {
-            if (idx & 1 == 0) {
-                filledSubtrees[l] = node;
-                node = _hashPair(node, zeros[l]);
-            } else {
-                node = _hashPair(filledSubtrees[l], node);
-            }
+        uint32 l = 0;
+        while (idx & 1 == 1) {
+            node = _hashPair(filledSubtrees[l], node);
             idx >>= 1;
+            l++;
         }
-        currentRoot = node;
-        emit LeafAppended(cm, index, node, uint64(block.number));
+        filledSubtrees[l] = node; // l == DEPTH only for the leaf filling the tree
     }
 
-    /// Publish currentRoot to the EIP-8272 ring. Callers publish ONCE per
-    /// operation after all appends: a spend's two appends land in the same
-    /// slot, so the intermediate root would only be overwritten by the final.
+    /// Root of the current tree: hash the next empty position (an all-zero
+    /// subtree) up the frontier, pairing with the filled left sibling where
+    /// the index bit is 1 and the all-zero right sibling where it is 0. A
+    /// full tree has no empty position; its root is the completed level-DEPTH
+    /// subtree recorded by the final _insert.
+    function _computeRoot() internal view returns (bytes32 node) {
+        uint32 idx = nextIndex;
+        if (idx == uint32(1) << DEPTH) return filledSubtrees[DEPTH];
+        for (uint32 l = 0; l < DEPTH; l++) {
+            node = idx & 1 == 0 ? _hashPair(node, _zeros(l)) : _hashPair(filledSubtrees[l], node);
+            idx >>= 1;
+        }
+    }
+
+    /// Root of an all-zero depth-l subtree. These depend only on DEPTH and
+    /// the hash, so they live in code, not storage. Generated from
+    /// reference/poseidon_bn254.py by zeros(l+1) = Poseidon2(zeros(l), zeros(l));
+    /// zeros(DEPTH) is the empty tree's root, checked against the reference
+    /// fixture in ../test/ShieldedPool.t.sol.
+    function _zeros(uint32 l) internal pure returns (bytes32) {
+        if (l == 0) return bytes32(0);
+        if (l == 1) return 0x2098f5fb9e239eab3ceac3f27b81e481dc3124d55ffed523a839ee8446b64864;
+        if (l == 2) return 0x1069673dcdb12263df301a6ff584a7ec261a44cb9dc68df067a4774460b1f1e1;
+        if (l == 3) return 0x18f43331537ee2af2e3d758d50f72106467c6eea50371dd528d57eb2b856d238;
+        if (l == 4) return 0x07f9d837cb17b0d36320ffe93ba52345f1b728571a568265caac97559dbc952a;
+        if (l == 5) return 0x2b94cf5e8746b3f5c9631f4c5df32907a699c58c94b2ad4d7b5cec1639183f55;
+        if (l == 6) return 0x2dee93c5a666459646ea7d22cca9e1bcfed71e6951b953611d11dda32ea09d78;
+        if (l == 7) return 0x078295e5a22b84e982cf601eb639597b8b0515a88cb5ac7fa8a4aabe3c87349d;
+        if (l == 8) return 0x2fa5e5f18f6027a6501bec864564472a616b2e274a41211a444cbe3a99f3cc61;
+        if (l == 9) return 0x0e884376d0d8fd21ecb780389e941f66e45e7acce3e228ab3e2156a614fcd747;
+        if (l == 10) return 0x1b7201da72494f1e28717ad1a52eb469f95892f957713533de6175e5da190af2;
+        if (l == 11) return 0x1f8d8822725e36385200c0b201249819a6e6e1e4650808b5bebc6bface7d7636;
+        if (l == 12) return 0x2c5d82f66c914bafb9701589ba8cfcfb6162b0a12acf88a8d0879a0471b5f85a;
+        if (l == 13) return 0x14c54148a0940bb820957f5adf3fa1134ef5c4aaa113f4646458f270e0bfbfd0;
+        if (l == 14) return 0x190d33b12f986f961e10c0ee44d8b9af11be25588cad89d416118e4bf4ebe80c;
+        if (l == 15) return 0x22f98aa9ce704152ac17354914ad73ed1167ae6596af510aa5b3649325e06c92;
+        if (l == 16) return 0x2a7c7c9b6ce5880b9f6f228d72bf6a575a526f29c66ecceef8b753d38bba7323;
+        if (l == 17) return 0x2e8186e558698ec1c67af9c14d463ffc470043c9c2988b954d75dd643f36b992;
+        if (l == 18) return 0x0f57c5571e9a4eab49e2c8cf050dae948aef6ead647392273546249d1c1ff10f;
+        if (l == 19) return 0x1830ee67b5fb554ad5f63d4388800e1cfe78e310697d46e43c9ce36134f72cca;
+        return 0x2134e76ac5d21aab186c2be1dd8f84ee880a1e46eaf712f9d371b6df22191f3e; // l == DEPTH
+    }
+
+    /// Publish currentRoot to the EIP-8272 ring. Callers recompute and
+    /// publish ONCE per operation after all inserts, so a spend's two leaves
+    /// never materialise an intermediate root.
     function _publishRoot() internal {
         lastRootSlot = uint64(block.number);
         roots.write(SALT, currentRoot);

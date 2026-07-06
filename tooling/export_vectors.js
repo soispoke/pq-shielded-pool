@@ -11,7 +11,7 @@
 //
 // Vector set: zero, unit, counter, and LCG-seeded
 // states for Poseidon(2) and Poseidon(3), plus the pool chain from seed 2026
-// (owner_pk, cm, nf, claim) and the depth-20 incremental-tree fixtures.
+// (owner_pk, cm, nf, out_cm) and the depth-20 incremental-tree fixtures.
 
 const fs = require("fs");
 const path = require("path");
@@ -65,17 +65,16 @@ async function main() {
   const vec3 = cases(3).map((c) => ({ in: c.map(String), out: hash(c).toString() }));
 
   // ---- the pool's tagged chain (mirrors circuits/spend.circom), seed 2026 ----
-  // note chain: value-carrying note, then the join-split claim over
-  // (root, nf1, nf2, out_cm1, out_cm2, public_amount, fee, ctx)
+  // note chain: the value-carrying note and the join-split outputs; the
+  // publics themselves are bound directly as Groth16 public signals, so no
+  // hash beyond the note chain exists to fix a vector for
   const lcg = new Lcg(2026);
-  const [spend_key, rho, root, out_inner1, out_inner2, ctx_r] =
-    Array.from({ length: 6 }, () => lcg.nextFe(p));
+  const [spend_key, rho, out_inner1, out_inner2] =
+    Array.from({ length: 4 }, () => lcg.nextFe(p));
   const mask128 = (1n << 128n) - 1n;
   const value = lcg.nextFe(p) & mask128;
   const out_value1 = lcg.nextFe(p) & mask128;
   const out_value2 = lcg.nextFe(p) & mask128;
-  const public_amount = lcg.nextFe(p) & mask128;
-  const fee = lcg.nextFe(p) & mask128;
   const owner_pk = p3(1n, spend_key, 0n);
   const inner = p2(owner_pk, rho);
   const cm = p3(2n, inner, value);
@@ -83,8 +82,6 @@ async function main() {
   const nf2 = p3(3n, spend_key, p3(2n, inner, 0n)); // a dummy's nullifier
   const out_cm1 = p3(2n, out_inner1, out_value1);
   const out_cm2 = p3(2n, out_inner2, out_value2);
-  const claim = p3(4n, p3(root, nf, nf2),
-                   p3(out_cm1, out_cm2, p3(public_amount, fee, ctx_r)));
 
   // ---- depth-20 incremental-tree fixtures (mirrors ShieldedPool._append) ----
   const zeros = [0n];
@@ -109,9 +106,8 @@ async function main() {
     poseidon2: vec2,
     poseidon3: vec3,
     pool_chain: Object.fromEntries(Object.entries({
-      spend_key, rho, value, root, out_inner1, out_inner2, out_value1, out_value2,
-      public_amount, fee, ctx: ctx_r, owner_pk, inner, cm, nf, nf2,
-      out_cm1, out_cm2, claim,
+      spend_key, rho, value, out_inner1, out_inner2, out_value1, out_value2,
+      owner_pk, inner, cm, nf, nf2, out_cm1, out_cm2,
     }).map(([k, v]) => [k, v.toString()])),
     tree: {
       depth: DEPTH,

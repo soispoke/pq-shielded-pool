@@ -7,8 +7,9 @@ Apache-2.0 (see LICENSE).
 This project builds on:
 
   iden3/circomlib 2.0.5 and iden3/circomlibjs 0.1.7 (GPL-3.0): the spend
-  circuit includes circomlib's poseidon.circom at compile time (fetched via
-  npm, not vendored), and reference/poseidon_bn254_constants.json plus
+  circuit includes circomlib's poseidon.circom and bitify.circom at compile
+  time (fetched via npm, not vendored), and
+  reference/poseidon_bn254_constants.json plus
   vectors/poseidon_bn254_vectors.json are exported from circomlibjs by
   tooling/export_vectors.js. contracts/src/PoseidonBN254.sol and the split
   PoseidonT3.sol / PoseidonT4.sol are generated from those constants.

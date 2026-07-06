@@ -25,8 +25,10 @@ and change), and proves in-circuit:
   through the two-input circuit.
 - **conservation** `v_in1 + v_in2 = v_out1 + v_out2 + publicAmount + fee`, with
   each value range-checked to 128 bits.
-- a single public **claim**
-  `Poseidon(TAG_CLAIM, P3(root, nf1, nf2), P3(outCm1, outCm2, P3(publicAmount, fee, ctx)))`.
+- **eight public signals**, bound directly by the verifier:
+  `[nf1, nf2, outCm1, outCm2, root, publicAmount, fee, ctx]` (circuit outputs
+  first, then public inputs). Each costs one scalar mul onchain (~6k gas),
+  far cheaper than recomputing a Poseidon-compressed digest (~230k).
 
 Transfer sets `publicAmount = 0` and `ctx = 0`; withdraw sets `publicAmount > 0`
 and `ctx` naming the recipient. Either may carry a `fee`, paid from shielded
@@ -39,7 +41,7 @@ The pool enforces four checks around each proof:
 1. the sender is the pinned `POOL_SENDER`;
 2. the 2 nullifiers are consumed as one keyed-nonce set `{nf1, nf2}`
    (EIP-8250: shared `nonce_seq = 0`, atomic all-or-nothing);
-3. the claim's root is one of the pool's recent roots (EIP-8272);
+3. the proof's root is one of the pool's recent roots (EIP-8272);
 4. the operation shape is well-formed (transfer vs withdraw).
 
 Consuming the 2 nullifiers as a set makes the duplicate-key rule the defense
@@ -71,25 +73,28 @@ cd ../wallet && ./smoke.sh           # generate real proofs, verify offchain, ru
 ```
 
 `forge test` runs from a fresh clone: the committed proof fixtures pair with the
-committed `Groth16Verifier.sol`. Re-running `setup.sh` regenerates the ceremony
-and the fixtures together.
+committed `Groth16Verifier.sol`. Re-running `setup.sh` re-randomises the
+ceremony and invalidates the committed fixtures; run `wallet/gen_smoke.py` (or
+`./smoke.sh`) afterward to regenerate them.
 
 ## Measured
 
-Standard-EVM figures (via-IR, optimizer 200, Poseidon as an external library).
-Depth 20, 14,069 R1CS constraints, ~600 ms to prove (snarkjs, Node), 256-byte
+Standard-EVM figures (via-IR, optimizer runs 5000, Poseidon as an external
+library).
+Depth 20, 13,028 R1CS constraints, ~600 ms to prove (snarkjs, Node), 256-byte
 proofs.
 
 | operation | gas |
 |---|---:|
-| Groth16 verify | ~188k |
-| shield | ~1.11M |
-| transfer | ~2.48M |
-| withdraw | ~2.51M |
+| verifySpend (proof + root check) | ~243k |
+| shield | ~1.20M |
+| transfer | ~1.13M |
+| withdraw | ~1.20M |
 
-Each spend appends two output commitments (two Merkle appends of 20 levels
-each). On the Hegotá devnet, EIP-8037's two-dimensional gas accounting raises
-these figures; see [devnet/REVIEW.md](devnet/REVIEW.md).
+Each spend inserts two output commitments into the Merkle frontier and
+recomputes the 20-level root once. On the Hegotá devnet, EIP-8037's
+two-dimensional gas accounting raises these figures; see
+[devnet/REVIEW.md](devnet/REVIEW.md).
 
 ## Limitations
 

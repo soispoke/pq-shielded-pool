@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 import wallet as w
-from poseidon_bn254 import p3, tagged, hex32, TAG_CLAIM
+from poseidon_bn254 import hex32
 
 HERE = Path(__file__).parent
 TOOLING = HERE.parent / "tooling"
@@ -59,22 +59,24 @@ def prove(witness, tag):
          HERE.parent / "contracts" / "vectors" / "spend_vkey.json", pubpath, proofpath])
     call = run(["npx", "snarkjs", "zkey", "export", "soliditycalldata", pubpath, proofpath])
     pa, pb, pc, _pub = json.loads("[" + call.stdout.strip() + "]")
-    claim = int(json.loads(pubpath.read_text())[0])
-    return claim, {"pA": pa, "pB": pb, "pC": pc}
+    publics = [int(x) for x in json.loads(pubpath.read_text())]
+    return publics, {"pA": pa, "pB": pb, "pC": pc}
 
 
-def spend_entry(tree, inputs, outputs, public_amount, fee, ctx, claim, proof, **extra):
+def spend_entry(tree, inputs, outputs, public_amount, fee, ctx, publics, proof, **extra):
     root = tree.root()
     nf1, nf2 = w.input_nullifiers(inputs)
     out_cm1, out_cm2 = w.output_commitments(outputs)
-    # the crux: the proof's claim binds exactly the wallet's own publics
-    recomputed = tagged(TAG_CLAIM, p3(root, nf1, nf2),
-                        p3(out_cm1, out_cm2, p3(public_amount, fee, ctx)))
-    assert recomputed == claim, "proof claim does not bind the wallet's publics"
+    # the crux: the proof's public signals are exactly the wallet's own
+    # publics, in the circuit's order (outputs first, then public inputs),
+    # which is also the order verifySpend passes them to the verifier
+    assert publics == [nf1, nf2, out_cm1, out_cm2,
+                       root, public_amount, fee, ctx], \
+        "proof public signals do not bind the wallet's publics"
     e = {"root": hex32(root), "nf1": hex32(nf1), "nf2": hex32(nf2),
          "out_cm1": hex32(out_cm1), "out_cm2": hex32(out_cm2),
          "public_amount": str(public_amount), "fee": str(fee), "ctx": hex32(ctx),
-         "claim": hex32(recomputed), "proof": proof}
+         "proof": proof}
     e.update(extra)
     return e
 
@@ -101,7 +103,7 @@ def main():
     ins_t = [{"sk": sk_a, "rho": rho_a, "value": v_shield, "idx": 0}, w.dummy_input()]
     outs_t = [(w.inner(sk_b, rho_b), v_bob), (w.inner(sk_a2, rho_a2), v_change)]
     wt = w.build_witness(t1, ins_t, outs_t, public_amount=0, fee=v_fee)
-    claim_t, proof_t = prove(wt, "transfer")
+    pub_t, proof_t = prove(wt, "transfer")
 
     # 3. Bob's withdraw: (B, dummy) -> (0, 0), publicAmount 0.55, fee 0.05
     t2 = w.Tree()
@@ -114,32 +116,32 @@ def main():
     v_pub = v_bob - v_fee
     ww = w.build_witness(t2, ins_w, outs_w, public_amount=v_pub, fee=v_fee,
                          recipient=RECIPIENT)
-    claim_w, proof_w = prove(ww, "withdraw")
+    pub_w, proof_w = prove(ww, "withdraw")
 
     # 4. the adversarial proof: note A through BOTH inputs (nf1 == nf2)
     ins_x = [dict(ins_t[0]), dict(ins_t[0])]
     outs_x = [(w.inner(*w.new_note()), v_shield), (w.inner(*w.new_note()), v_shield)]
     wx = w.build_witness(t1, ins_x, outs_x, public_amount=0, fee=0)
-    claim_x, proof_x = prove(wx, "same_note")
+    pub_x, proof_x = prove(wx, "same_note")
 
     fixture = {
         "inner_a": hex32(inner_a),
         "cm_a": hex32(cm_a),
         "shield_value": str(v_shield),
         "recipient": RECIPIENT,
-        "transfer": spend_entry(t1, ins_t, outs_t, 0, v_fee, 0, claim_t, proof_t,
+        "transfer": spend_entry(t1, ins_t, outs_t, 0, v_fee, 0, pub_t, proof_t,
                                 # Bob's opening, so the duplicate-output no-op
                                 # can be exercised on-chain (shield it first)
                                 out_inner1=hex32(outs_t[0][0]),
                                 out_value1=str(outs_t[0][1])),
         "withdraw": spend_entry(t2, ins_w, outs_w, v_pub, v_fee,
-                                w.ctx_for_recipient(RECIPIENT), claim_w, proof_w,
+                                w.ctx_for_recipient(RECIPIENT), pub_w, proof_w,
                                 recipient=RECIPIENT),
-        "attack_same_note": spend_entry(t1, ins_x, outs_x, 0, 0, 0, claim_x, proof_x),
+        "attack_same_note": spend_entry(t1, ins_x, outs_x, 0, 0, 0, pub_x, proof_x),
     }
     assert fixture["attack_same_note"]["nf1"] == fixture["attack_same_note"]["nf2"]
     (HERE / "smoke_fixture.json").write_text(json.dumps(fixture, indent=1))
-    print("real join-split proofs generated and verified off-chain; claims bind the wallet roots")
+    print("real join-split proofs generated and verified off-chain; public signals bind the wallet publics")
     print(f"  transfer  nf1 {fixture['transfer']['nf1'][:18]}... nf2 {fixture['transfer']['nf2'][:18]}... fee {v_fee}")
     print(f"  withdraw  publicAmount {v_pub} fee {v_fee}")
     print(f"  attack_same_note proves with nf1 == nf2 (the key-set duplicate the envelope must refuse)")

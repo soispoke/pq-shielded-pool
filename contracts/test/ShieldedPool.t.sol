@@ -167,7 +167,7 @@ contract ShieldedPoolBN254Test {
     }
 
     /// A valid proof cannot have its amounts re-priced: fee and publicAmount
-    /// are inside the claim, so tampering kills the proof.
+    /// are public signals the proof binds, so tampering kills the proof.
     function test_tampered_fee_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.fee = s.fee + 1;
@@ -182,6 +182,47 @@ contract ShieldedPoolBN254Test {
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
         pool.transfer(s);
+    }
+
+    /// The root is bound by the PROOF, not only by the recent-roots check:
+    /// anchor the fixture proof to a second, genuinely recent root so
+    /// roots.check passes and only the verifier stands in the way. Catches a
+    /// circuit regression that drops root from the public list.
+    function test_recent_but_unproven_root_reverts_in_verifier() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        pool.shield{value: 1 ether}(bytes32(uint256(1)));
+        s.root = pool.currentRoot();
+        s.slot = pool.lastRootSlot();
+        vm.roll(block.number + 1);
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.ProofInvalid.selector);
+        pool.transfer(s);
+    }
+
+    /// ctx and publicAmount are bound by the PROOF, not only by the shape
+    /// checks: re-bind the withdraw to a different recipient CONSISTENTLY
+    /// (ctx = ctxFor(evil), so CtxDoesNotNameRecipient passes), and re-price
+    /// the payout. Catches a circuit regression that drops either from the
+    /// public list.
+    function test_rebound_ctx_and_repriced_amount_revert_in_verifier() public {
+        ShieldedPool.Spend memory ts = _shieldA();
+        vm.prank(POOL_SENDER);
+        pool.transfer(ts);
+        uint64 slotR2 = pool.lastRootSlot();
+        vm.roll(block.number + 1);
+
+        ShieldedPool.Spend memory ws = _spendOf(".withdraw", slotR2);
+        address payable evil = payable(address(0xBEEF));
+        ws.ctx = pool.ctxFor(evil);
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.ProofInvalid.selector);
+        pool.withdraw(ws, evil);
+
+        ShieldedPool.Spend memory wp = _spendOf(".withdraw", slotR2);
+        wp.publicAmount = wp.publicAmount + 1;
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.ProofInvalid.selector);
+        pool.withdraw(wp, payable(vm.parseAddress(vm.parseJsonString(j, ".recipient"))));
     }
 
     // ---- 5. root-source / freshness attacks ----
@@ -299,12 +340,6 @@ contract ShieldedPoolBN254Test {
                    "ctxFor mismatch vs wallet");
     }
 
-    function test_computeClaim_matches_wallet() public view {
-        ShieldedPool.Spend memory ws = _spendOf(".withdraw", 0);
-        assertTrue(pool.computeClaim(ws) == _s(".withdraw.claim"),
-                   "computeClaim mismatch vs wallet");
-    }
-
     function test_tree_root_matches_reference() public {
         string memory vecs = vm.readFile("../vectors/poseidon_bn254_vectors.json");
         assertTrue(
@@ -322,16 +357,15 @@ contract ShieldedPoolBN254Test {
 
     /// verifySpend must run under STATICCALL, so it is legal inside a VERIFY
     /// (static) frame where a paymaster staticcalls it to gate APPROVE. A
-    /// successful staticcall proves it writes no state; it returns the claim.
-    function test_verifySpend_is_static_and_returns_claim() public {
+    /// successful staticcall proves it writes no state.
+    function test_verifySpend_is_static() public {
         ShieldedPool.Spend memory s = _shieldA();
-        (bool ok, bytes memory ret) =
+        (bool ok,) =
             address(pool).staticcall(abi.encodeWithSelector(ShieldedPool.verifySpend.selector, s));
         assertTrue(ok, "verifySpend must succeed under staticcall (VERIFY-frame legal)");
-        assertTrue(abi.decode(ret, (bytes32)) == pool.computeClaim(s), "verifySpend returned the wrong claim");
     }
 
-    /// A proof that does not match its public claim is rejected by verifySpend.
+    /// A proof that does not match its public signals is rejected by verifySpend.
     function test_verifySpend_rejects_mismatched_proof() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.outCm1 = bytes32(uint256(42)); // canonical, but not the proven output
@@ -371,10 +405,11 @@ contract ShieldedPoolBN254Test {
     // BN254 scalar field modulus, for the aliasing test below.
     uint256 constant P = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
 
-    /// A nullifier is only canonical in [0, P). Poseidon reduces its inputs
-    /// mod P, so nf + P hashes identically to nf: without the NotCanonical
-    /// guard in computeClaim, the same proof would re-verify under a fresh
-    /// nonce key (nf + P) and double-spend. This asserts the guard fires.
+    /// A nullifier is only canonical in [0, P). The verifier's field check
+    /// rejects nf + P as a public signal, and verifySpend's NotCanonical
+    /// guard names the failure first: without either, the same proof could
+    /// re-verify under a fresh nonce key (nf + P) and double-spend. This
+    /// asserts the guard fires.
     function test_verifySpend_rejects_noncanonical_nullifier() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.nf1 = bytes32(uint256(s.nf1) + P);

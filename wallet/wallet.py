@@ -15,10 +15,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "reference"))
-from poseidon_bn254 import P, p2, p3, tagged, hex32  # noqa: E402
+from poseidon_bn254 import P, p2, tagged, TAG_PK, TAG_LEAF, TAG_NULL  # noqa: E402
 
 DEPTH = 20
-TAG_PK, TAG_LEAF, TAG_NULL = 1, 2, 3
 MAX_VALUE = 1 << 128
 
 _RNG = None  # None = cryptographic secrets; set_seed makes note generation reproducible

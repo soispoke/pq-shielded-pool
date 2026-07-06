@@ -9,9 +9,10 @@ pragma circom 2.0.8;
 //   - EIP-8250 MULTI-KEY nonces: the two nullifiers are consumed as ONE
 //     keyed-nonce set (shared nonce_seq = 0, atomic, per-sender domain), the
 //     `nonce_keys` list shape bounded by MAX_NONCE_KEYS = 16;
-//   - the fee binding that makes a TRUSTLESS PAYMASTER possible: `fee` is
-//     folded into the claim, so whoever submits the spend is reimbursed from
-//     shielded value by the contract itself, and no relayer needs trusting.
+//   - the fee binding that makes a TRUSTLESS PAYMASTER possible: `fee` is a
+//     public signal the proof binds, so whoever submits the spend is
+//     reimbursed from shielded value by the contract itself, and no relayer
+//     needs trusting.
 //
 // What it proves (hiding keys, secrets, values, and both Merkle paths):
 //
@@ -19,7 +20,7 @@ pragma circom 2.0.8;
 //     root (or they are zero-value dummies), their value equals the output
 //     notes' value plus the public amount plus the fee, every value is a
 //     128-bit integer, and I expose exactly the two nullifiers, two output
-//     commitments, public amount, fee, and context bound in the claim.
+//     commitments, public amount, fee, and context as public signals.
 //
 // Note structure (value-carrying):
 //     owner_pk = Poseidon(TAG_PK,   spend_key, 0)
@@ -28,11 +29,12 @@ pragma circom 2.0.8;
 //                                                  # ON-CHAIN from msg.value
 //     nf       = Poseidon(TAG_NULL, spend_key, cm)
 //
-// The claim, the only public signal:
-//     claim = Poseidon(TAG_CLAIM, c1, c2)
-//     c1    = Poseidon3(root, nf1, nf2)
-//     c2    = Poseidon3(out_cm1, out_cm2, c3)
-//     c3    = Poseidon3(public_amount, fee, ctx)
+// The eight public signals, in the verifier's order (circom puts outputs
+// first in declaration order, then public inputs in declaration order):
+//     [nf1, nf2, out_cm1, out_cm2, root, public_amount, fee, ctx]
+// The verifier binds each directly (one scalar mul per signal, ~6k gas),
+// which is cheaper and leaner than the earlier design's Poseidon-compressed
+// claim recomputed onchain (4 hash3, ~230k gas).
 //
 // Soundness, beyond the fixed-denomination edition's five properties:
 //   6. Value conservation: v_in1 + v_in2 === v_out1 + v_out2 + public_amount
@@ -116,8 +118,11 @@ template Spend(DEPTH) {
     signal input out_value[2];
     signal input public_amount;  // leaves the pool to the ctx recipient
     signal input fee;            // leaves the pool to the submitting sender
-    signal input ctx;
-    signal output claim;
+    signal input ctx;            // public; binding it needs no constraint here
+    signal output nf1;
+    signal output nf2;
+    signal output out_cm1;
+    signal output out_cm2;
 
     // inputs
     component note[2];
@@ -151,25 +156,10 @@ template Spend(DEPTH) {
     }
     in_value[0] + in_value[1] === out_value[0] + out_value[1] + public_amount + fee;
 
-    // claim = Poseidon(TAG_CLAIM, P3(root, nf1, nf2),
-    //                  P3(out_cm1, out_cm2, P3(public_amount, fee, ctx)))
-    component c1 = Poseidon(3);
-    c1.inputs[0] <== root;
-    c1.inputs[1] <== note[0].nf;
-    c1.inputs[2] <== note[1].nf;
-    component c3 = Poseidon(3);
-    c3.inputs[0] <== public_amount;
-    c3.inputs[1] <== fee;
-    c3.inputs[2] <== ctx;
-    component c2 = Poseidon(3);
-    c2.inputs[0] <== outCm[0].out;
-    c2.inputs[1] <== outCm[1].out;
-    c2.inputs[2] <== c3.out;
-    component cl = Poseidon(3);
-    cl.inputs[0] <== 4;
-    cl.inputs[1] <== c1.out;
-    cl.inputs[2] <== c2.out;
-    claim <== cl.out;
+    nf1 <== note[0].nf;
+    nf2 <== note[1].nf;
+    out_cm1 <== outCm[0].out;
+    out_cm2 <== outCm[1].out;
 }
 
-component main = Spend(20);
+component main {public [root, public_amount, fee, ctx]} = Spend(20);

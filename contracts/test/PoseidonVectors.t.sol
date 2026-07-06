@@ -15,7 +15,7 @@ interface Vm {
 /// Differential tests against vectors exported from circomlibjs (the package
 /// the circuit's poseidon.circom pairs with) by ../../tooling/export_vectors.js.
 /// Every Poseidon(2) and Poseidon(3) vector, the pool's tagged
-/// owner_pk/cm/nf/claim chain, a soundness check that a single flipped input
+/// owner_pk/cm/nf/out_cm chain, a soundness check that a single flipped input
 /// changes the output, and a gas-regression ceiling.
 contract PoseidonVectorsTest {
     Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
@@ -55,14 +55,13 @@ contract PoseidonVectorsTest {
     }
 
     /// The pool's value-note spend chain, end to end: owner_pk, inner, cm,
-    /// nf, the dummy nf, both output commitments, and the join-split claim
-    /// (the exact values the circom circuit computes for the same secrets).
+    /// nf, the dummy nf, and both output commitments (the exact values the
+    /// circom circuit computes for the same secrets).
     function test_pool_chain() external view {
         string memory json = vm.readFile(PATH);
         uint256 spendKey = _u(json, ".pool_chain.spend_key");
         uint256 rho = _u(json, ".pool_chain.rho");
         uint256 value = _u(json, ".pool_chain.value");
-        uint256 root = _u(json, ".pool_chain.root");
 
         uint256 ownerPk = PoseidonBN254.hash3(1, spendKey, 0);
         require(ownerPk == _u(json, ".pool_chain.owner_pk"), "owner_pk mismatch");
@@ -81,13 +80,6 @@ contract PoseidonVectorsTest {
         uint256 outCm2 = PoseidonBN254.hash3(
             2, _u(json, ".pool_chain.out_inner2"), _u(json, ".pool_chain.out_value2"));
         require(outCm2 == _u(json, ".pool_chain.out_cm2"), "out_cm2 mismatch");
-
-        uint256 c3 = PoseidonBN254.hash3(
-            _u(json, ".pool_chain.public_amount"), _u(json, ".pool_chain.fee"),
-            _u(json, ".pool_chain.ctx"));
-        uint256 claim = PoseidonBN254.hash3(
-            4, PoseidonBN254.hash3(root, nf, nf2), PoseidonBN254.hash3(outCm1, outCm2, c3));
-        require(claim == _u(json, ".pool_chain.claim"), "claim mismatch");
     }
 
     /// A single flipped input must change the hash (smoke soundness).

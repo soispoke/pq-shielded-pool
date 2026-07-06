@@ -56,10 +56,20 @@ POOL=$(forge create --root $BN --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GA
 # NonceManager is CREATE(pool, nonce=1); computed, since eth_call is unusable here
 NONCES=$(cast compute-address "$POOL" --nonce 1 | awk '{print $NF}')
 echo "    pool=$POOL  nonces=$NONCES"
+echo "==> proof-gated APPROVE paymaster (50-byte runtime, see paymaster.py)"
+# --gas-limit 1M: under EIP-8037 the code deposit alone is ~1,530 gas/byte.
+PAYMASTER=$(cast send --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GAS --gas-limit 1000000 \
+  --create "$(python3 paymaster.py --initcode "$POOL")" --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["contractAddress"])')
+[ "$(cast code "$PAYMASTER" --rpc-url "$RPC")" = "$(python3 paymaster.py --runtime "$POOL")" ] \
+  || { echo "paymaster runtime mismatch"; exit 1; }
+# The pay frame's target is the payer, so the paymaster must hold ETH for gas.
+# Its receive() guard (empty calldata -> STOP) accepts this plain transfer.
+cast send --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GAS --gas-limit 100000 --value 1ether "$PAYMASTER" >/dev/null
+echo "    paymaster=$PAYMASTER  funded=$(cast balance "$PAYMASTER" --rpc-url "$RPC" | cut -c1-4)...wei"
 
-python3 - "$RPC" "$POOL" "$ROOTS" "$VERIFIER" "$NONCES" "$T3" "$T4" "$POOL_SENDER" <<'PY'
+python3 - "$RPC" "$POOL" "$ROOTS" "$VERIFIER" "$NONCES" "$T3" "$T4" "$POOL_SENDER" "$PAYMASTER" <<'PY'
 import json, sys
-k = ["rpc","pool","roots","verifier","nonces","poseidonT3","poseidonT4","poolSender"]
+k = ["rpc","pool","roots","verifier","nonces","poseidonT3","poseidonT4","poolSender","paymaster"]
 json.dump(dict(zip(k, sys.argv[1:])), open("deploy_config.json","w"), indent=1)
 print("wrote deploy_config.json")
 PY
