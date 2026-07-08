@@ -23,28 +23,26 @@ included, executes on the devnet as an ordinary application frame.
 
 What this integration does NOT do, and why (see REVIEW.md):
   * It does not put the two nullifiers in the transaction's `nonce_keys` (the
-    protocol EIP-8250 spent set). The pool keeps its own NonceManager instead,
-    because the devnet exposes no TXPARAM selector for `nonce_keys`, so an
-    in-EVM VERIFY frame cannot bind the consumed key set to the proven
-    nullifiers. `nonce_keys=[nf1,nf2]` is also not admitted by the public
-    mempool (only `[0]` is). The `--protocol-nonces` flag builds that variant
-    for a direct-to-builder submission experiment; it is expected to be
-    rejected by the public RPC and is here to document the gap empirically.
+    protocol EIP-8250 spent set) in the default public-devnet path. The pool
+    keeps its own NonceManager there because the public mempool still admits
+    only `[0]`. The faithful `--proof-in-verify` path does set
+    `nonce_keys=[nf1,nf2]` and binds them in the paymaster via NONCEKEYLOAD,
+    but it needs builder-direct or a mempool policy update.
   * It does not reference the root via the tx `recent_root_references`; the
-    pool reads its own RecentRoots. The devnet does not deliver the slot to
-    the EL yet, and no opcode exposes the refs to the pool.
+    pool reads its own RecentRoots. RECENTROOTREFLOAD now exists in ethrex, but
+    this paymaster still needs to wire it before the root binding is protocol
+    state rather than pool-owned storage.
 
 The `--proof-in-verify` flag builds the FAITHFUL shape instead, in the
 EIP-8141 [only_verify, pay] grammar: an execution-scope self-verify frame
 followed by a payment-scope pay frame targeting the proof-gated paymaster
 (paymaster.py), which staticcalls pool.verifySpend and APPROVEs payment only
 on a valid proof, so the proof is checked before any approval. This grammar
-mines on the devnet (validated 2026-07-05 via OpenSponsor). Two devnet-side
+mines on the devnet (validated 2026-07-05 via OpenSponsor). Three devnet-side
 conditions still gate a real proof-in-VERIFY spend on the PUBLIC endpoint:
-verifySpend ~243k busts MAX_VERIFY_GAS = 100k, and the paymaster's STATICCALL
-is banned by the mempool ERC-7562 observer, so the spend submits
-builder-direct (which it must anyway, since nonce_keys=[nf1,nf2] is not
-public-mempool admissible). The paymaster must be funded: it is the payer.
+verifySpend ~243k busts MAX_VERIFY_GAS = 100k, the paymaster's STATICCALL is
+banned by the mempool ERC-7562 observer, and nonce_keys=[nf1,nf2] is not
+public-mempool admissible. The paymaster must be funded: it is the payer.
 
 Usage:
   pool_frametx.py <rpc> deploy-config.json fixture.json shield   <priv>
@@ -71,6 +69,28 @@ def rpc(url, method, params):
     r = json.loads(urllib.request.urlopen(req, timeout=20).read())
     if "error" in r:
         raise RuntimeError(f"{method} -> {r['error']}")
+    return r["result"]
+
+
+def simulate(url, raw):
+    """Dry-run a built frame tx via ethrex_simulateFrameTransaction (the
+    ethrex_ namespace, ethrex >= v17, commit e7e495f): the frame-native
+    counterpart to eth_estimateGas, which cannot represent a multi-frame tx.
+    Runs the mempool validation prefix and, if it passes, a full read-only
+    multi-frame execution at head. Returns the result dict, or None if the
+    endpoint does not expose the method (-32601). Raises on any other RPC
+    error (malformed tx). A tx over the per-tx gas cap comes back as a result
+    with valid=False, not an error."""
+    req = urllib.request.Request(
+        url, headers={"content-type": "application/json"},
+        data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                         "method": "ethrex_simulateFrameTransaction",
+                         "params": [raw]}).encode())
+    r = json.loads(urllib.request.urlopen(req, timeout=20).read())
+    if "error" in r:
+        if r["error"].get("code") == -32601:
+            return None
+        raise SystemExit(f"  simulate RPC error: {r['error']}")
     return r["result"]
 
 
@@ -105,7 +125,7 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
     nonce_keys = protocol_nonces if protocol_nonces else [0]
     nonce_seq = 0 if protocol_nonces else nonce
 
-    def build():
+    def build(sender_gas=10_000_000):
         if proof_verify:
             # The FAITHFUL shape, EIP-8141 [only_verify, pay] grammar (validated
             # live via OpenSponsor on 2026-07-05). Frame 0 self-verifies for the
@@ -129,10 +149,11 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
             # FRAME_TX_MAX_VERIFY_GAS = 100k, which caps Σ(prefix frame gas) +
             # signature cost; 100k exactly is rejected.
             frames = [Frame(mode=1, flags=0x03, target=sender, gas_limit=80_000, value=0, data=b"")]
-        # The SENDER frame is not part of the capped prefix. EIP-8037
-        # state-dimension accounting inflates receipt gas ~2-4x over
-        # Sepolia numbers, so size the execution frame generously.
-        frames.append(Frame(mode=2, flags=0, target=pool, gas_limit=10_000_000,
+        # The SENDER frame is not part of the capped prefix. It starts
+        # generous (EIP-8037 state-dimension accounting inflates gas ~2-4x over
+        # Sepolia numbers) and is then sized down from the simulated per-frame
+        # gas below, when the endpoint exposes ethrex_simulateFrameTransaction.
+        frames.append(Frame(mode=2, flags=0, target=pool, gas_limit=sender_gas,
                             value=value, data=calldata))
         tx = FrameTx(
             chain_id=chain_id, nonce_keys=nonce_keys, nonce_seq=nonce_seq, sender=sender,
@@ -146,6 +167,31 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
 
     tx = build()
     raw = "0x" + tx.raw().hex()
+
+    # Dry-run first: pre-check validity, report the resolved payer, and size
+    # the (uncapped) SENDER frame from the simulated gas. Degrades to the
+    # default limits on an endpoint that does not expose the ethrex_ namespace.
+    sim = simulate(url, raw)
+    if sim is None:
+        print("  simulate: ethrex_simulateFrameTransaction unavailable here; default gas limits")
+    elif sim.get("valid"):
+        per = ", ".join(f"f{i}={int(f['gasUsed'],16):,}" for i, f in enumerate(sim.get("frames") or []))
+        print(f"  simulate: valid  shape={sim.get('prefixShape')}  payer={sim.get('payer')}  "
+              f"gas={int(sim['gasUsed'],16):,}  ({per})")
+        used = int(sim["frames"][-1]["gasUsed"], 16)
+        sized = used + used // 4  # measured + 25% for state-gas variance at a later block
+        tx2 = build(sender_gas=sized)
+        raw2 = "0x" + tx2.raw().hex()
+        s2 = simulate(url, raw2)
+        if s2 and s2.get("valid"):
+            tx, raw = tx2, raw2
+            print(f"  sized SENDER frame to {sized:,} gas (measured {used:,} + 25%)")
+    elif proof_verify:
+        print(f"  simulate: prefix not mempool-admissible ({sim.get('violation')}); "
+              "expected for the faithful shape, attempting builder-direct anyway")
+    else:
+        raise SystemExit(f"  simulate: INVALID ({sim.get('violation')}); not sending")
+
     print(f"  frame tx: sender={pk.public_key.to_checksum_address()} nonce_keys={nonce_keys} "
           f"raw_len={len(tx.raw())} sig_hash={tx.sig_hash().hex()[:18]}...")
     txhash = rpc(url, "eth_sendRawTransaction", [raw])

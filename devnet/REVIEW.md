@@ -108,6 +108,22 @@ state must be read from receipts/events rather than `eth_call`. The frame-tx
 tooling here already does this; general dapp tooling (wallets, `forge`
 scripting) will trip over it.
 
+**Update (2026-07-07): resolved.** `eth_call`/`eth_estimateGas` carry the slot
+and work again after the 2026-07-06 update, and ethrex commit `e7e495f` adds
+`ethrex_simulateFrameTransaction` (a new `ethrex_` namespace), the frame-native
+dry-run those flat-call methods structurally cannot express. It runs the
+mempool validation prefix and, if it passes, a read-only multi-frame execution
+at head, returning validity, the prefix shape, the resolved payer, the max
+cost, and total/per-frame gas, bounded by the same 2^24 per-tx cap as
+`eth_estimateGas`. `pool_frametx.py` now dry-runs every spend before sending:
+it aborts one the node reports invalid (surfacing the violation), prints the
+resolved payer, and sizes the uncapped SENDER frame from the simulated gas
+rather than over-reserving. Confirmed live against `rpc1` (v17.0.0): a shield
+returns `valid`, `SelfVerify`, the self-funded payer, and a SENDER frame of
+~1.275M gas, so the frame is sized to ~1.59M instead of the hardcoded 10M. The
+tool degrades to the fixed limits on an endpoint that does not enable the
+`ethrex_` namespace (`-32601`).
+
 **4. Plain contract creation works; the "no deploy path" conclusion was a
 funding artifact.** The morning's evidence chain (creation tx reverting at
 816k/1M gas, tiny creations pending forever, `DeployInstalledNoCode` from the
@@ -240,10 +256,13 @@ roughly 0.25M gas, over the 100k public-mempool cap but comfortably under the
 FOCIL eligibility draft's `MAX_VERIFY_GAS_PER_TX = 2^20` (~1.05M). This is
 exactly the draft's separation: public mempool admission and FOCIL
 eligibility are different policies, and this transaction reaches includers
-through a custom mempool or direct submission. One such spend takes ~23% of
-an IL's verify budget, so an IL fits four (the earlier Poseidon-compressed
-claim design measured ~62%; binding the eight publics directly in the
-verifier removed all Poseidon hashing from VERIFY).
+through a custom mempool or direct submission. The measured verification work
+is ~23% of the FOCIL draft's verify budget (the earlier Poseidon-compressed
+claim design measured ~62%; binding the eight publics directly in the verifier
+removed all Poseidon hashing from VERIFY). The FOCIL draft charges static
+declared prefix gas, not gas used, so the current 20k self-verify plus 300k pay
+frame is budgeted closer to 320k plus signature cost. Tightening declared frame
+gas is what converts the measured cost into more IL capacity.
 
 **Enforcement is the index-based check.** FOCIL's stock omission rule
 (end-of-block nonce and balance) cannot express keyed-nonce validity. The
@@ -297,13 +316,13 @@ tested (contracts/test/ShieldedPool.t.sol):
   `pool_frametx.py --proof-in-verify` builds the transaction, setting
   `nonce_keys = [nf1, nf2]` so the binding has something to check.
 
-What remains is entirely devnet-side and out of the pool's hands: applying
-multi-VERIFY-frame prefixes at all (see the 2026-07-05 run below: today the
-builder drops any transaction with more than one VERIFY frame), the raised
-`MAX_VERIFY_GAS`, and the `nonce_keys` / `recent_root_references` TXPARAM
-selectors. The SENDER frame then shrinks to the state changes: append the two
-output commitments and pay out, with the nullifiers already consumed as
-protocol keyed nonces at approval.
+The 2026-07-06 devnet update below has since landed the multi-VERIFY grammar
+and the `NONCEKEYLOAD` / `RECENTROOTREFLOAD` accessors. What remains is split:
+Ethrex-side public admission policy, verify budget, and VOPS-aware observer
+rules; pool-side root-reference wiring and settle-only hardening. Once those
+are in place, the SENDER frame shrinks to state changes: append the two output
+commitments and pay out, with the nullifiers already consumed as protocol
+keyed nonces at approval.
 
 **Measured gas split** (standard EVM, `forge test --mt test_gas_frame_split`),
 per operation, VERIFY frame (the proof check) vs exec frame (state changes):
@@ -319,9 +338,12 @@ plus one scalar mul per public signal (eight signals, ~6.2k each) and the
 recent-root staticcall. There is no Poseidon hashing in VERIFY: the eight
 publics are bound directly by the verifier rather than compressed into a
 claim the contract recomputes, which cut this column from ~648k. It sits at
-~23% of the FOCIL draft's `MAX_VERIFY_GAS_PER_TX = 2^20` (~1.05M) but still
-~2.5x over EIP-8141's 100k mempool cap, so a proof-in-VERIFY spend needs a
-custom mempool or direct submission.
+~23% of the FOCIL draft's `MAX_VERIFY_GAS_PER_TX = 2^20` (~1.05M) as measured
+work, but FOCIL budget fill is based on declared prefix gas. With today's 20k
+self-verify plus 300k pay frame limits, the static budget cost is closer to
+320k plus signature cost. Both the measured proof work and the declared-prefix
+budget exceed EIP-8141's 100k public-mempool cap, so a proof-in-VERIFY spend
+needs a custom mempool or direct submission until admission policy changes.
 The exec frame is dominated by the Merkle hashing: the two frontier inserts
 share one 20-level root recompute (~21 Poseidon hash2, ~0.73M); shield is one
 insert plus the same root recompute and carries no proof.
@@ -503,7 +525,7 @@ So the whole faithful shape executes against the real Hegota opcodes
 checked in the VERIFY prefix before approval, spent set bound to the proven
 nullifiers in-EVM, nullifiers consumed as protocol state, payment approved by
 the proof-gated paymaster, outputs settled in the SENDER frame. The 2.03M gas
-includes a redundant second `verifySpend` in the SENDER frame (roadmap item 7).
+includes a redundant second `verifySpend` in the SENDER frame (roadmap item 8).
 What remains is entirely the mempool/FOCIL work below, which is ethrex-side.
 
 ## Roadmap: from consensus-valid to mempool-admitted and FOCIL-eligible
@@ -561,16 +583,24 @@ have to treat one-time keys on their own terms.
 **Pool-side (our remaining work):**
 
 6. **Wire `RECENTROOTREFLOAD`.** Bind the spend's root to a protocol
-   recent-root reference in the paymaster, the way item done for nonce_keys, so
-   the root binding is proven and inside the VOPS surface. The last trusted
-   binding.
-7. **Add a settle-only SENDER entrypoint.** In the faithful shape the protocol
+   recent-root reference in the paymaster, the way the nonce-key binding is
+   done, so the root binding is proven and inside the VOPS surface. The last
+   trusted binding.
+7. **Harden the paymaster binding.** Check `nonce_seq == 0`, pin the calldata
+   selector to `verifySpend(Spend)`, and bind the expected SENDER-frame
+   settlement data before approving payment. The current redundant SENDER
+   re-verification makes the local run safe, but a settle-only path needs this
+   binding before that redundancy is removed.
+8. **Add a settle-only SENDER entrypoint.** In the faithful shape the protocol
    consumes the keyed nonces at approval and the proof is checked in VERIFY, so
    the SENDER frame should only settle (insert outputs, pay out), not re-run
    `verifySpend` (~243k wasted) or re-consume via the pool's own NonceManager.
-   No collision exists today (the pool's manager is a separate store from the
-   protocol NONCE_MANAGER predeploy), but the redundancy should go.
-8. **Retire the pool's own NonceManager/RecentRoots** once the bindings read
+   Post-approval failures must be impossible or prefix-checked: tree capacity,
+   payout success, duplicate-output behavior, and settlement calldata all need
+   explicit handling. No collision exists today (the pool's manager is a
+   separate store from the protocol NONCE_MANAGER predeploy), but the
+   redundancy should go.
+9. **Retire the pool's own NonceManager/RecentRoots** once the bindings read
    protocol state, for minimality.
 
 **Submission channel (interim):** builder-direct, to run the faithful spend
@@ -592,11 +622,12 @@ capability gaps this section used to name: `NONCEKEYLOAD` (0xB9) and
 `RECENTROOTREFLOAD` now expose `nonce_keys[i]` and the recent-root references
 in-EVM, so both trusted bindings can become proven, and the multi-VERIFY
 `[only_verify, pay]` grammar the faithful shape needs is live. What remains for
-a proof-in-VERIFY spend is a single devnet-side item, the `MAX_VERIFY_GAS`
-budget (100k vs the ~243k `verifySpend`), plus builder-direct submission for
-the paymaster's external call and the non-zero `nonce_keys`. The operational
-lessons that cost the most time were self-inflicted or diagnosable: fund from
-the genesis set (not the faucet), budget deploys at ~1,545 gas per runtime byte
-under the 2^24 per-tx cap, fund the pay-frame paymaster (it is the payer), and
-treat a perpetually-pending tx as a builder-side rejection with no error
-surface.
+public admission is mempool policy: non-zero one-time keyed nonces, a verify
+budget above the ~243k proof check, and VOPS-scoped observer rules for the
+paymaster's validation call. Builder-direct is the interim path. Pool-side, the
+last protocol binding is `RECENTROOTREFLOAD`, followed by paymaster hardening
+and a safe settle-only SENDER entrypoint. The operational lessons that cost the
+most time were self-inflicted or diagnosable: fund from the genesis set (not the
+faucet), budget deploys at ~1,545 gas per runtime byte under the 2^24 per-tx
+cap, fund the pay-frame paymaster (it is the payer), and treat a
+perpetually-pending tx as a builder-side rejection with no error surface.
