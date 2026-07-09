@@ -160,12 +160,37 @@ contract ShieldedPool {
     function verifySpend(Spend calldata s) public view {
         if (s.nf1 == bytes32(0) || s.nf2 == bytes32(0)) revert ZeroNullifier();
         if (!roots.check(sourceId, s.slot, s.root)) revert RootNotRecentForPool();
+        _verifyProof(s);
+    }
+
+    /// verifySpend WITHOUT the recent-root check. Reads no storage (the
+    /// verifier's key is in code, the field/range guards are on calldata), so a
+    /// VERIFY-frame paymaster can STATICCALL it and still clear the ERC-7562
+    /// observer's non-sender-SLOAD ban, which `roots.check` (a read of the
+    /// RecentRoots contract) would trip. Approval is gated on the proof, which
+    /// binds `root` as a public signal; root RECENCY is then enforced in the
+    /// SENDER frame (verifySpend, via _spend). A stale or fabricated root
+    /// therefore reverts in execution, consuming only the proven nullifiers,
+    /// never a double-spend. See devnet/REVIEW.md.
+    function verifyProofOnly(Spend calldata s) public view {
+        if (s.nf1 == bytes32(0) || s.nf2 == bytes32(0)) revert ZeroNullifier();
+        _verifyProof(s);
+    }
+
+    /// Shared: field canonicity, 128-bit value range, and the Groth16 proof
+    /// over the eight public signals. No storage reads.
+    function _verifyProof(Spend calldata s) internal view {
         if (uint256(s.root) >= P || uint256(s.nf1) >= P || uint256(s.nf2) >= P
             || uint256(s.outCm1) >= P || uint256(s.outCm2) >= P || uint256(s.ctx) >= P) {
             revert NotCanonical();
         }
         if (s.publicAmount >= MAX_VALUE || s.fee >= MAX_VALUE) revert ValueTooLarge();
-        if (!verifier.verifyProof(s.pA, s.pB, s.pC,
+        // Forward a fixed gas literal, not gas(): when verifyProofOnly runs in a
+        // VERIFY frame the ERC-7562 observer bans the GAS opcode, and Solidity
+        // would emit one for a default-gas external call. The EVM caps the
+        // request at 63/64 of remaining gas. (Groth16Verifier's precompile
+        // calls are patched to forward a fixed literal for the same reason.)
+        if (!verifier.verifyProof{gas: 30000000}(s.pA, s.pB, s.pC,
             [uint256(s.nf1), uint256(s.nf2), uint256(s.outCm1), uint256(s.outCm2),
              uint256(s.root), s.publicAmount, s.fee, uint256(s.ctx)])) revert ProofInvalid();
     }

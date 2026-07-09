@@ -507,6 +507,59 @@ The 0xB9 read itself resolves only for `index > 0` in a builder-included
 multi-key tx, so like the rest of the faithful spend it awaits a builder-direct
 path. `pool_frametx.py --proof-in-verify` assembles the whole thing.
 
+## The faithful spend runs live through the public mempool (2026-07-09)
+
+The last gate was pool-side, not ethrex-side, and closing it needed no
+builder-direct path and no VOPS "validation reads" allowance. Two changes made
+the pay VERIFY frame observer-clean, so the full faithful spend now submits
+through the public `eth_sendRawTransaction` and mines.
+
+**1. No non-sender storage read.** `verifyProofOnly` is `verifySpend` minus the
+`roots.check`. It checks the proof, field canonicity, and value range, all over
+calldata and the code-resident verification key, so it reads no storage. The
+paymaster STATICCALLs it instead of `verifySpend`, clearing the observer's
+`StorageReadNonSender` ban. Root recency is not dropped, only moved: the proof
+binds `root` as a public signal, and the SENDER frame still runs `verifySpend`
+(via `_spend`), so a stale or fabricated root reverts in execution and consumes
+only the proven nullifiers. `ProofPaymaster.yul` also stopped reading storage
+for its own pool address: the constructor appends the address to the deployed
+code and the runtime reads it back with `CODECOPY`, so the paymaster is
+`SLOAD`-free.
+
+**2. No `GAS` opcode in the validation trace.** With the SLOAD gone the
+simulator surfaced the next violation, `BannedOpcode(90)` = `GAS` (`0x5a`). The
+observer bans `GAS` in validation frames, and it traces through the STATICCALL,
+so the ban reaches the snarkjs `Groth16Verifier`, whose precompile calls use
+`staticcall(sub(gas(), 2000), ...)`. Three sites were changed to forward a
+fixed gas literal instead: the verifier's precompile calls (`sub(gas(), 2000)`
+to `30000000`), the pool's `verifier.verifyProof{gas: 30000000}(...)`, and the
+paymaster's STATICCALL (a `0xffffffffffffffff` literal). The EVM caps each at
+63/64 of remaining gas, so nothing is undersized, and the proof math is
+unchanged (44 forge tests pass).
+
+Redeployed the verifier, pool, and paymaster (RecentRoots and the Poseidon
+halves reused), shielded a fresh note, then dry-ran and sent the faithful
+transfer:
+
+- dry-run: `valid=True`, `violation=None`, `OnlyVerifyPay`,
+  gas `2,025,994` (self-verify frame 0, pay frame 282,427, SENDER frame
+  1,706,654). The pay frame fits `MAX_VERIFY_GAS = 500k`.
+- live transfer `0xabcc9c82…` mined at block 104569, `status=1`, gasUsed
+  2,025,994, submitted through the public endpoint (no builder-direct).
+- payer = the paymaster: its balance dropped by exactly the gas cost, so
+  `APPROVE` fired only because the proof and the `nonce_keys == {nf1, nf2}`
+  binding both held.
+- tree settled: `currentRoot` advanced to the fixture's post-transfer root.
+- replay refused: a second `--proof-in-verify` transfer of the same notes is
+  rejected at admission with `Nonce mismatch: expected 1, got 0`, so the two
+  nullifiers were consumed as protocol keyed nonces (EIP-8250), not double-spent.
+
+This is the first proof-in-VERIFY private spend mined through the public
+mempool: the proof is verified inside the payment VERIFY frame, the payer pays
+only on a valid proof, and the spent-set binding is proven by `NONCEKEYLOAD`,
+not trusted. The one remaining coarseness is the redundant second `verifySpend`
+in the SENDER frame (the settle-only entrypoint item below).
+
 ## Local end-to-end run of the faithful spend (2026-07-06, patched node)
 
 The faithful spend ran end to end against a local ethrex built from
@@ -637,12 +690,15 @@ whole prototype was aiming at. The 2026-07-06 devnet update closed the two
 capability gaps this section used to name: `NONCEKEYLOAD` (0xB9) and
 `RECENTROOTREFLOAD` now expose `nonce_keys[i]` and the recent-root references
 in-EVM, so both trusted bindings can become proven, and the multi-VERIFY
-`[only_verify, pay]` grammar the faithful shape needs is live. What remains for
-public admission is mempool policy: non-zero one-time keyed nonces, a verify
-budget above the ~243k proof check, and VOPS-scoped observer rules for the
-paymaster's validation call. Builder-direct is the interim path. Pool-side, the
-last protocol binding is `RECENTROOTREFLOAD`, followed by paymaster hardening
-and a safe settle-only SENDER entrypoint. The operational lessons that cost the
+`[only_verify, pay]` grammar the faithful shape needs is live. As of 2026-07-09
+the faithful proof-in-VERIFY spend also mines through the public mempool (tx
+`0xabcc9c82…`, block 104569): the 2026-07-08 devnet update cleared the verify
+budget and non-zero keyed nonces, and two pool-side changes cleared the
+observer without a VOPS allowance, a `verifyProofOnly` that reads no non-sender
+storage plus a `GAS`-free validation trace (fixed-gas precompile and verifier
+calls). No builder-direct path was needed. Pool-side, the last protocol binding
+is `RECENTROOTREFLOAD`, followed by a safe settle-only SENDER entrypoint (which
+also removes the redundant second `verifySpend`). The operational lessons that cost the
 most time were self-inflicted or diagnosable: fund from the genesis set (not the
 faucet), budget deploys at ~1,545 gas per runtime byte under the 2^24 per-tx
 cap, fund the pay-frame paymaster (it is the payer), and treat a

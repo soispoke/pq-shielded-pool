@@ -438,6 +438,22 @@ contract ShieldedPoolBN254Test {
         pool.verifySpend(s);
     }
 
+    /// verifyProofOnly must succeed under STATICCALL for a valid proof EVEN with
+    /// a non-recent root (no roll): it omits roots.check, so it reads no storage
+    /// and clears the observer's non-sender-SLOAD ban. This is the SLOAD-free
+    /// call the ProofPaymaster makes; root recency stays in the SENDER frame.
+    function test_verifyProofOnly_is_static_without_root_check() public {
+        pool.shield{value: _u(".shield_value")}(_s(".inner_a"));
+        ShieldedPool.Spend memory s = _spendOf(".transfer", pool.lastRootSlot());
+        // same slot as publish => verifySpend would revert RootNotRecentForPool;
+        // verifyProofOnly ignores recency and passes on the valid proof.
+        vm.expectRevert(ShieldedPool.RootNotRecentForPool.selector);
+        pool.verifySpend(s);
+        (bool ok,) =
+            address(pool).staticcall(abi.encodeWithSelector(ShieldedPool.verifyProofOnly.selector, s));
+        assertTrue(ok, "verifyProofOnly must pass under staticcall regardless of root recency");
+    }
+
     /// Gas split per operation: what a VERIFY frame would spend on the proof
     /// check (verifySpend + the checkKeySet binding) vs what the SENDER/exec
     /// frame spends on state. Run: forge test --mt test_gas_frame_split -vv

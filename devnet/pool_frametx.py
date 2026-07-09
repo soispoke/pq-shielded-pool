@@ -36,13 +36,13 @@ What this integration does NOT do, and why (see REVIEW.md):
 The `--proof-in-verify` flag builds the FAITHFUL shape instead, in the
 EIP-8141 [only_verify, pay] grammar: an execution-scope self-verify frame
 followed by a payment-scope pay frame targeting the proof-gated paymaster
-(paymaster.py), which staticcalls pool.verifySpend and APPROVEs payment only
-on a valid proof, so the proof is checked before any approval. This grammar
-mines on the devnet (validated 2026-07-05 via OpenSponsor). Three devnet-side
-conditions still gate a real proof-in-VERIFY spend on the PUBLIC endpoint:
-verifySpend ~243k busts MAX_VERIFY_GAS = 100k, the paymaster's STATICCALL is
-banned by the mempool ERC-7562 observer, and nonce_keys=[nf1,nf2] is not
-public-mempool admissible. The paymaster must be funded: it is the payer.
+(paymaster.py), which staticcalls pool.verifyProofOnly and APPROVEs payment
+only on a valid proof, so the proof is checked before any approval. verifySpend
+~243k fits MAX_VERIFY_GAS once raised (500k on the devnet as of 2026-07-08).
+verifyProofOnly reads no RecentRoots storage and the paymaster is SLOAD-free, so
+the pay frame no longer trips the observer's StorageReadNonSender ban; it still
+submits builder-direct because nonce_keys=[nf1,nf2] is not public-mempool
+admissible. The paymaster must be funded: it is the payer.
 
 Usage:
   pool_frametx.py <rpc> deploy-config.json fixture.json shield   <priv>
@@ -131,13 +131,12 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
             # live via OpenSponsor on 2026-07-05). Frame 0 self-verifies for the
             # EXECUTION scope only (0x02, target sender). Frame 1 is the pay
             # frame (0x01, PAYMENT scope) targeting the proof-gated paymaster,
-            # which staticcalls pool.verifySpend and APPROVEs payment only on a
-            # valid proof; the paymaster must be funded (it is the payer). Two
-            # devnet-side conditions still gate inclusion on the PUBLIC endpoint
-            # (both documented in REVIEW.md): verifySpend ~243k busts
-            # MAX_VERIFY_GAS = 100k, and the paymaster's STATICCALL is banned by
-            # the mempool ERC-7562 observer, so a real spend submits
-            # builder-direct (which it must anyway for nonce_keys=[nf1,nf2]).
+            # which staticcalls pool.verifyProofOnly and APPROVEs payment only on
+            # a valid proof; the paymaster must be funded (it is the payer).
+            # verifyProofOnly reads no RecentRoots storage and the paymaster is
+            # SLOAD-free, so the pay frame no longer trips the observer's
+            # StorageReadNonSender ban (see REVIEW.md); it still submits
+            # builder-direct, which it must anyway for nonce_keys=[nf1,nf2].
             paymaster, vcalldata = proof_verify
             frames = [
                 Frame(mode=1, flags=0x02, target=sender, gas_limit=20_000, value=0, data=b""),
@@ -238,12 +237,14 @@ def main():
         protocol_nonces = sorted([int(e["nf1"], 16), int(e["nf2"], 16)])  # strictly increasing
 
     def verify_frame(e):
-        """The faithful-shape VERIFY frame: ProofPaymaster target, verifySpend data.
-        The paymaster binds nonce_keys == {nf1, nf2} and staticcalls verifySpend."""
+        """The faithful-shape VERIFY frame: ProofPaymaster target, verifyProofOnly
+        data. The paymaster binds nonce_keys == {nf1, nf2} and staticcalls
+        verifyProofOnly (proof + canonicity, no RecentRoots read) so the frame
+        reads no non-sender storage; root recency stays in the SENDER frame."""
         if not proof_in_verify:
             return None
         return (int(cfg["paymaster"], 16),
-                cast_calldata(f"verifySpend({SPEND_TUPLE})", spend_args(e)))
+                cast_calldata(f"verifyProofOnly({SPEND_TUPLE})", spend_args(e)))
 
     if op == "shield":
         value = int(fix["shield_value"])
