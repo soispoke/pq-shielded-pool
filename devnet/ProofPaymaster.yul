@@ -56,8 +56,15 @@ object "ProofPaymaster" {
         code {
             // receive() — accept funding; the pay-frame target is the payer.
             if iszero(calldatasize()) { stop() }
-            // need at least through nf2 (byte 100..131) of verifyProofOnly(Spend)
-            if lt(calldatasize(), 132) { revert(0, 0) }
+            // Bind the pay-frame calldata to exactly verifyProofOnly(Spend):
+            // selector 0xe5367e41, and the full static 548-byte encoding. Without
+            // this the STATICCALL below would succeed for ANY non-reverting pool
+            // selector (e.g. currentRoot()), and APPROVE would fire with no proof
+            // -- sponsoring an unproven transaction and draining the paymaster.
+            // (Selector is fixed by the Spend tuple shape; regenerate with
+            // paymaster.py if either changes.)
+            if iszero(eq(calldatasize(), 548)) { revert(0, 0) }
+            if iszero(eq(shr(224, calldataload(0)), 0xe5367e41)) { revert(0, 0) }
 
             let nf1 := calldataload(68)
             let nf2 := calldataload(100)

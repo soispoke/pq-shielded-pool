@@ -183,6 +183,7 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
             if g is not None:
                 print(f"           gas={g:,}  ({per})")
         return
+    eff = sim  # the simulation the send is gated on (resized one if adopted)
     if sim is None:
         print("  simulate: ethrex_simulateFrameTransaction unavailable here; default gas limits")
     elif sim.get("valid"):
@@ -195,13 +196,24 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
         raw2 = "0x" + tx2.raw().hex()
         s2 = simulate(url, raw2)
         if s2 and s2.get("valid"):
-            tx, raw = tx2, raw2
+            tx, raw, eff = tx2, raw2, s2
             print(f"  sized SENDER frame to {sized:,} gas (measured {used:,} + 25%)")
     elif proof_verify:
         print(f"  simulate: prefix not mempool-admissible ({sim.get('violation')}); "
               "expected for the faithful shape, attempting builder-direct anyway")
     else:
         raise SystemExit(f"  simulate: INVALID ({sim.get('violation')}); not sending")
+
+    # Refuse to send when the SENDER frame reverts in simulation. The common
+    # cause is a transfer landing in the same block the shield published the
+    # root, so roots.check sees current == slot and reverts RootNotRecentForPool
+    # (the root is referenceable only from the next block). Without this guard
+    # the SENDER frame is sized from that cheap revert and the live tx runs out
+    # of gas. Only gate when the sim produced an execution result.
+    if eff and eff.get("executionStatus") and eff["executionStatus"] != "success":
+        raise SystemExit(f"  simulate: SENDER frame reverts "
+                         f"({eff.get('executionError') or eff['executionStatus']}); not sending "
+                         "(if root-not-recent, retry one block later)")
 
     print(f"  frame tx: sender={pk.public_key.to_checksum_address()} nonce_keys={nonce_keys} "
           f"raw_len={len(tx.raw())} sig_hash={tx.sig_hash().hex()[:18]}...")

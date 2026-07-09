@@ -560,6 +560,45 @@ only on a valid proof, and the spent-set binding is proven by `NONCEKEYLOAD`,
 not trusted. The one remaining coarseness is the redundant second `verifySpend`
 in the SENDER frame (the settle-only entrypoint item below).
 
+### Security review: the paymaster must bind the calldata selector (2026-07-09)
+
+A review pass found a real bug in the first faithful-spend paymaster. It read
+`nf1`/`nf2` at fixed calldata offsets and STATICCALLed the pool, but checked
+only that the call did not revert, never that the calldata was actually
+`verifyProofOnly(Spend)`. So an attacker could target the paymaster with
+calldata whose selector is any non-reverting, storage-free pool view, set the
+two words at bytes 68 and 100 to match the transaction's `nonce_keys`, and the
+paymaster would `APPROVE` payment with no proof at all. `ctxFor(address)` (pure,
+never reverts, reads no storage, so it also clears the observer's
+`StorageReadNonSender` ban) is a working key: dry-run against the first live
+paymaster returned `valid=True, payer=<paymaster>, violation=None`. The
+paymaster would sponsor arbitrary unproven transactions, draining it.
+
+The fix binds the pay-frame calldata to exactly `verifyProofOnly(Spend)`:
+selector `0xe5367e41` and the full static 548-byte encoding, both checked before
+the STATICCALL. Redeployed and confirmed live: the `ctxFor` and `currentRoot`
+attacks now come back `valid=False` (`validation prefix frame reverted`), while
+the legit faithful transfer still mines (tx `0xc2555b29…`, block 111029,
+2,026,024 gas, payer = paymaster, tree settled to the fixture post-transfer
+root). The selector is fixed by the `Spend` tuple shape; `paymaster.py`
+regenerates the bytecode if either changes.
+
+The same pass hardened `pool_frametx.py`: it sized the SENDER frame from the
+simulation but never checked the SENDER frame *succeeded*, so a transfer sent in
+the same block the shield published its root (where `roots.check` sees
+`current == slot` and reverts `RootNotRecentForPool`, referenceable only from
+the next block) was sized to that cheap revert and ran out of gas live. It now
+refuses to send when the simulation's `executionStatus` is not `success`.
+
+Two findings for ethrex, not the pool: (1) a mined-but-reverted frame
+transaction consumes its keyed nonce (as a classic reverted tx consumes its
+account nonce), so a spend that reverts after approval permanently burns its
+nullifiers, the real-world sharp edge behind the "post-approval revert" note in
+`_settle`; (2) `ethrex_simulateFrameTransaction` returned `valid=True` for a tx
+that admission then rejected on a keyed-nonce mismatch, a sim/admission
+inconsistency. Dora also does not index type-0x06 frame transactions, so the
+spend is invisible in the explorer even though it mined.
+
 ## Local end-to-end run of the faithful spend (2026-07-06, patched node)
 
 The faithful spend ran end to end against a local ethrex built from
