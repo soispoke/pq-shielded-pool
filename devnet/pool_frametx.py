@@ -114,7 +114,7 @@ def spend_args(entry):
             f'{entry["fee"]},{entry["ctx"]},{pair(p["pA"])},{pb},{pair(p["pC"])})')
 
 
-def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_verify=None):
+def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_verify=None, dry_run=False):
     sender = int.from_bytes(pk.public_key.to_canonical_address(), "big")
     chain_id = int(rpc(url, "eth_chainId", []), 16)
     nonce = int(rpc(url, "eth_getTransactionCount", [pk.public_key.to_checksum_address(), "latest"]), 16)
@@ -172,6 +172,18 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
     # the (uncapped) SENDER frame from the simulated gas. Degrades to the
     # default limits on an endpoint that does not expose the ethrex_ namespace.
     sim = simulate(url, raw)
+    if dry_run:
+        if sim is None:
+            print("  dry-run: ethrex_simulateFrameTransaction unavailable on this endpoint")
+        else:
+            per = ", ".join(f"f{i}={int(f['gasUsed'],16):,}" for i, f in enumerate(sim.get("frames") or []))
+            g = int(sim["gasUsed"], 16) if sim.get("gasUsed") else None
+            print(f"  dry-run: valid={sim.get('valid')}  shape={sim.get('prefixShape')}  "
+                  f"payer={sim.get('payer')}  status={sim.get('executionStatus')}")
+            print(f"           violation={sim.get('violation')}")
+            if g is not None:
+                print(f"           gas={g:,}  ({per})")
+        return
     if sim is None:
         print("  simulate: ethrex_simulateFrameTransaction unavailable here; default gas limits")
     elif sim.get("valid"):
@@ -219,6 +231,7 @@ def main():
     # envelope's nonce_keys to the proven nullifiers (NONCEKEYLOAD), so the two
     # nullifiers MUST be the transaction's key set.
     proof_in_verify = "--proof-in-verify" in sys.argv and op in ("transfer", "withdraw")
+    dry = "--dry-run" in sys.argv
     protocol_nonces = None
     if ("--protocol-nonces" in sys.argv or proof_in_verify) and op in ("transfer", "withdraw"):
         e = fix[op]
@@ -236,17 +249,17 @@ def main():
         value = int(fix["shield_value"])
         calldata = cast_calldata("shield(bytes32)", fix["inner_a"])
         print(f"shield {value} wei via frame tx -> pool {cfg['pool']}")
-        build_and_send(url, pk, pool, value, calldata)
+        build_and_send(url, pk, pool, value, calldata, dry_run=dry)
     elif op == "transfer":
         e = {**fix["transfer"], "slot": cfg["_slot_transfer"]}
         calldata = cast_calldata(f"transfer({SPEND_TUPLE})", spend_args(e))
         print("join-split transfer via frame tx (proof verified on-chain in the SENDER frame)")
-        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e))
+        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e), dry_run=dry)
     elif op == "withdraw":
         e = {**fix["withdraw"], "slot": cfg["_slot_withdraw"]}
         calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address)", spend_args(e), fix["recipient"])
         print("join-split withdraw via frame tx")
-        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e))
+        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e), dry_run=dry)
     else:
         raise SystemExit(f"unknown op {op}")
 
