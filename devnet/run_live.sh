@@ -27,10 +27,12 @@ POOL_SENDER=$(cast wallet address --private-key "$POOL_SENDER_PK")
 DEPLOYER=$(cast wallet address --private-key "$DEPLOYER_PK")
 echo "deployer=$DEPLOYER  pool_sender=$POOL_SENDER"
 
-echo "==> RecentRoots (EIP-8272 emulation)"
-ROOTS=$(forge create --root $BN --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GAS --gas-limit 3000000 --broadcast \
-  src/RecentRoots.sol:RecentRoots | deployed)
-echo "    roots=$ROOTS"
+echo "==> EnvelopeProbe (stateless frame-tx envelope reader, see EnvelopeProbe.yul)"
+PROBE=$(cast send --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GAS --gas-limit 500000 \
+  --create "$(python3 probe.py --initcode)" --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["contractAddress"])')
+[ "$(cast code "$PROBE" --rpc-url "$RPC")" = "$(python3 probe.py --runtime)" ] \
+  || { echo "probe runtime mismatch"; exit 1; }
+echo "    probe=$PROBE"
 echo "==> Groth16Verifier (snarkjs, committed pot14 verifier)"
 VERIFIER=$(forge create --root $BN --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GAS --gas-limit 6000000 --broadcast \
   src/Groth16Verifier.sol:Groth16Verifier | deployed)
@@ -52,29 +54,36 @@ POOL=$(forge create --root $BN --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GA
   src/ShieldedPool.sol:ShieldedPool \
   --libraries "src/PoseidonT3.sol:PoseidonT3:$T3" \
   --libraries "src/PoseidonT4.sol:PoseidonT4:$T4" \
-  --constructor-args "$POOL_SENDER" "$ROOTS" "$VERIFIER" | deployed)
-# NonceManager is CREATE(pool, nonce=1); computed, since eth_call is unusable here
-NONCES=$(cast compute-address "$POOL" --nonce 1 | awk '{print $NF}')
-echo "    pool=$POOL  nonces=$NONCES"
-echo "==> proof-gated APPROVE paymaster (50-byte runtime, see paymaster.py)"
-# --gas-limit 1M: under EIP-8037 the code deposit alone is ~1,530 gas/byte.
-PAYMASTER=$(cast send --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GAS --gas-limit 1000000 \
-  --create "$(python3 paymaster.py --initcode "$POOL")" --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["contractAddress"])')
-[ "$(cast code "$PAYMASTER" --rpc-url "$RPC")" = "$(python3 paymaster.py --runtime "$POOL")" ] \
+  --constructor-args "$POOL_SENDER" "$PROBE" "$VERIFIER" | deployed)
+SOURCE_ID=$(cast call "$POOL" "sourceId()(bytes32)" --rpc-url "$RPC")
+CHAIN_ID=$(cast chain-id --rpc-url "$RPC")
+echo "    pool=$POOL  source_id=$SOURCE_ID"
+echo "==> generating deployment-bound proofs"
+python3 ../wallet/gen_smoke.py "--chain-id=$CHAIN_ID" "--source-id=$SOURCE_ID"
+echo "==> proof-gated, sender-bound APPROVE paymaster (see paymaster.py)"
+# --gas-limit 2M: the paymaster runtime is ~575 bytes (with the root-reference
+# binding) and under EIP-8037 the code deposit alone is ~1,545 gas/byte, plus
+# constructor execution; an underfunded deploy produces an empty (codeless)
+# contract that the runtime-match check below then catches.
+# pool||poolSender are appended as constructor args; the runtime binds
+# TXPARAM(0x02)==POOL_SENDER, so only the pinned sender can be sponsored.
+PAYMASTER=$(cast send --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GAS --gas-limit 2000000 \
+  --create "$(python3 paymaster.py --initcode "$POOL" "$POOL_SENDER")" --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["contractAddress"])')
+[ "$(cast code "$PAYMASTER" --rpc-url "$RPC")" = "$(python3 paymaster.py --runtime "$POOL" "$POOL_SENDER")" ] \
   || { echo "paymaster runtime mismatch"; exit 1; }
 # The pay frame's target is the payer, so the paymaster must hold ETH for gas.
 # Its receive() guard (empty calldata -> STOP) accepts this plain transfer.
 cast send --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $GAS --gas-limit 100000 --value 1ether "$PAYMASTER" >/dev/null
 echo "    paymaster=$PAYMASTER  funded=$(cast balance "$PAYMASTER" --rpc-url "$RPC" | cut -c1-4)...wei"
 
-python3 - "$RPC" "$POOL" "$ROOTS" "$VERIFIER" "$NONCES" "$T3" "$T4" "$POOL_SENDER" "$PAYMASTER" <<'PY'
+python3 - "$RPC" "$POOL" "$PROBE" "$VERIFIER" "$T3" "$T4" "$POOL_SENDER" "$PAYMASTER" "$SOURCE_ID" <<'PY'
 import json, sys
-k = ["rpc","pool","roots","verifier","nonces","poseidonT3","poseidonT4","poolSender","paymaster"]
+k = ["rpc","pool","probe","verifier","poseidonT3","poseidonT4","poolSender","paymaster","sourceId"]
 json.dump(dict(zip(k, sys.argv[1:])), open("deploy_config.json","w"), indent=1)
 print("wrote deploy_config.json")
 PY
 echo "==> deployed. code sizes:"
-for a in "$POOL" "$T3" "$T4" "$VERIFIER" "$ROOTS"; do
+for a in "$POOL" "$T3" "$T4" "$VERIFIER" "$PROBE"; do
   echo "    $a $(cast code "$a" --rpc-url "$RPC" | wc -c) hex-chars"
 done
 echo

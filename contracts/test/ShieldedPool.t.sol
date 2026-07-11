@@ -4,14 +4,14 @@ pragma solidity ^0.8.24;
 import {PoseidonBN254} from "../src/PoseidonBN254.sol";
 import {Groth16Verifier} from "../src/Groth16Verifier.sol";
 import {ShieldedPool} from "../src/ShieldedPool.sol";
-import {NonceManager} from "../src/NonceManager.sol";
-import {RecentRoots} from "../src/RecentRoots.sol";
 
 interface Vm {
     function prank(address) external;
     function deal(address, uint256) external;
     function roll(uint256) external;
     function expectRevert(bytes4) external;
+    function expectCall(address, bytes calldata) external;
+    function etch(address, bytes calldata) external;
     function readFile(string calldata) external view returns (string memory);
     function parseJsonString(string calldata, string calldata) external pure returns (string memory);
     function parseJsonStringArray(string calldata, string calldata) external pure returns (string[] memory);
@@ -20,19 +20,20 @@ interface Vm {
     function parseUint(string calldata) external pure returns (uint256);
 }
 
-/// The attack battery for the JOIN-SPLIT pool. Every accepted spend carries a
-/// real Groth16 proof (wallet/smoke_fixture.json) verified on-chain, spends
-/// consume their two nullifiers as one EIP-8250 key set, and fees are paid to
-/// the submitter from shielded value. The star witness is `attack_same_note`:
-/// a REAL, circuit-valid proof that spends one note through both inputs
-/// (nf1 == nf2, conservation satisfied at double the value). Nothing in the
-/// proof layer refuses it; the multi-key set consumption must, and does.
+/// The attack battery for the JOIN-SPLIT pool, settle-only edition. Every
+/// accepted spend carries a real Groth16 proof (wallet/smoke_fixture.json)
+/// verified on-chain. The pool keeps no spent set and no root history: _spend
+/// binds the transaction envelope (protocol keyed nonces == the proven
+/// nullifiers, declared recent-root reference == the proven root) through a
+/// stateless probe. Tests deploy a MOCK probe (the frame-tx opcodes do not
+/// exist on anvil/Forge) and arm it with the envelope facts a faithful
+/// transaction would carry; negatives arm it wrong. The real Yul probe
+/// (devnet/EnvelopeProbe.yul) is exercised on the devnet.
 contract ShieldedPoolBN254Test {
     Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
     ShieldedPool pool;
-    NonceManager nonces;
-    RecentRoots roots;
+    MockEnvelopeProbe probe;
     Groth16Verifier verifier;
     string j;
 
@@ -43,10 +44,12 @@ contract ShieldedPoolBN254Test {
 
     function setUp() public {
         vm.roll(1000);
-        roots = new RecentRoots();
+        // NOTE: the probe occupies the deploy slot RecentRoots used to hold,
+        // keeping the pool's CREATE address (and so sourceId/domain and the
+        // fixture) stable across the settle-only migration.
+        probe = new MockEnvelopeProbe();
         verifier = new Groth16Verifier();
-        pool = new ShieldedPool(POOL_SENDER, roots, verifier);
-        nonces = pool.nonces();
+        pool = new ShieldedPool(POOL_SENDER, address(probe), verifier);
         vm.deal(address(this), 100 ether);
         vm.deal(POOL_SENDER, 1 ether);
         j = vm.readFile(FIX);
@@ -68,10 +71,10 @@ contract ShieldedPoolBN254Test {
         out[1] = uint256(vm.parseBytes32(v[1]));
     }
 
-    function _spendOf(string memory p, uint64 slot) internal view returns (ShieldedPool.Spend memory s) {
+    function _spendOf(string memory p) internal view returns (ShieldedPool.Spend memory s) {
         s = ShieldedPool.Spend({
             root: _s(string.concat(p, ".root")),
-            slot: slot,
+            domain: _s(string.concat(p, ".domain")),
             nf1: _s(string.concat(p, ".nf1")),
             nf2: _s(string.concat(p, ".nf2")),
             outCm1: _s(string.concat(p, ".out_cm1")),
@@ -85,67 +88,123 @@ contract ShieldedPoolBN254Test {
         });
     }
 
+    /// Arm the mock probe with the envelope facts the faithful shape carries
+    /// for this spend: 3 frames, settling at index 2, nonce_keys == sorted
+    /// {nf1, nf2} at seq 0, one reference (pool source_id, proven root).
+    function _arm(ShieldedPool.Spend memory s) internal {
+        (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
+        probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root);
+    }
+
     /// Shield Alice's 1.0-ether note so the pool's tree matches the fixture's
-    /// transfer root, and return the fixture transfer spend for that slot.
+    /// transfer root, and return the armed fixture transfer spend.
     function _shieldA() internal returns (ShieldedPool.Spend memory ts) {
         pool.shield{value: _u(".shield_value")}(_s(".inner_a"));
-        uint64 slot = pool.lastRootSlot();
         require(pool.isLeaf(_s(".cm_a")), "shield hashed the wrong commitment");
-        require(pool.currentRoot() == _s(".transfer.root"),
-                "pool root after shield != wallet's transfer root");
-        vm.roll(block.number + 1); // a root written in slot S is usable from S+1
-        ts = _spendOf(".transfer", slot);
+        require(pool.currentRoot() == _s(".transfer.root"), "pool root after shield != wallet's transfer root");
+        ts = _spendOf(".transfer");
+        _arm(ts);
     }
 
-    // ---- 1. honest join-split transfer: two nullifiers, ONE key set ----
+    // ---- 1. honest join-split transfer settles ----
 
-    function test_transfer_consumes_both_keys_as_one_set() public {
+    function test_transfer_settles_under_faithful_envelope() public {
         ShieldedPool.Spend memory s = _shieldA();
-        uint256 senderBefore = POOL_SENDER.balance;
         vm.prank(POOL_SENDER);
-        pool.transfer(s);
-        assertTrue(nonces.current(POOL_SENDER, s.nf1) == 1, "nf1 consumed");
-        assertTrue(nonces.current(POOL_SENDER, s.nf2) == 1, "nf2 consumed");
+        pool.transfer(s, POOL_SENDER);
         assertTrue(pool.isLeaf(s.outCm1) && pool.isLeaf(s.outCm2), "both outputs appended");
-        assertTrue(POOL_SENDER.balance == senderBefore + s.fee, "fee paid to submitter");
-        assertTrue(pool.currentRoot() == _s(".withdraw.root"),
-                   "pool root after transfer != wallet's withdraw root");
+        assertTrue(pool.feeCredit(POOL_SENDER) == s.fee, "fee credited to submitter");
+        assertTrue(pool.currentRoot() == _s(".withdraw.root"), "pool root after transfer != wallet's withdraw root");
     }
 
-    // ---- 2. the multi-key star witness: one note through both inputs ----
+    // ---- 2. envelope bindings (the settle-only trust surface) ----
 
-    function test_same_note_both_inputs_reverts_in_key_set() public {
-        // this proof is REAL and circuit-valid (conservation holds at twice
-        // the note's value); only the EIP-8250 duplicate-key rule refuses it
+    /// Outside a frame transaction the probe's opcodes halt; the pool must
+    /// refuse to settle rather than settle unbound.
+    function test_spend_outside_frame_tx_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
-        ShieldedPool.Spend memory x = _spendOf(".attack_same_note", s.slot);
-        assertTrue(x.nf1 == x.nf2, "the attack exposes one nullifier twice");
+        probe.setHalted();
         vm.prank(POOL_SENDER);
-        vm.expectRevert(NonceManager.NonceKeyAlreadyUsed.selector);
-        pool.transfer(x);
-        assertTrue(nonces.current(POOL_SENDER, x.nf1) == 0, "atomic: nothing consumed");
+        vm.expectRevert(ShieldedPool.NotFrameNative.selector);
+        pool.transfer(s, POOL_SENDER);
     }
 
-    // ---- 3. replay and cross-sender double-spends ----
-
-    function test_double_spend_replay_reverts() public {
+    /// Exactly-once: only the faithful [verify, pay, SENDER] grammar settles.
+    /// A second settle frame in the same tx would re-credit the fee for one
+    /// protocol consumption.
+    function test_wrong_frame_shape_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
+        (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
+        probe.set(4, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root); // four frames
         vm.prank(POOL_SENDER);
-        pool.transfer(s);
-        vm.roll(block.number + 1);
+        vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
+        pool.transfer(s, POOL_SENDER);
+        probe.set(3, 1, 2, 0, lo, hi, 1, pool.sourceId(), s.root); // wrong index
         vm.prank(POOL_SENDER);
-        vm.expectRevert(NonceManager.NonceKeyAlreadyUsed.selector);
-        pool.transfer(s);
+        vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
+        pool.transfer(s, POOL_SENDER);
     }
 
-    function test_cross_sender_double_spend_reverts() public {
+    /// The transaction's consumed key set must be exactly the proven
+    /// nullifiers: wrong keys, wrong order, wrong count, or nonzero seq all
+    /// refuse to settle.
+    function test_wrong_key_set_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
+        (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
+        probe.set(3, 2, 2, 0, hi, lo, 1, pool.sourceId(), s.root); // unsorted
         vm.prank(POOL_SENDER);
-        pool.transfer(s);
-        assertTrue(nonces.current(address(0xEEEE), s.nf1) == 0, "eve's slot is fresh");
+        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
+        pool.transfer(s, POOL_SENDER);
+        probe.set(3, 2, 2, 0, lo, bytes32(uint256(hi) ^ 1), 1, pool.sourceId(), s.root); // wrong key
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
+        pool.transfer(s, POOL_SENDER);
+        probe.set(3, 2, 1, 0, lo, bytes32(0), 1, pool.sourceId(), s.root); // one key
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
+        pool.transfer(s, POOL_SENDER);
+        probe.set(3, 2, 2, 1, lo, hi, 1, pool.sourceId(), s.root); // seq != 0
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
+        pool.transfer(s, POOL_SENDER);
+    }
+
+    /// The proven root must ride as the transaction's declared reference,
+    /// under THIS pool's source_id.
+    function test_wrong_reference_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
+        probe.set(3, 2, 2, 0, lo, hi, 0, bytes32(0), bytes32(0)); // no reference
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
+        pool.transfer(s, POOL_SENDER);
+        probe.set(3, 2, 2, 0, lo, hi, 1, bytes32(uint256(1)), s.root); // foreign source
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
+        pool.transfer(s, POOL_SENDER);
+        probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), bytes32(uint256(999))); // wrong root
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
+        pool.transfer(s, POOL_SENDER);
+    }
+
+    /// A foreign root in the SPEND (proof side) mismatches the armed
+    /// reference: the settle path catches it before the verifier runs.
+    function test_foreign_root_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        s.root = bytes32(uint256(999));
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
+        pool.transfer(s, POOL_SENDER);
+    }
+
+    // ---- 3. sender pin ----
+
+    function test_cross_sender_spend_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
         vm.prank(address(0xEEEE));
         vm.expectRevert(ShieldedPool.NotPoolSender.selector);
-        pool.transfer(s);
+        pool.transfer(s, POOL_SENDER);
     }
 
     // ---- 4. proof attacks ----
@@ -155,7 +214,7 @@ contract ShieldedPoolBN254Test {
         s.nf2 = bytes32(0);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ZeroNullifier.selector);
-        pool.transfer(s);
+        pool.transfer(s, POOL_SENDER);
     }
 
     function test_corrupted_proof_reverts() public {
@@ -163,7 +222,7 @@ contract ShieldedPoolBN254Test {
         s.pA[0] = addmod(s.pA[0], 1, 21888242871839275222246405745257275088696311157297823662689037894645226208583);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s);
+        pool.transfer(s, POOL_SENDER);
     }
 
     /// A valid proof cannot have its amounts re-priced: fee and publicAmount
@@ -173,7 +232,7 @@ contract ShieldedPoolBN254Test {
         s.fee = s.fee + 1;
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s);
+        pool.transfer(s, POOL_SENDER);
     }
 
     function test_tampered_outputs_revert() public {
@@ -181,22 +240,29 @@ contract ShieldedPoolBN254Test {
         s.outCm1 = bytes32(uint256(12345));
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s);
+        pool.transfer(s, POOL_SENDER);
     }
 
-    /// The root is bound by the PROOF, not only by the recent-roots check:
-    /// anchor the fixture proof to a second, genuinely recent root so
-    /// roots.check passes and only the verifier stands in the way. Catches a
-    /// circuit regression that drops root from the public list.
-    function test_recent_but_unproven_root_reverts_in_verifier() public {
+    function test_wrong_domain_reverts_before_verifier() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        s.domain = bytes32(uint256(s.domain) ^ 1);
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.InvalidDomain.selector);
+        pool.transfer(s, POOL_SENDER);
+    }
+
+    /// The root is bound by the PROOF, not only by the reference binding:
+    /// re-anchor the spend AND its armed reference to a second real root so
+    /// the reference check passes and only the verifier stands in the way.
+    /// Catches a circuit regression that drops root from the public list.
+    function test_referenced_but_unproven_root_reverts_in_verifier() public {
         ShieldedPool.Spend memory s = _shieldA();
         pool.shield{value: 1 ether}(bytes32(uint256(1)));
         s.root = pool.currentRoot();
-        s.slot = pool.lastRootSlot();
-        vm.roll(block.number + 1);
+        _arm(s); // reference now carries the new root, so that check passes
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s);
+        pool.transfer(s, POOL_SENDER);
     }
 
     /// ctx and publicAmount are bound by the PROOF, not only by the shape
@@ -207,60 +273,42 @@ contract ShieldedPoolBN254Test {
     function test_rebound_ctx_and_repriced_amount_revert_in_verifier() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(POOL_SENDER);
-        pool.transfer(ts);
-        uint64 slotR2 = pool.lastRootSlot();
-        vm.roll(block.number + 1);
+        pool.transfer(ts, POOL_SENDER);
 
-        ShieldedPool.Spend memory ws = _spendOf(".withdraw", slotR2);
+        ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         address payable evil = payable(address(0xBEEF));
         ws.ctx = pool.ctxFor(evil);
+        _arm(ws);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.withdraw(ws, evil);
+        pool.withdraw(ws, evil, POOL_SENDER);
 
-        ShieldedPool.Spend memory wp = _spendOf(".withdraw", slotR2);
+        ShieldedPool.Spend memory wp = _spendOf(".withdraw");
         wp.publicAmount = wp.publicAmount + 1;
+        _arm(wp);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.withdraw(wp, payable(vm.parseAddress(vm.parseJsonString(j, ".recipient"))));
+        pool.withdraw(wp, vm.parseAddress(vm.parseJsonString(j, ".recipient")), POOL_SENDER);
     }
 
-    // ---- 5. root-source / freshness attacks ----
-
-    function test_foreign_root_reverts() public {
-        ShieldedPool.Spend memory s = _shieldA();
-        s.root = bytes32(uint256(999));
-        vm.prank(POOL_SENDER);
-        vm.expectRevert(ShieldedPool.RootNotRecentForPool.selector);
-        pool.transfer(s);
-    }
-
-    function test_stale_root_reverts() public {
-        ShieldedPool.Spend memory s = _shieldA();
-        vm.roll(uint256(s.slot) + roots.RECENT_ROOT_USABLE_WINDOW() + 1);
-        vm.prank(POOL_SENDER);
-        vm.expectRevert(ShieldedPool.RootNotRecentForPool.selector);
-        pool.transfer(s);
-    }
-
-    // ---- 6. operation-shape attacks ----
+    // ---- 5. operation-shape attacks ----
 
     function test_withdraw_shaped_spend_rejected_by_transfer() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.publicAmount = 1; // nonzero publicAmount is not a transfer
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.TransferShape.selector);
-        pool.transfer(s);
+        pool.transfer(s, POOL_SENDER);
     }
 
     function test_transfer_shaped_spend_rejected_by_withdraw() public {
         ShieldedPool.Spend memory s = _shieldA(); // publicAmount == 0, ctx == 0
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.WithdrawShape.selector);
-        pool.withdraw(s, payable(address(0xBEEF)));
+        pool.withdraw(s, address(0xBEEF), POOL_SENDER);
     }
 
-    // ---- 6c. duplicate output is a no-op success, never a revert ----
+    // ---- 5c. duplicate output is a no-op success, never a revert ----
 
     function test_duplicate_output_is_noop() public {
         ShieldedPool.Spend memory s = _shieldA();
@@ -268,11 +316,9 @@ contract ShieldedPoolBN254Test {
         // exact output commitment via shield
         pool.shield{value: _u(".transfer.out_value1")}(_s(".transfer.out_inner1"));
         require(pool.isLeaf(s.outCm1), "pre-seeded output leaf");
-        vm.roll(block.number + 1);
         uint32 before = pool.nextIndex();
         vm.prank(POOL_SENDER);
-        pool.transfer(s); // must not revert
-        assertTrue(nonces.current(POOL_SENDER, s.nf1) == 1, "nf1 still consumed");
+        pool.transfer(s, POOL_SENDER); // must not revert
         assertTrue(pool.nextIndex() == before + 1, "only the change note appended");
     }
 
@@ -280,37 +326,67 @@ contract ShieldedPoolBN254Test {
 
     function test_full_lifecycle_pays_recipient_fees_and_stays_solvent() public {
         ShieldedPool.Spend memory ts = _shieldA();
-        uint256 senderBefore = POOL_SENDER.balance;
         vm.prank(POOL_SENDER);
-        pool.transfer(ts);
-        uint64 slotR2 = pool.lastRootSlot();
-        vm.roll(block.number + 1);
+        pool.transfer(ts, POOL_SENDER);
 
         address payable recipient = payable(vm.parseAddress(vm.parseJsonString(j, ".recipient")));
-        ShieldedPool.Spend memory ws = _spendOf(".withdraw", slotR2);
-        uint256 balBefore = recipient.balance;
+        ShieldedPool.Spend memory ws = _spendOf(".withdraw");
+        _arm(ws);
         vm.prank(POOL_SENDER);
-        pool.withdraw(ws, recipient);
+        pool.withdraw(ws, recipient, POOL_SENDER);
 
-        assertTrue(recipient.balance == balBefore + ws.publicAmount, "recipient paid publicAmount");
-        assertTrue(POOL_SENDER.balance == senderBefore + ts.fee + ws.fee,
-                   "submitter reimbursed both fees from shielded value");
-        // solvency: 1.0 in, 0.55 out, 0.1 fees out; Alice's 0.35 change remains
-        assertTrue(address(pool).balance ==
-                   _u(".shield_value") - ws.publicAmount - ts.fee - ws.fee,
-                   "pool balance equals the one unspent change note");
+        assertTrue(pool.withdrawalCredit(recipient) == ws.publicAmount, "withdrawal credited");
+        assertTrue(pool.feeCredit(POOL_SENDER) == ts.fee + ws.fee, "both fees credited");
+        assertTrue(address(pool).balance == _u(".shield_value"), "credits remain escrowed");
+
+        // claims are pushable: a third party (this test contract) pays each
+        // party its own recorded credit; no prank / self-call needed.
+        uint256 recipientBefore = recipient.balance;
+        pool.claimWithdrawal(recipient);
+        assertTrue(recipient.balance == recipientBefore + ws.publicAmount, "withdrawal claimed");
+        uint256 senderBefore = POOL_SENDER.balance;
+        pool.claimFee(payable(POOL_SENDER));
+        assertTrue(POOL_SENDER.balance == senderBefore + ts.fee + ws.fee, "fees claimed");
+    }
+
+    /// The stranded-fee regression: in the faithful shape the fee recipient is
+    /// the paymaster, a passive contract whose only ETH-in path is receive().
+    /// A keyed `feeCredit[msg.sender]` claim would strand it. The pushable
+    /// claim lets any keeper move the credit into the paymaster's balance,
+    /// where it funds future sponsorship.
+    function test_anyone_can_push_fee_to_passive_recipient() public {
+        PassiveReceiver pm = new PassiveReceiver();
+        ShieldedPool.Spend memory s = _shieldA();
+        vm.prank(POOL_SENDER);
+        pool.transfer(s, address(pm)); // fee recipient is the passive contract
+        assertTrue(pool.feeCredit(address(pm)) == s.fee, "fee credited to passive recipient");
+        uint256 before = address(pm).balance;
+        // a third party (0xF00D), not the recipient, pushes the credit
+        vm.prank(address(0xF00D));
+        pool.claimFee(payable(address(pm)));
+        assertTrue(address(pm).balance == before + s.fee, "credit pushed to passive recipient");
+        assertTrue(pool.feeCredit(address(pm)) == 0, "credit cleared after push");
+    }
+
+    function test_failed_fee_claim_preserves_credit() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        vm.prank(POOL_SENDER);
+        pool.transfer(s, address(this));
+        uint256 credit = pool.feeCredit(address(this));
+        vm.expectRevert(ShieldedPool.PayoutFailed.selector);
+        pool.claimFee(payable(address(this))); // this test contract rejects plain ETH
+        assertTrue(pool.feeCredit(address(this)) == credit, "failed claim restored credit");
     }
 
     function test_withdraw_wrong_recipient_reverts() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(POOL_SENDER);
-        pool.transfer(ts);
-        uint64 slotR2 = pool.lastRootSlot();
-        vm.roll(block.number + 1);
-        ShieldedPool.Spend memory ws = _spendOf(".withdraw", slotR2);
+        pool.transfer(ts, POOL_SENDER);
+        ShieldedPool.Spend memory ws = _spendOf(".withdraw");
+        _arm(ws);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.CtxDoesNotNameRecipient.selector);
-        pool.withdraw(ws, payable(address(0xDEAD)));
+        pool.withdraw(ws, address(0xDEAD), POOL_SENDER);
     }
 
     // ---- shield rules ----
@@ -333,11 +409,51 @@ contract ShieldedPoolBN254Test {
         pool.shield{value: 1 ether}(bytes32(type(uint256).max));
     }
 
+    // ---- EIP-8272 native predeploy (the pool's only root store) ----
+
+    /// Every root publication sends the native predeploy the exact 64-byte
+    /// `SALT || root` payload ethrex's native write expects. The expected
+    /// root after shielding Alice's note is the fixture's transfer root.
+    function test_publish_root_calls_native_predeploy() public {
+        vm.expectCall(pool.RECENT_ROOT_PREDEPLOY(), abi.encodePacked(pool.SALT(), _s(".transfer.root")));
+        pool.shield{value: _u(".shield_value")}(_s(".inner_a"));
+    }
+
+    /// A reverting predeploy write fails the operation loudly: with no
+    /// emulation left, an unpublished root would be unspendable state.
+    function test_publish_root_reverts_if_predeploy_reverts() public {
+        vm.etch(pool.RECENT_ROOT_PREDEPLOY(), hex"60006000fd"); // PUSH1 0 PUSH1 0 REVERT
+        vm.expectRevert(ShieldedPool.RootPublishFailed.selector);
+        pool.shield{value: 1 ether}(bytes32(uint256(1)));
+    }
+
+    /// The pool's sourceId must equal ethrex's native-write derivation,
+    /// keccak256(pad32(source) || salt). Vector computed independently with
+    /// the wallet's keccak (Python, eth_hash); pins Solidity's abi.encode
+    /// padding against the 64-byte preimage ethrex hashes.
+    function test_source_id_matches_ethrex_padded_derivation() public view {
+        assertTrue(
+            keccak256(abi.encode(address(0xBEEF), bytes32(uint256(7))))
+                == 0x93be371628ba90461c1988f904614363a3d7c6cf8ba98ae973416a0339a040f5,
+            "abi.encode(source, salt) != keccak256(pad32(source) || salt)"
+        );
+        assertTrue(
+            pool.sourceId() == keccak256(abi.encode(address(pool), pool.SALT())),
+            "pool.sourceId not the padded self-derivation"
+        );
+    }
+
     // ---- cross-stack fixtures (wallet / Python reference) ----
 
     function test_ctxFor_matches_wallet() public view {
-        assertTrue(pool.ctxFor(address(0xcafebabe)) == _s(".withdraw.ctx"),
-                   "ctxFor mismatch vs wallet");
+        assertTrue(pool.ctxFor(address(0xcafebabe)) == _s(".withdraw.ctx"), "ctxFor mismatch vs wallet");
+    }
+
+    function test_domain_matches_wallet_fixture() public view {
+        assertTrue(pool.domain() == _s(".domain"), "domain mismatch vs wallet");
+        assertTrue(
+            pool.domainFor(block.chainid, pool.sourceId()) == pool.domain(), "domain is not bound to chain and source"
+        );
     }
 
     function test_tree_root_matches_reference() public {
@@ -346,158 +462,71 @@ contract ShieldedPoolBN254Test {
             uint256(pool.currentRoot()) == vm.parseUint(vm.parseJsonString(vecs, ".tree.root_empty")),
             "empty root mismatch vs reference"
         );
-        // shield can't append arbitrary leaves (it hashes value in), so check
-        // the incremental tree through the reference fixture's raw leaves via
-        // the wallet-side root equalities asserted in _shieldA and the
-        // lifecycle test; here, assert the empty root only.
     }
 
-    // ---- VERIFY-frame readiness (for a devnet that raises MAX_VERIFY_GAS and
-    //      exposes a nonce_keys TXPARAM selector) ----
+    // ---- verifyProofOnly: the paymaster's prefix check ----
 
-    /// verifySpend must run under STATICCALL, so it is legal inside a VERIFY
-    /// (static) frame where a paymaster staticcalls it to gate APPROVE. A
-    /// successful staticcall proves it writes no state.
-    function test_verifySpend_is_static() public {
+    /// verifyProofOnly must succeed under STATICCALL (VERIFY-frame legal) and
+    /// reads no storage, so it clears the observer's non-sender-SLOAD ban.
+    function test_verifyProofOnly_is_static() public {
         ShieldedPool.Spend memory s = _shieldA();
-        (bool ok,) =
-            address(pool).staticcall(abi.encodeWithSelector(ShieldedPool.verifySpend.selector, s));
-        assertTrue(ok, "verifySpend must succeed under staticcall (VERIFY-frame legal)");
+        (bool ok,) = address(pool).staticcall(abi.encodeWithSelector(ShieldedPool.verifyProofOnly.selector, s));
+        assertTrue(ok, "verifyProofOnly must succeed under staticcall (VERIFY-frame legal)");
     }
 
-    /// A proof that does not match its public signals is rejected by verifySpend.
-    function test_verifySpend_rejects_mismatched_proof() public {
+    /// A proof that does not match its public signals is rejected.
+    function test_verifyProofOnly_rejects_mismatched_proof() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.outCm1 = bytes32(uint256(42)); // canonical, but not the proven output
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.verifySpend(s);
-    }
-
-    /// checkKeySet proves the envelope's nonce_keys are exactly the two
-    /// nullifiers (distinct, sorted): the binding a VERIFY-frame paymaster
-    /// makes once the devnet exposes a nonce_keys selector.
-    function test_checkKeySet_binds_keys_to_nullifiers() public {
-        ShieldedPool.Spend memory s = _spendOf(".transfer", 1);
-        bytes32 lo = s.nf1;
-        bytes32 hi = s.nf2;
-        if (uint256(lo) > uint256(hi)) { lo = s.nf2; hi = s.nf1; }
-
-        bytes32[] memory good = new bytes32[](2);
-        good[0] = lo; good[1] = hi;
-        pool.checkKeySet(s, good); // exact set, sorted: accepted (no revert)
-
-        bytes32[] memory unsorted = new bytes32[](2);
-        unsorted[0] = hi; unsorted[1] = lo;
-        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.checkKeySet(s, unsorted);
-
-        bytes32[] memory wrong = new bytes32[](2);
-        wrong[0] = lo; wrong[1] = bytes32(uint256(hi) ^ 1);
-        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.checkKeySet(s, wrong);
-
-        bytes32[] memory tooFew = new bytes32[](1);
-        tooFew[0] = lo;
-        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.checkKeySet(s, tooFew);
+        pool.verifyProofOnly(s);
     }
 
     // BN254 scalar field modulus, for the aliasing test below.
     uint256 constant P = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
 
     /// A nullifier is only canonical in [0, P). The verifier's field check
-    /// rejects nf + P as a public signal, and verifySpend's NotCanonical
-    /// guard names the failure first: without either, the same proof could
-    /// re-verify under a fresh nonce key (nf + P) and double-spend. This
-    /// asserts the guard fires.
-    function test_verifySpend_rejects_noncanonical_nullifier() public {
+    /// rejects nf + P as a public signal, and the NotCanonical guard names
+    /// the failure first: without either, the same proof could re-verify
+    /// under a fresh nonce key (nf + P) and double-spend.
+    function test_verifyProofOnly_rejects_noncanonical_nullifier() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.nf1 = bytes32(uint256(s.nf1) + P);
         vm.expectRevert(ShieldedPool.NotCanonical.selector);
-        pool.verifySpend(s);
+        pool.verifyProofOnly(s);
     }
 
-    /// checkKeySet rejects a set whose two nullifiers are equal (nf1 == nf2):
-    /// the same-note-through-both-inputs witness, refused by the duplicate-key
-    /// clause that is the sole barrier in the VERIFY-frame shape.
-    function test_checkKeySet_rejects_duplicate_nullifier() public {
-        ShieldedPool.Spend memory s = _spendOf(".attack_same_note", 1); // nf1 == nf2
-        bytes32[] memory keys = new bytes32[](2);
-        keys[0] = s.nf1; keys[1] = s.nf2;
-        vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.checkKeySet(s, keys);
-    }
-
-    /// A root is usable only from its publish slot + 1 (EIP-8272 window lower
-    /// bound). A spend referencing it in the same block it was published must
-    /// fail, or a same-block reorg could reference a root that never settled.
-    function test_root_not_usable_at_publish_slot() public {
-        pool.shield{value: _u(".shield_value")}(_s(".inner_a"));
-        ShieldedPool.Spend memory s = _spendOf(".transfer", pool.lastRootSlot());
-        vm.expectRevert(ShieldedPool.RootNotRecentForPool.selector); // no roll: current == slot
-        pool.verifySpend(s);
-    }
-
-    /// verifyProofOnly must succeed under STATICCALL for a valid proof EVEN with
-    /// a non-recent root (no roll): it omits roots.check, so it reads no storage
-    /// and clears the observer's non-sender-SLOAD ban. This is the SLOAD-free
-    /// call the ProofPaymaster makes; root recency stays in the SENDER frame.
-    function test_verifyProofOnly_is_static_without_root_check() public {
-        pool.shield{value: _u(".shield_value")}(_s(".inner_a"));
-        ShieldedPool.Spend memory s = _spendOf(".transfer", pool.lastRootSlot());
-        // same slot as publish => verifySpend would revert RootNotRecentForPool;
-        // verifyProofOnly ignores recency and passes on the valid proof.
-        vm.expectRevert(ShieldedPool.RootNotRecentForPool.selector);
-        pool.verifySpend(s);
-        (bool ok,) =
-            address(pool).staticcall(abi.encodeWithSelector(ShieldedPool.verifyProofOnly.selector, s));
-        assertTrue(ok, "verifyProofOnly must pass under staticcall regardless of root recency");
-    }
-
-    /// Gas split per operation: what a VERIFY frame would spend on the proof
-    /// check (verifySpend + the checkKeySet binding) vs what the SENDER/exec
-    /// frame spends on state. Run: forge test --mt test_gas_frame_split -vv
+    /// Gas split per operation: what the pay VERIFY frame spends on the proof
+    /// check vs what the settle-only SENDER frame spends on state.
+    /// Run: forge test --mt test_gas_frame_split -vv
     function test_gas_frame_split() public {
         uint256 g;
 
-        // shield: no proof, so nothing runs in a VERIFY frame beyond the
-        // sender's self-verify signature; the whole cost is the exec deposit.
         g = gasleft();
         pool.shield{value: _u(".shield_value")}(_s(".inner_a"));
         emit log_named_uint("shield.exec", g - gasleft());
-        uint64 slot = pool.lastRootSlot();
-        vm.roll(block.number + 1);
 
-        // transfer: VERIFY (verifySpend) + the key-set binding, then total.
-        ShieldedPool.Spend memory ts = _spendOf(".transfer", slot);
+        ShieldedPool.Spend memory ts = _spendOf(".transfer");
+        _arm(ts);
         g = gasleft();
-        pool.verifySpend(ts);
+        pool.verifyProofOnly(ts);
         emit log_named_uint("transfer.verify", g - gasleft());
-
-        bytes32[] memory keys = new bytes32[](2);
-        keys[0] = ts.nf1; keys[1] = ts.nf2;
-        if (uint256(keys[0]) > uint256(keys[1])) (keys[0], keys[1]) = (ts.nf2, ts.nf1);
-        g = gasleft();
-        pool.checkKeySet(ts, keys);
-        emit log_named_uint("transfer.checkKeySet", g - gasleft());
 
         vm.prank(POOL_SENDER);
         g = gasleft();
-        pool.transfer(ts);
+        pool.transfer(ts, POOL_SENDER);
         emit log_named_uint("transfer.total", g - gasleft());
-        uint64 slotR2 = pool.lastRootSlot();
-        vm.roll(uint256(slotR2) + 2); // past the publish slot so the root is usable
 
-        // withdraw: VERIFY (verifySpend), then total.
         address payable recipient = payable(vm.parseAddress(vm.parseJsonString(j, ".recipient")));
-        ShieldedPool.Spend memory ws = _spendOf(".withdraw", slotR2);
+        ShieldedPool.Spend memory ws = _spendOf(".withdraw");
+        _arm(ws);
         g = gasleft();
-        pool.verifySpend(ws);
+        pool.verifyProofOnly(ws);
         emit log_named_uint("withdraw.verify", g - gasleft());
 
         vm.prank(POOL_SENDER);
         g = gasleft();
-        pool.withdraw(ws, recipient);
+        pool.withdraw(ws, recipient, POOL_SENDER);
         emit log_named_uint("withdraw.total", g - gasleft());
     }
 
@@ -505,4 +534,45 @@ contract ShieldedPoolBN254Test {
     function assertTrue(bool c, string memory m) internal pure {
         require(c, m);
     }
+}
+
+/// Configurable stand-in for devnet/EnvelopeProbe.yul: anvil/Forge has no
+/// frame-tx opcodes, so tests arm the nine envelope words a faithful
+/// transaction would expose (or halt, emulating a non-frame context).
+contract MockEnvelopeProbe {
+    bytes blob;
+    bool halted;
+
+    function set(
+        uint256 frames,
+        uint256 frameIndex,
+        uint256 keyCount,
+        uint256 nonceSeq,
+        bytes32 k0,
+        bytes32 k1,
+        uint256 refCount,
+        bytes32 refSource,
+        bytes32 refRoot
+    ) external {
+        halted = false;
+        blob = abi.encode(frames, frameIndex, keyCount, nonceSeq, k0, k1, refCount, refSource, refRoot);
+    }
+
+    function setHalted() external {
+        halted = true;
+    }
+
+    fallback() external {
+        if (halted) revert();
+        bytes memory b = blob;
+        assembly {
+            return(add(b, 32), mload(b))
+        }
+    }
+}
+
+/// A passive ETH sink: accepts plain transfers via receive(), like the faithful
+/// paymaster, but has no code path of its own to call the pool's claim.
+contract PassiveReceiver {
+    receive() external payable {}
 }

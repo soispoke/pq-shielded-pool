@@ -6,9 +6,10 @@ Each pool interaction rides a type-0x06 frame transaction:
 
   shield:   frames = [ VERIFY(target=sender, self-verify sig -> APPROVE),
                        SENDER(target=pool, value=amount, data=shield(inner)) ]
-  transfer: frames = [ VERIFY(target=POOL_SENDER, self-verify),
-                       SENDER(target=pool, value=0, data=transfer(Spend)) ]
-  withdraw: same, data=withdraw(Spend, recipient)
+  transfer: frames = [ VERIFY(target=POOL_SENDER, self-verify, execution),
+                       VERIFY(target=paymaster, verifyProofOnly(Spend), payment),
+                       SENDER(target=pool, value=0, data=transfer(Spend, feeRecipient)) ]
+  withdraw: same, data=withdraw(Spend, recipient, feeRecipient)
 
 The VERIFY frame is the reference self-verify pattern from
 scripts/hegota-devnet/frametx_submit.py: the sender's default EOA code checks
@@ -21,28 +22,33 @@ The Groth16 proof is verified INSIDE the pool call (BN254 pairing precompiles),
 so no attester is needed: the whole spend, proof check
 included, executes on the devnet as an ordinary application frame.
 
-What this integration does NOT do, and why (see REVIEW.md):
-  * It does not put the two nullifiers in the transaction's `nonce_keys` (the
-    protocol EIP-8250 spent set) in the default public-devnet path. The pool
-    keeps its own NonceManager there because the public mempool still admits
-    only `[0]`. The faithful `--proof-in-verify` path does set
-    `nonce_keys=[nf1,nf2]` and binds them in the paymaster via NONCEKEYLOAD,
-    but it needs builder-direct or a mempool policy update.
-  * It does not reference the root via the tx `recent_root_references`; the
-    pool reads its own RecentRoots. RECENTROOTREFLOAD now exists in ethrex, but
-    this paymaster still needs to wire it before the root binding is protocol
-    state rather than pool-owned storage.
-
-The `--proof-in-verify` flag builds the FAITHFUL shape instead, in the
+Since the settle-only pool (step 2) transfers and withdraws are ALWAYS the
+faithful shape: the pool keeps no spent set and no root history, so _spend
+refuses to settle unless the transaction consumed exactly the proven
+nullifiers as protocol keyed nonces and declared the proven root as its
+recent-root reference. The faithful shape is the
 EIP-8141 [only_verify, pay] grammar: an execution-scope self-verify frame
 followed by a payment-scope pay frame targeting the proof-gated paymaster
-(paymaster.py), which staticcalls pool.verifyProofOnly and APPROVEs payment
-only on a valid proof, so the proof is checked before any approval. verifySpend
+(paymaster.py), which staticcalls pool.verifyProofOnly and APPROVEs payment only
+if the proof is valid AND the envelope binds to POOL_SENDER (TXPARAM 0x02),
+nonce_seq == 0, exactly three frames, nonce_keys == sorted{nf1, nf2}
+(NONCEKEYLOAD), and one declared EIP-8272 recent-root reference carrying the
+pool's source_id and the spend's proven root (RECENTROOTREFLOAD 0xB5). The
+faithful tx therefore declares `recent_root_references = [[source_id, slot,
+root]]`, with slot the consensus slot of the block that published the root
+(derived from that block's timestamp the same way ethrex's derivedSlotTime
+knob does); the protocol validates the reference at admission and at block
+execution, which makes root recency protocol-enforced. The pool re-binds the
+same envelope facts in the SENDER frame via EnvelopeProbe.yul. The
+sender bind is what stops a costless dummy-input proof from draining the funded
+paymaster (see REVIEW.md 2026-07-10); the proof is checked before any approval.
+verifySpend
 ~243k fits MAX_VERIFY_GAS once raised (500k on the devnet as of 2026-07-08).
-verifyProofOnly reads no RecentRoots storage and the paymaster is SLOAD-free, so
-the pay frame no longer trips the observer's StorageReadNonSender ban; it still
-submits builder-direct because nonce_keys=[nf1,nf2] is not public-mempool
-admissible. The paymaster must be funded: it is the payer.
+verifyProofOnly reads no RecentRoots storage and the paymaster is SLOAD-free,
+so the pay frame does not trip the observer's StorageReadNonSender ban, and
+since 2026-07-08 non-zero nonce_keys are public-mempool admissible, so the
+faithful spend submits through the public RPC. The paymaster must be funded:
+it is the payer.
 
 Usage:
   pool_frametx.py <rpc> deploy-config.json fixture.json shield   <priv>
@@ -59,7 +65,7 @@ from eth_keys import keys
 from frametx import Frame, FrameSig, FrameTx
 
 
-SPEND_TUPLE = "(bytes32,uint64,bytes32,bytes32,bytes32,bytes32,uint256,uint256,bytes32,uint256[2],uint256[2][2],uint256[2])"
+SPEND_TUPLE = "(bytes32,bytes32,bytes32,bytes32,bytes32,bytes32,uint256,uint256,bytes32,uint256[2],uint256[2][2],uint256[2])"
 
 
 def rpc(url, method, params):
@@ -109,12 +115,32 @@ def spend_args(entry):
     p = entry["proof"]
     pair = lambda v: "[" + ",".join(str(int(x, 16)) for x in v) + "]"
     pb = "[" + ",".join(pair(row) for row in p["pB"]) + "]"
-    return (f'({entry["root"]},{entry["slot"]},{entry["nf1"]},{entry["nf2"]},'
+    return (f'({entry["root"]},{entry["domain"]},{entry["nf1"]},{entry["nf2"]},'
             f'{entry["out_cm1"]},{entry["out_cm2"]},{entry["public_amount"]},'
             f'{entry["fee"]},{entry["ctx"]},{pair(p["pA"])},{pb},{pair(p["pC"])})')
 
 
-def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_verify=None, dry_run=False):
+def recent_root_ref(url, cfg, e):
+    """The pre-encoded EIP-8272 envelope reference [source_id, slot, root] for
+    the spend's root. `e["slot"]` is the block number that published the root
+    (threaded in as cfg _slot_transfer/_slot_withdraw from the receipt); its
+    consensus slot is derived from that block's timestamp exactly as ethrex's
+    derivedSlotTime knob does: (timestamp - genesis_timestamp) / seconds_per_slot
+    (6s on the devnet, override with cfg["secondsPerSlot"]). The paymaster binds
+    source_id and root (RECENTROOTREFLOAD); the protocol enforces the recency
+    window and the committed entry at admission and at block execution."""
+    from frametx import rlp_bytes, rlp_int, rlp_list
+    pub_block = int(e["slot"])
+    ts = int(rpc(url, "eth_getBlockByNumber", [hex(pub_block), False])["timestamp"], 16)
+    genesis_ts = int(rpc(url, "eth_getBlockByNumber", ["0x0", False])["timestamp"], 16)
+    slot = (ts - genesis_ts) // int(cfg.get("secondsPerSlot", 6))
+    source_id = bytes.fromhex(cfg["sourceId"].removeprefix("0x"))
+    root = bytes.fromhex(e["root"].removeprefix("0x"))
+    return rlp_list([rlp_bytes(source_id), rlp_int(slot), rlp_bytes(root)])
+
+
+def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_verify=None,
+                   recent_root_refs=None, dry_run=False):
     sender = int.from_bytes(pk.public_key.to_canonical_address(), "big")
     chain_id = int(rpc(url, "eth_chainId", []), 16)
     nonce = int(rpc(url, "eth_getTransactionCount", [pk.public_key.to_checksum_address(), "latest"]), 16)
@@ -158,7 +184,8 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
             chain_id=chain_id, nonce_keys=nonce_keys, nonce_seq=nonce_seq, sender=sender,
             frames=frames,
             signatures=[FrameSig(FrameSig.SECP256K1, sender, b"", b"")],
-            max_priority_fee=max_priority, max_fee=max_fee)
+            max_priority_fee=max_priority, max_fee=max_fee,
+            recent_root_refs=recent_root_refs)
         s = pk.sign_msg_hash(tx.sig_hash())
         sig = bytes([s.v + 27]) + s.r.to_bytes(32, "big") + s.s.to_bytes(32, "big")
         tx.signatures = [FrameSig(FrameSig.SECP256K1, sender, b"", sig)]
@@ -238,10 +265,13 @@ def main():
     fix = json.loads(open(fix_path).read())
     pool = int(cfg["pool"], 16)
     pk = keys.PrivateKey(bytes.fromhex(priv.removeprefix("0x")))
+    sender_address = pk.public_key.to_checksum_address()
     # --proof-in-verify implies protocol nonces: the ProofPaymaster binds the
     # envelope's nonce_keys to the proven nullifiers (NONCEKEYLOAD), so the two
     # nullifiers MUST be the transaction's key set.
-    proof_in_verify = "--proof-in-verify" in sys.argv and op in ("transfer", "withdraw")
+    # settle-only pool: every spend is the faithful shape (the flag remains
+    # accepted for compatibility but is implied)
+    proof_in_verify = op in ("transfer", "withdraw")
     dry = "--dry-run" in sys.argv
     protocol_nonces = None
     if ("--protocol-nonces" in sys.argv or proof_in_verify) and op in ("transfer", "withdraw"):
@@ -250,9 +280,12 @@ def main():
 
     def verify_frame(e):
         """The faithful-shape VERIFY frame: ProofPaymaster target, verifyProofOnly
-        data. The paymaster binds nonce_keys == {nf1, nf2} and staticcalls
+        data. The paymaster binds nonce_keys == {nf1, nf2}, the declared
+        recent-root reference (pool source_id + proven root), and staticcalls
         verifyProofOnly (proof + canonicity, no RecentRoots read) so the frame
-        reads no non-sender storage; root recency stays in the SENDER frame."""
+        reads no non-sender storage; the protocol enforces root recency via the
+        reference, and the SENDER frame's verifySpend re-checks the pool's own
+        emulation as a belt."""
         if not proof_in_verify:
             return None
         return (int(cfg["paymaster"], 16),
@@ -264,15 +297,20 @@ def main():
         print(f"shield {value} wei via frame tx -> pool {cfg['pool']}")
         build_and_send(url, pk, pool, value, calldata, dry_run=dry)
     elif op == "transfer":
-        e = {**fix["transfer"], "slot": cfg["_slot_transfer"]}
-        calldata = cast_calldata(f"transfer({SPEND_TUPLE})", spend_args(e))
+        e = fix["transfer"]
+        fee_recipient = cfg["paymaster"] if proof_in_verify else sender_address
+        refs = [recent_root_ref(url, cfg, {"slot": cfg["_slot_transfer"], "root": e["root"]})]
+        calldata = cast_calldata(f"transfer({SPEND_TUPLE},address)", spend_args(e), fee_recipient)
         print("join-split transfer via frame tx (proof verified on-chain in the SENDER frame)")
-        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e), dry_run=dry)
+        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e), refs, dry_run=dry)
     elif op == "withdraw":
-        e = {**fix["withdraw"], "slot": cfg["_slot_withdraw"]}
-        calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address)", spend_args(e), fix["recipient"])
+        e = fix["withdraw"]
+        fee_recipient = cfg["paymaster"] if proof_in_verify else sender_address
+        refs = [recent_root_ref(url, cfg, {"slot": cfg["_slot_withdraw"], "root": e["root"]})]
+        calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address,address)", spend_args(e),
+                                 fix["recipient"], fee_recipient)
         print("join-split withdraw via frame tx")
-        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e), dry_run=dry)
+        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify_frame(e), refs, dry_run=dry)
     else:
         raise SystemExit(f"unknown op {op}")
 

@@ -14,11 +14,14 @@ import secrets
 import sys
 from pathlib import Path
 
+from eth_hash.auto import keccak
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "reference"))
 from poseidon_bn254 import P, p2, tagged, TAG_PK, TAG_LEAF, TAG_NULL  # noqa: E402
 
 DEPTH = 20
 MAX_VALUE = 1 << 128
+DOMAIN_TAG = bytes.fromhex("40752e102d2a749c61d42a71e297edd3b493de639003b9480a700d589d98065b")
 
 _RNG = None  # None = cryptographic secrets; set_seed makes note generation reproducible
 
@@ -51,8 +54,17 @@ def commitment(spend_key, rho, value):
     return tagged(TAG_LEAF, inner(spend_key, rho), value)
 
 
-def nullifier(spend_key, cm):
-    return tagged(TAG_NULL, spend_key, cm)
+def domain_scalar(chain_id, source_id):
+    """keccak256(DOMAIN_TAG || uint256_be(chain_id) || source_id) mod Fr."""
+    if isinstance(source_id, str):
+        source_id = bytes.fromhex(source_id.removeprefix("0x"))
+    if len(source_id) != 32 or not 0 <= chain_id < 1 << 256:
+        raise ValueError("domain inputs must be uint256 chain_id and bytes32 source_id")
+    return int.from_bytes(keccak(DOMAIN_TAG + chain_id.to_bytes(32, "big") + source_id), "big") % P
+
+
+def nullifier(domain, spend_key, cm):
+    return tagged(TAG_NULL, p2(domain, spend_key), cm)
 
 
 def new_note():
@@ -123,7 +135,7 @@ def ctx_for_recipient(addr_hex):
     return int(h, 16)
 
 
-def build_witness(tree, inputs, outputs, public_amount=0, fee=0, recipient=None):
+def build_witness(tree, inputs, outputs, domain, public_amount=0, fee=0, recipient=None):
     """A join-split witness against the current tree, as the circom input map.
 
     inputs: exactly two dicts {sk, rho, value, idx} (idx None for a dummy,
@@ -152,6 +164,7 @@ def build_witness(tree, inputs, outputs, public_amount=0, fee=0, recipient=None)
             bits.append(b)
     return {
         "root": str(tree.root()),
+        "domain": str(domain),
         "in_spend_key": [str(i["sk"]) for i in inputs],
         "in_rho": [str(i["rho"]) for i in inputs],
         "in_value": [str(i["value"]) for i in inputs],
@@ -165,9 +178,9 @@ def build_witness(tree, inputs, outputs, public_amount=0, fee=0, recipient=None)
     }
 
 
-def input_nullifiers(inputs):
+def input_nullifiers(domain, inputs):
     """The two nullifiers a witness's inputs expose, in order."""
-    return [nullifier(i["sk"], commitment(i["sk"], i["rho"], i["value"])) for i in inputs]
+    return [nullifier(domain, i["sk"], commitment(i["sk"], i["rho"], i["value"])) for i in inputs]
 
 
 def output_commitments(outputs):

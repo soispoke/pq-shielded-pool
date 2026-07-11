@@ -27,11 +27,12 @@ pragma circom 2.0.8;
 //     inner    = Poseidon2(owner_pk, rho)          # what a recipient reveals
 //     cm       = Poseidon(TAG_LEAF, inner, value)  # shield hashes value in
 //                                                  # ON-CHAIN from msg.value
-//     nf       = Poseidon(TAG_NULL, spend_key, cm)
+//     domain   = keccak256(DOMAIN_TAG || chain_id || source_id) mod Fr
+//     nf       = Poseidon(TAG_NULL, Poseidon2(domain, spend_key), cm)
 //
-// The eight public signals, in the verifier's order (circom puts outputs
+// The nine public signals, in the verifier's order (circom puts outputs
 // first in declaration order, then public inputs in declaration order):
-//     [nf1, nf2, out_cm1, out_cm2, root, public_amount, fee, ctx]
+//     [nf1, nf2, out_cm1, out_cm2, root, domain, public_amount, fee, ctx]
 // The verifier binds each directly (one scalar mul per signal, ~6k gas),
 // which is cheaper and leaner than the earlier design's Poseidon-compressed
 // claim recomputed onchain (4 hash3, ~230k gas).
@@ -44,11 +45,12 @@ pragma circom 2.0.8;
 //      (computed_root - root) * v_in === 0, so a nonzero-value input MUST be
 //      in the tree while a zero-value input (needed to spend a single note
 //      through the 2-input circuit) may be fabricated: it contributes zero
-//      value, and its nullifier is derived from its own fabricated cm, so it
-//      can never collide with (or burn) a real note's nullifier.
-//   8. Same-note-twice is refused one layer up: spending one note as both
-//      inputs yields nf1 == nf2, and the EIP-8250 key-set consumption
-//      rejects a duplicate key in the set (NonceManager.consumeFreshMany).
+//      value. Reproducing a real note's nullifier still requires its secret;
+//      in any case a zero-value collision cannot destroy value.
+//   8. Same-note-twice is refused in-circuit by nf1 != nf2. The EIP-8250
+//      duplicate-key rule remains defense in depth.
+//   9. Domain separation: the contract binds the public domain to this chain
+//      and pool source before verifying the proof.
 //
 // The four contract-side VERIFY bindings still apply, with the key-set
 // binding generalised: the consumed nonce-key set must be exactly
@@ -57,10 +59,12 @@ pragma circom 2.0.8;
 // resolved via -l tooling/node_modules (see tooling/setup.sh)
 include "circomlib/circuits/poseidon.circom";
 include "circomlib/circuits/bitify.circom";
+include "circomlib/circuits/comparators.circom";
 
 // One input note: derive nf, walk the path, gate membership on value != 0.
 template InputNote(DEPTH) {
     signal input root;
+    signal input domain;
     signal input spend_key;
     signal input rho;
     signal input value;
@@ -100,15 +104,22 @@ template InputNote(DEPTH) {
     // membership, gated: a nonzero-value note must open at the anchored root
     (cur[DEPTH] - root) * value === 0;
 
+    // Domain separation keeps one note's keyed nonce distinct across chains
+    // and pool deployments without requiring a new Poseidon arity:
+    // nf = Poseidon3(TAG_NULL, Poseidon2(domain, spend_key), cm).
+    component domainKey = Poseidon(2);
+    domainKey.inputs[0] <== domain;
+    domainKey.inputs[1] <== spend_key;
     component null = Poseidon(3);
     null.inputs[0] <== 3;
-    null.inputs[1] <== spend_key;
+    null.inputs[1] <== domainKey.out;
     null.inputs[2] <== leaf.out;
     nf <== null.out;
 }
 
 template Spend(DEPTH) {
     signal input root;
+    signal input domain;
     signal input in_spend_key[2];
     signal input in_rho[2];
     signal input in_value[2];
@@ -129,6 +140,7 @@ template Spend(DEPTH) {
     for (var k = 0; k < 2; k++) {
         note[k] = InputNote(DEPTH);
         note[k].root <== root;
+        note[k].domain <== domain;
         note[k].spend_key <== in_spend_key[k];
         note[k].rho <== in_rho[k];
         note[k].value <== in_value[k];
@@ -158,8 +170,12 @@ template Spend(DEPTH) {
 
     nf1 <== note[0].nf;
     nf2 <== note[1].nf;
+    component sameNullifier = IsEqual();
+    sameNullifier.in[0] <== nf1;
+    sameNullifier.in[1] <== nf2;
+    sameNullifier.out === 0;
     out_cm1 <== outCm[0].out;
     out_cm2 <== outCm[1].out;
 }
 
-component main {public [root, public_amount, fee, ctx]} = Spend(20);
+component main {public [root, domain, public_amount, fee, ctx]} = Spend(20);

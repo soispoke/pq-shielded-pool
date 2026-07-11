@@ -599,6 +599,123 @@ that admission then rejected on a keyed-nonce mismatch, a sim/admission
 inconsistency. Dora also does not index type-0x06 frame transactions, so the
 spend is invisible in the explorer even though it mined.
 
+### Security review: the paymaster must bind the sender, not just the proof (2026-07-10)
+
+The selector fix above closed the "APPROVE with no proof" path, but a deeper
+one remained, and it is the more important finding. **A valid spend proof is
+costless to mint.** The circuit's zero-value dummy input (a legitimate feature,
+it is how a single note is spent through the two-input circuit) lets anyone
+build a fully valid proof with `in_value = [0, 0]`: conservation forces every
+output, `publicAmount`, and `fee` to 0, membership is skipped for both inputs,
+`root`/`ctx` are free, and the two nullifiers are fresh, distinct, non-zero
+Poseidon outputs. So `verifyProofOnly` passing is **not** evidence of ownership
+or of any value moving. The faithful paymaster bound the proof and the
+`nonce_keys` set but authenticated neither the sender, nor `nonce_seq == 0`, nor
+the frame shape, nor the SENDER frame it pays for. EIP-8250's own Security
+Considerations require the opposite: a single-use-key application MUST
+authenticate `(sender, nonce_keys_hash, nonce_seq == 0)` in VERIFY. So, opened
+beyond operator-only builder-direct submission, anyone could mint a dummy proof,
+set `nonce_keys = sorted{nf1, nf2}`, and have the funded paymaster sponsor their
+transaction, draining it (and, since the SENDER frame was unbound, sponsoring
+arbitrary execution). It was a *trusted* paymaster, safe only because the
+operator was the sole submitter, not the *trustless* one the docs claimed.
+
+The fix adds the missing envelope bindings to `ProofPaymaster.yul`, checked
+before APPROVE: `TXPARAM(0x02) == POOL_SENDER` (only the pinned sender may be
+sponsored), `TXPARAM(0x01) == 0` (nonce_seq, the EIP-8250 single-use rule), and
+`TXPARAM(0x09) == 3` (the exact `[self-verify, pay, sender]` shape, no extra
+payer-funded frames), alongside the existing `len(nonce_keys) == 2` and
+`nonce_keys == sorted{nf1, nf2}`. **The sender bind is the load-bearing one for
+this pool.** Because the pool pins `POOL_SENDER` everywhere (`_spend` reverts
+otherwise), only `POOL_SENDER` can produce an acceptable spend; binding
+sponsorship to that same pinned sender means a third party cannot forge
+`POOL_SENDER`'s signature and so cannot get sponsored, which closes the drain.
+`POOL_SENDER` is now a second 32-byte constructor arg (`pool || poolSender`
+appended to the code; still SLOAD-free, read via CODECOPY at codesize-64 and
+codesize-32). The honest faithful transfer still satisfies every check (sender
+`POOL_SENDER`, `nonce_seq = 0`, three frames).
+
+Status: recompiled with `solc 0.8.30 --strict-assembly --optimize --optimize-runs
+200`, the bytecode disassembled with every binding confirmed present and ordered,
+and re-run live on the Hegotá devnet (chain 3151908, blocks ~119310-119323) on a
+fresh stack whose `POOL_SENDER` is a throwaway operator (the sender's identity is
+irrelevant to the binding logic). Three checks:
+
+- **deploy / bytecode match**: `run_live.sh` deployed the hardened paymaster and
+  its on-chain code equalled `paymaster.py --runtime pool poolSender` (the
+  script's own line-63 assertion passed).
+- **positive (no regression)**: the honest `--proof-in-verify` transfer signed by
+  `POOL_SENDER` mined (tx `0x874e9fd6…`, block 119323, status 1, 2,124,052 gas),
+  the **payer was the paymaster** (its balance dropped by the gas cost, so APPROVE
+  fired only because the new binds passed), both nullifiers show
+  `NONCE_MANAGER seq = 1`, and the root advanced to the fixture withdraw root.
+- **negative (drain closed)**: the identical transaction signed by a
+  non-`POOL_SENDER` key was rejected by `ethrex_simulateFrameTransaction` in the
+  **validation prefix** (`valid=False, payer=None, executionStatus=None,
+  violation="validation prefix frame reverted"`), i.e. the pay frame reverted on
+  the `TXPARAM(0x02)` sender bind *before any approval*, not merely in SENDER-frame
+  execution. The only variable between the two runs is the signer, and the only
+  sender-dependent prefix check is that bind, so the rejection is attributable to
+  it. (The `nonce_seq != 0` and four-frame rejections are not reachable through
+  the stock `pool_frametx.py`, which always builds `nonce_seq = 0` and three
+  frames; those two remain verified structurally by the disassembly, not live.)
+
+Two items deliberately left open. (1) **SENDER-frame binding.** The paymaster
+still does not bind the SENDER frame's `(target, keccak256(calldata))`; it relies
+on the sender pin instead, which suffices for this single-operator pool. A
+*permissionless* variant (no sender pin, anyone may spend) additionally MUST bind
+the SENDER frame, via per-frame introspection: canonical EIP-8141 exposes this
+through `FRAMEPARAM (0xb3)` + `FRAMEDATALOAD (0xb1)`, and ethrex's build through
+per-frame `TXPARAM` selectors `0x11–0x15` (REVIEW opcode list above). The
+capability exists in the spec and on the devnet; the exact per-frame stack ABI on
+the current build is not pinned in-repo and is unexercised, so that variant is
+specified but not implemented. This was never an EIP or an ethrex *capability*
+gap, only unused capability in the paymaster. (2) **Fee routing.** The pool pays
+`fee` to `msg.sender`, which in this shape is `POOL_SENDER`, not the payer (the
+paymaster); for the single-operator pool that is the same entity that funds the
+paymaster, so the loop nets out, but a distinct third-party payer would need the
+pool to route the fee to the payer (a payer `TXPARAM`, not currently exposed).
+
+### Conservative v2 validated live, and two findings (2026-07-11)
+
+The v2 statement (domain-separated nullifiers, in-circuit `nf1 != nf2`, pull-credit
+settlement, envelope-bound fee recipient, reproducible paymaster; see
+[[drafts/minimal-shielded-pool-v2/statement]]) ran end to end on a fresh public-devnet
+stack (chain 3151908, blocks 134171-134180) with a throwaway operator. The whole
+point was to exercise the new SENDER-frame binding live for the first time: the
+paymaster now also binds the pay-frame and SENDER-frame shape with `FRAMEPARAM`
+(0xb3) and `FRAMEDATALOAD` (0xb1), which no prior run touched. It works. The honest
+`--proof-in-verify` transfer mined (tx `0x91abb6a5…`, payer = paymaster, pay frame
+291k gas, up from ~283k, consistent with the added per-frame reads), the two
+nullifiers show `NONCE_MANAGER seq = 1`, the root advanced to the fixture withdraw
+root, `pool.domain()` equals the proof's `domain` public signal (deployment-bound
+proof generation agrees with the contract's `domainFor`), and a non-`POOL_SENDER`
+submitter is rejected in the validation prefix (`valid=False, payer=None`). So the
+frame-introspection ABI the Yul assumed is empirically correct on ethrex.
+
+Two findings:
+
+1. **`run_live.sh` underfunded the paymaster deploy (fixed).** The v2 paymaster
+   runtime is 532 bytes (the SENDER-frame binding roughly tripled it), needing ~820k
+   code-deposit gas plus constructor under EIP-8037, ~1.04M total. The script's
+   `--gas-limit 1000000` produced a codeless deploy, which the runtime-match guard
+   then correctly flagged as a "mismatch". Raised to 2M; deployed code then equals
+   `paymaster.py --runtime` byte-for-byte (532 bytes). The guard worked; the mismatch
+   was the symptom.
+
+2. **The faithful-shape fee was stranded (fixed).** Settlement credits `fee` to the
+   fee recipient, which the paymaster binds to itself. But the paymaster is a passive
+   contract (its only ETH-in path is a bare receive), and the old `claimFee` keyed the
+   claim on `feeCredit[msg.sender]`, so the paymaster had no way to collect its own
+   credit and no third party could push it out. Confirmed live: `feeCredit[paymaster]`
+   held the fee with no path to recover it. Not a soundness bug (nothing lost or
+   stealable), but the sponsorship loop did not close. Fixed by making the claims
+   pushable: `claimWithdrawal(who)` / `claimFee(who)` now pay `who`'s own recorded
+   credit to `who`, callable by anyone, so a keeper moves the fee into the paymaster's
+   balance where it funds future sponsorship. Zeroed before the send, so a recipient
+   that reverts on receipt only reverts its own claim. Forge-tested against a passive
+   receiver pushed by a third party (48 tests pass).
+
 ## Local end-to-end run of the faithful spend (2026-07-06, patched node)
 
 The faithful spend ran end to end against a local ethrex built from
@@ -718,6 +835,164 @@ end-to-end run today means a local node acting as the builder.
 
 Everything pool-side through item 5's dependencies is deployed and waiting: the
 proof check, the paymaster, and the spent-set binding (`NONCEKEYLOAD`).
+
+## Source check (2026-07-11): the recent-root path is complete, and inclusion re-validates everything
+
+Instead of asking ethrex the two questions the roadmap left open, we read the
+`hegota-devnet` source at tip `2d64fba`. Both answers are yes, and the branch
+carries documentation this review did not know about: `docs/eip-8141.md`,
+`docs/eip-8250.md`, and `docs/eip-8272.md` specify the shipped opcode ABIs and
+enumerate every divergence from the draft specs. The ethrex ask list shrinks
+to one item.
+
+**The recent-root path works end to end.** `RECENTROOTREFLOAD` is opcode
+**`0xB5`**, not a `NONCEKEYLOAD` mirror as the 2026-07-06 commit note
+suggested and not the draft's `0xB4` (which collides with EIP-8141's shipped
+`SIGPARAM = 0xB4`). Stack `[field, index]` with `field` on top: 0 =>
+source_id, 1 => slot, 2 => root; gas 3; envelope-only; legal in VERIFY
+frames; exceptional-halt on out-of-range. Declared references are validated
+twice: at mempool admission (slot window plus a head-state storage assertion,
+because the validation-prefix simulation never reaches the VM's check) and
+authoritatively in `execute_frame_tx` before any frame runs, where an invalid
+reference invalidates the transaction and, on import, the whole block.
+`entry_hash` commits to the raw slot, so a ring entry overwritten by an
+aliasing newer slot can never satisfy a stale reference; per the ethrex doc
+this closed the soundness hole that had kept references disabled, and the
+path was deployed and proven e2e on the devnet on 2026-07-08. The native
+write (64-byte `salt ‖ root` to the predeploy) commits under
+`source_id = keccak256(pad32(caller) ‖ salt)`. That padded form diverges
+from this repo's `RecentRoots.sol` emulation, whose `sourceIdOf` hashes the
+unpadded 20-byte address; the migration must adopt ethrex's derivation, and
+the draft EIP must ratify one form (ethrex flags it as needing upstream
+ratification, since clients that disagree fork on the first
+reference-carrying transaction). Upstream items for the draft are filed in
+the vault at
+`drafts/recent-root-references/reviews/2026-07-11-ethrex-implementation-divergences-claude.md`.
+
+**Inclusion re-validates the whole prefix.** `execute_frame_tx`, the path
+block import takes for type-0x06 transactions, re-checks against transaction
+pre-state before any frame executes: static constraints, keyed-nonce
+freshness (every selected key's current sequence must equal `nonce_seq`),
+fee rules, every outer signature, and recent-root validity. Payer solvency
+is enforced structurally: APPROVE debits the payer the transaction's maximum
+cost, an underflow reverts the frame leaving `payer` unset, and an unset
+payer invalidates the whole transaction post-execution. So the three
+admission-to-inclusion races (another transaction consumed the nullifier,
+the root aged out, the payer was drained) all invalidate the transaction,
+and its block, at inclusion. Roadmap item 9's consensus precondition is
+satisfied; what remains is mempool hygiene (admitted reference-carrying
+transactions are not re-checked or evicted on head changes, only dropped
+when block building fails them — latency, not soundness).
+
+**The one missing capability is a payer TXPARAM.** The selector list runs
+0x00–0x10 and nothing exposes the resolved payer, so a pool cannot route the
+fee to whoever actually funded the transaction; the fee stays pinned to the
+one known paymaster. This is the single remaining ethrex feature ask
+(roadmap fee routing, and any relayer beyond the pinned one).
+
+## Migration step 1 (2026-07-11): the root binding is protocol state, belt kept
+
+Roadmap item 6 is implemented, both belts on. Four changes, validated by the
+full deterministic smoke (real Groth16 proofs on-chain) and 51 forge tests;
+the live Hegotá run is the remaining validation.
+
+1. **`RecentRoots.sourceIdOf` adopts ethrex's padded derivation**,
+   `keccak256(pad32(source) || salt)` (`abi.encode` instead of
+   `abi.encodePacked`), so the pool's `sourceId` — and therefore its `domain`
+   public signal — is the same value ethrex's native write commits under. A
+   cross-stack vector test pins the form. This changed the testbed domain, so
+   the fixture, and all its proofs, were regenerated (`gen_smoke.py`, new
+   `TEST_SOURCE_ID`).
+2. **`_publishRoot` dual-writes**: the RecentRoots emulation (still what
+   `verifySpend` checks) plus the same 64-byte `SALT || root` payload to the
+   native `0x…8272` predeploy, which on ethrex commits the entry at the
+   current consensus slot. Forge tests assert the exact payload
+   (`vm.expectCall`) and that a reverting predeploy fails the operation
+   (`RootPublishFailed`) instead of letting the two stores diverge.
+3. **The paymaster gains the root binding (1b)**: exactly one declared
+   reference (TXPARAM `0x0F`), `source_id == keccak256(pad32(pool) || 0)`
+   (computed in-EVM — KECCAK256 is not observer-banned — so no new
+   constructor arg), and `ref.root == spend.root` via `RECENTROOTREFLOAD`
+   (`0xB5`), disassembly-verified operand order. Runtime grew 468 → 509
+   bytes; `run_live.sh`'s 2M deploy gas still clears it.
+4. **`pool_frametx.py` declares the reference** on the faithful path:
+   `recent_root_references = [[source_id, slot, root]]`, slot derived from
+   the publication block's timestamp exactly as ethrex's `derivedSlotTime`
+   does. The ref is RLP-embedded verbatim and covered by `sig_hash`
+   (self-checked).
+
+With this, a stale or forged root fails in the validation prefix under
+protocol rules (committed entry + recency window, enforced at admission and
+at block execution) rather than only in SENDER-frame execution.
+
+**Validated live the same day** (public Hegotá devnet, chain 3151908, fresh
+stack, throwaway operator, everything through the public
+`eth_sendRawTransaction`, blocks 136448-136500):
+
+- **Deploy**: `pool.sourceId()` on-chain equals the padded derivation
+  computed independently in Python; paymaster runtime byte-matched.
+- **Shield** (tx `0x27819c32…`, block 136463): the dual-write committed a
+  native predeploy entry, read back via `eth_getStorageAt` and equal to
+  `entry_hash(source_id, slot, root)` at the timestamp-derived slot 136479 —
+  proving the script's slot derivation matches the node's `derivedSlotTime`
+  (slot 136479 > block 136463: missed slots advance the counter).
+- **Faithful transfer with a declared reference** (tx `0xa59b033f…`, block
+  136473, 2,265,513 gas, pay frame 291,219 — the ref binding's gas cost is
+  noise): payer = paymaster, both nullifiers at `NONCE_MANAGER` storage
+  seq 1, root advanced to the fixture withdraw root. As far as we know the
+  first reference-carrying frame transactions accepted on the devnet.
+- **Negative controls** (simulator, withdraw spend): the same faithful shape
+  with NO declared reference is rejected in the validation prefix
+  (`valid=False, payer=None`), and — the sharp one — a reference carrying a
+  COMMITTED, in-window root that is not the spend's root (the stale transfer
+  root) is also rejected in the prefix. The protocol's committed-entry check
+  passes for that reference; only the paymaster's `RECENTROOTREFLOAD` root
+  equality kills it, so the B5 bind is load-bearing, not vacuous.
+- **Faithful withdraw with a declared reference** (tx `0xc9795801…`, block
+  136493): mined, nullifiers consumed, `withdrawalCredit[recipient]` = 0.55
+  ETH.
+- **Pushable claims closed the sponsorship loop live** (first time): a third
+  party (the deployer key) pushed `claimFee(paymaster)` — the paymaster's
+  balance rose by the two spends' 0.1 ETH fee credit — and
+  `claimWithdrawal(recipient)` paid the recipient 0.55 ETH.
+
+What remains for the fully clean design: step 2 (settle-only SENDER
+entrypoint, retire the pool's NonceManager/RecentRoots — the reference path
+is now live-proven, so step 2 is unblocked), and the payer TXPARAM for fee
+routing beyond the pinned paymaster.
+
+## Migration step 2 (2026-07-11): settle-only, protocol state is the sole authority
+
+Roadmap items 8 and 9 are done: the pool keeps NO spent set and NO root
+history. RecentRoots.sol, NonceManager.sol, and the Spend tuple's `slot`
+field are deleted; `_publishRoot` writes only the native predeploy;
+`sourceId` is self-computed (`keccak256(abi.encode(this, SALT))`). `_spend`
+is settle-only: it binds the transaction envelope through
+**EnvelopeProbe.yul** (88 bytes deployed), a stateless Yul reader the pool
+STATICCALLs because Solidity cannot emit the frame-tx opcodes. It requires
+frames == 3 and current index == 2 (exactly-once per consumption — without
+it a crafted multi-SENDER-frame tx could settle twice per key consumption),
+nonce_keys == sorted{nf1, nf2} at seq 0, and one declared reference equal to
+(sourceId, s.root); then it checks the proof and settles. The proof check
+stays pool-side deliberately: the paymaster's prefix check protects its gas
+float, the pool's protects noteholders, and the pool cannot authenticate WHO
+verified in the prefix (a payer TXPARAM would allow exactly that — a second
+use for the one remaining ethrex ask). Transfers and withdraws are therefore
+faithful-shape only; the legacy self-paying path no longer settles. Tests
+run against a mock probe armed with the envelope facts (the opcodes do not
+exist on anvil); 39 forge tests and the real-proof smoke pass.
+
+**Validated live the same day** (fresh stack, public mempool, blocks
+136700-136720): shield `0x217ef8dc…` (block 136707), settle-only transfer
+`0x6e7ff04e…` (block 136710, **1,939,893 gas vs 2,265,513 in step 1**, ~326k
+saved by dropping the pool's own stores), withdraw `0x1be83aaa…` (block
+136714). All four nullifiers sit at seq 1 in the protocol NONCE_MANAGER —
+now the only spent set anywhere — the fee credits and the 0.55 ETH
+withdrawal credit are correct, and the pool's only root store is the
+EIP-8272 predeploy. Remaining known bounds: TreeFull is an accepted
+operational limit (a revert there now burns notes for good; disposable
+2^20-leaf testbed), and fee routing to arbitrary relayers still waits on the
+payer TXPARAM.
 
 ## Bottom line
 

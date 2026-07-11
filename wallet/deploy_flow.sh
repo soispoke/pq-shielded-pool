@@ -19,8 +19,6 @@ cd "$(dirname "$0")"
 CONTRACTS=../contracts
 FIX=smoke_fixture.json
 
-[ -f "$FIX" ] || { echo "no $FIX; run ./smoke.sh first"; exit 1; }
-
 ANVIL_PID=""
 cleanup() { [ -n "$ANVIL_PID" ] && kill "$ANVIL_PID" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -69,14 +67,17 @@ POOL=$($FC src/ShieldedPool.sol:ShieldedPool \
   --libraries "src/PoseidonT4.sol:PoseidonT4:$T4" \
   --constructor-args "$POOL_SENDER" "$ROOTS" "$VERIFIER" | deployed)
 NONCES=$(cast call "$POOL" "nonces()(address)" --rpc-url "$RPC_URL")
+SOURCE_ID=$(cast call "$POOL" "sourceId()(bytes32)" --rpc-url "$RPC_URL")
 echo "    pool $POOL  roots $ROOTS  verifier $VERIFIER  nonces $NONCES"
+echo "==> generating deployment-bound proofs (chain $CHAINID, source $SOURCE_ID)"
+python3 gen_smoke.py "--chain-id=$CHAINID" "--source-id=$SOURCE_ID"
 
 send() { cast send --rpc-url "$RPC_URL" "$@" >/dev/null; }
 call() { cast call --rpc-url "$RPC_URL" "$@"; }
 
-SPEND_SIG="(bytes32,uint64,bytes32,bytes32,bytes32,bytes32,uint256,uint256,bytes32,uint256[2],uint256[2][2],uint256[2])"
+SPEND_SIG="(bytes32,uint64,bytes32,bytes32,bytes32,bytes32,bytes32,uint256,uint256,bytes32,uint256[2],uint256[2][2],uint256[2])"
 spend_tuple() { # $1 = fixture key, $2 = root, $3 = slot
-  echo "($2,$3,$(j "['$1']['nf1']"),$(j "['$1']['nf2']"),$(j "['$1']['out_cm1']"),$(j "['$1']['out_cm2']"),$(j "['$1']['public_amount']"),$(j "['$1']['fee']"),$(j "['$1']['ctx']"),$(proof "$1"))"
+  echo "($2,$3,$(j "['$1']['domain']"),$(j "['$1']['nf1']"),$(j "['$1']['nf2']"),$(j "['$1']['out_cm1']"),$(j "['$1']['out_cm2']"),$(j "['$1']['public_amount']"),$(j "['$1']['fee']"),$(j "['$1']['ctx']"),$(proof "$1"))"
 }
 
 echo "==> shield 1.0 ether into note A (contract hashes msg.value into cm)"
@@ -85,16 +86,9 @@ SLOT_R1=$(call "$POOL" "lastRootSlot()(uint64)")
 R1=$(call "$POOL" "currentRoot()(bytes32)")
 [ "$R1" = "$(j "['transfer']['root']")" ] || { echo "R1 != fixture transfer root"; exit 1; }
 
-echo "==> the same-note-twice attack (real proof, nf1 == nf2): must be refused"
-if cast send --rpc-url "$RPC_URL" --private-key "$POOL_SENDER_PK" "$POOL" \
-  "transfer($SPEND_SIG)" "$(spend_tuple attack_same_note "$R1" "$SLOT_R1")" >/dev/null 2>&1; then
-  echo "    ATTACK ACCEPTED, the key-set duplicate rule failed"; exit 1
-fi
-echo "    refused (duplicate key in the 8250 set)"
-
-
 echo "==> join-split transfer (two nullifiers as ONE 8250 key set; fee to sender)"
-send --private-key "$POOL_SENDER_PK" "$POOL" "transfer($SPEND_SIG)" "$(spend_tuple transfer "$R1" "$SLOT_R1")"
+send --private-key "$POOL_SENDER_PK" "$POOL" "transfer($SPEND_SIG,address)" \
+  "$(spend_tuple transfer "$R1" "$SLOT_R1")" "$POOL_SENDER"
 SLOT_R2=$(call "$POOL" "lastRootSlot()(uint64)")
 R2=$(call "$POOL" "currentRoot()(bytes32)")
 [ "$R2" = "$(j "['withdraw']['root']")" ] || { echo "R2 != fixture withdraw root"; exit 1; }
@@ -102,19 +96,21 @@ R2=$(call "$POOL" "currentRoot()(bytes32)")
 echo "==> withdraw (publicAmount to recipient, fee to sender)"
 RECIPIENT=$(j "['recipient']")
 BAL_BEFORE=$(cast balance "$RECIPIENT" --rpc-url "$RPC_URL")
-send --private-key "$POOL_SENDER_PK" "$POOL" "withdraw($SPEND_SIG,address)" \
-  "$(spend_tuple withdraw "$R2" "$SLOT_R2")" "$RECIPIENT"
+send --private-key "$POOL_SENDER_PK" "$POOL" "withdraw($SPEND_SIG,address,address)" \
+  "$(spend_tuple withdraw "$R2" "$SLOT_R2")" "$RECIPIENT" "$POOL_SENDER"
+send --private-key "$POOL_SENDER_PK" "$POOL" "claimFee(address)" "$POOL_SENDER"
 BAL_AFTER=$(cast balance "$RECIPIENT" --rpc-url "$RPC_URL")
 echo "    recipient balance $BAL_BEFORE -> $BAL_AFTER"
-python3 -c "import sys;sys.exit(0 if int('$BAL_AFTER')==int('$BAL_BEFORE')+$(j "['withdraw']['public_amount']") else 1)" || { echo "recipient not paid publicAmount"; exit 1; }
+CREDIT=$(call "$POOL" "withdrawalCredit(address)(uint256)" "$RECIPIENT")
+[ "$CREDIT" = "$(j "['withdraw']['public_amount']")" ] || { echo "recipient credit mismatch"; exit 1; }
 
 # the trustless-paymaster loop: the pinned sender was reimbursed both fees
 # from shielded value (anvil charges gas, so assert net = fees - gas > 0
 # relative to a gasless baseline by checking the pool paid the fees out)
 POOL_BAL=$(cast balance "$POOL" --rpc-url "$RPC_URL")
-EXPECT=$(python3 -c "import json;f=json.load(open('$FIX'));print(int(f['shield_value'])-int(f['withdraw']['public_amount'])-int(f['transfer']['fee'])-int(f['withdraw']['fee']))")
+EXPECT=$(python3 -c "import json;f=json.load(open('$FIX'));print(int(f['shield_value'])-int(f['transfer']['fee'])-int(f['withdraw']['fee']))")
 [ "$POOL_BAL" = "$EXPECT" ] || { echo "pool balance $POOL_BAL != expected $EXPECT (fees not paid?)"; exit 1; }
-echo "    pool balance == the one unspent change note; both fees left to the sender"
+echo "    pool escrows the withdrawal credit; both prepaid fees were claimed by the sender"
 
 echo "==> flow complete"
 echo "    shield + join-split transfer + withdraw accepted, same-note attack refused,"

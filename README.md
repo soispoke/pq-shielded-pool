@@ -20,19 +20,18 @@ misstated. A spend consumes two input notes, creates two output notes (payment
 and change), and proves in-circuit:
 
 - **membership** of each non-zero input at an anchored Merkle root (depth 20).
-  A zero-value input is a dummy: its nullifier derives from a fabricated
-  commitment and cannot collide with a real note, so a single note can be spent
-  through the two-input circuit.
+  A zero-value input is a dummy and contributes no value.
 - **conservation** `v_in1 + v_in2 = v_out1 + v_out2 + publicAmount + fee`, with
   each value range-checked to 128 bits.
-- **eight public signals**, bound directly by the verifier:
-  `[nf1, nf2, outCm1, outCm2, root, publicAmount, fee, ctx]` (circuit outputs
+- **nine public signals**, bound directly by the verifier:
+  `[nf1, nf2, outCm1, outCm2, root, domain, publicAmount, fee, ctx]` (circuit outputs
   first, then public inputs). Each costs one scalar mul onchain (~6k gas),
   far cheaper than recomputing a Poseidon-compressed digest (~230k).
 
 Transfer sets `publicAmount = 0` and `ctx = 0`; withdraw sets `publicAmount > 0`
 and `ctx` naming the recipient. Either may carry a `fee`, paid from shielded
-value to `msg.sender`.
+value as a pull credit to the envelope-bound fee recipient. Withdrawals are
+also pull credits, so recipient code cannot revert settlement.
 
 ## Contracts
 
@@ -44,10 +43,8 @@ The pool enforces four checks around each proof:
 3. the proof's root is one of the pool's recent roots (EIP-8272);
 4. the operation shape is well-formed (transfer vs withdraw).
 
-Consuming the 2 nullifiers as a set makes the duplicate-key rule the defense
-against spending one note through both inputs: such a spend has `nf1 == nf2`,
-which the circuit accepts but the set consumption rejects, so it reverts and
-spends nothing.
+Nullifiers are separated by `domain = H(chain_id, source_id)` and the circuit
+rejects `nf1 == nf2`. The duplicate-key rule repeats that check in the envelope.
 
 ```
 contracts/src/
@@ -81,12 +78,12 @@ ceremony and invalidates the committed fixtures; run `wallet/gen_smoke.py` (or
 
 Standard-EVM figures (via-IR, optimizer runs 5000, Poseidon as an external
 library).
-Depth 20, 13,028 R1CS constraints, ~600 ms to prove (snarkjs, Node), 256-byte
+Depth 20, 13,509 R1CS constraints, ~600 ms to prove (snarkjs, Node), 256-byte
 proofs.
 
 | operation | gas |
 |---|---:|
-| verifySpend (proof + root check) | ~243k |
+| verifySpend (proof + root check) | ~250k |
 | shield | ~1.20M |
 | transfer | ~1.13M |
 | withdraw | ~1.20M |
@@ -105,8 +102,6 @@ two-dimensional gas accounting raises these figures; see
 - **Amounts are public.** Shield and withdraw amounts and fees are visible
   onchain; only internal transfer amounts are hidden, and equal deposit and
   withdrawal amounts are linkable.
-- **The duplicate-key check is soundness-critical.** Spending one note twice is
-  rejected by the nullifier-set consumption, not by the circuit; a deployment
-  that skipped that check would double-count. Enforcing `nf1 != nf2` in-circuit
-  is a possible hardening.
+- **Finite tree.** Depth 20 admits 1,048,576 commitments. There is no silent
+  epoch rollover because old epoch roots would age out and strand notes.
 - **Unaudited research code.**
