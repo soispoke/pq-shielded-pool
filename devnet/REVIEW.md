@@ -1297,6 +1297,15 @@ the settlement credit. The pool routes the address through `_feeRecipient`, a
 backward-compatible seam for replacing the calldata value with an authenticated
 resolved-payer TXPARAM when ethrex exposes it. A real-proof Forge lifecycle
 selects two passive paymaster addresses for consecutive spends and confirms
-their credits remain isolated and non-redirectable. This validates pool
-accounting and transaction construction locally; the Yul self-binding across
-two funded paymaster deployments still needs a live devnet run.
+their credits remain isolated and non-redirectable.
+
+The Yul self-binding also ran live on a fresh public Hegotá deployment. The
+shield mined at block 141775 (`0x67f7ab8a…`). Paymaster A
+(`0x0165878a…`) then funded the transfer (`0xff47ade9…`, block 141783,
+1,742,745 gas), and paymaster B (`0x2279b7a0…`) funded the withdrawal
+(`0x846e106b…`, block 141789, 1,882,784 gas). Simulation and receipts resolved
+the intended payer in each case. After both spends, the pool held exactly 0.05
+ETH of fee credit for A and 0.05 ETH for B. Independent push claims
+(`0x29654d8a…`, `0x66cd0682…`) transferred each credit only to its recorded
+paymaster and cleared both mappings. The test used an isolated temporary copy,
+so it did not replace the repository's recorded deployment or fixtures.
