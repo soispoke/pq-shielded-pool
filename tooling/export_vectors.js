@@ -11,7 +11,8 @@
 //
 // Vector set: zero, unit, counter, and LCG-seeded
 // states for Poseidon(2) and Poseidon(3), plus the pool chain from seed 2026
-// (owner_pk, cm, nf, out_cm) and the depth-20 incremental-tree fixtures.
+// (owner_pk, cm, the domain-separated nf, out_cm) and the depth-20
+// incremental-tree fixtures.
 
 const fs = require("fs");
 const path = require("path");
@@ -75,11 +76,15 @@ async function main() {
   const value = lcg.nextFe(p) & mask128;
   const out_value1 = lcg.nextFe(p) & mask128;
   const out_value2 = lcg.nextFe(p) & mask128;
+  // drawn last so the earlier draws (and their committed vectors) are stable
+  const domain = lcg.nextFe(p); // stands in for keccak(TAG||chain||source) mod p
   const owner_pk = p3(1n, spend_key, 0n);
   const inner = p2(owner_pk, rho);
   const cm = p3(2n, inner, value);
-  const nf = p3(3n, spend_key, cm);
-  const nf2 = p3(3n, spend_key, p3(2n, inner, 0n)); // a dummy's nullifier
+  // v2 nullifiers are domain-separated: nf = Poseidon(TAG_NULL,
+  // Poseidon2(domain, spend_key), cm), mirroring circuits/spend.circom
+  const nf = p3(3n, p2(domain, spend_key), cm);
+  const nf2 = p3(3n, p2(domain, spend_key), p3(2n, inner, 0n)); // a dummy's nullifier
   const out_cm1 = p3(2n, out_inner1, out_value1);
   const out_cm2 = p3(2n, out_inner2, out_value2);
 
@@ -107,7 +112,7 @@ async function main() {
     poseidon3: vec3,
     pool_chain: Object.fromEntries(Object.entries({
       spend_key, rho, value, out_inner1, out_inner2, out_value1, out_value2,
-      owner_pk, inner, cm, nf, nf2, out_cm1, out_cm2,
+      domain, owner_pk, inner, cm, nf, nf2, out_cm1, out_cm2,
     }).map(([k, v]) => [k, v.toString()])),
     tree: {
       depth: DEPTH,

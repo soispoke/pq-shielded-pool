@@ -54,7 +54,7 @@ contract ShieldedPool {
 
     address public immutable POOL_SENDER;
     /// Stateless Yul envelope reader (devnet/EnvelopeProbe.yul): returns the
-    /// nine envelope words _spend binds. A separate contract because Solidity
+    /// ten envelope words _spend binds. A separate contract because Solidity
     /// cannot emit the frame-tx opcodes (verbatim is Yul-object-only).
     address public immutable probe;
     Groth16Verifier public immutable verifier;

@@ -1035,6 +1035,49 @@ settle-only transfer (1,940,073 gas), and withdraw all mined through the public
 mempool with the hardened 320-byte probe and the new settle-frame-target bind,
 all four nullifiers consumed as protocol keyed nonces, credits correct.
 
+## Tooling hardening pass (2026-07-11)
+
+A follow-up review of the Python tooling found one high-severity operational
+gap and fixed it plus three smaller ones. The on-chain core (circuit, pool,
+paymaster, probe) was re-read in the same pass with no new findings.
+
+- **Spends refuse to send without a simulation.** `pool_frametx.py`'s
+  SENDER-revert guard silently disengaged when the endpoint lacked
+  `ethrex_simulateFrameTransaction`: it printed a note and sent blind. For the
+  settle-only pool that is the note-burn case, since a mined tx whose SENDER
+  frame reverts has already consumed `{nf1, nf2}` as protocol keyed nonces at
+  payment approval but never inserts the outputs. Nullifier-consuming spends
+  now hard-refuse to send without a successful simulation (shields still
+  degrade gracefully; a reverted shield loses nothing), and the post-mine
+  revert message states explicitly that the spent notes are burned.
+- **No gas down-sizing on spends.** The measured + 25% SENDER-frame resize
+  traded paymaster prepayment for note loss: EIP-8037 state-dimension
+  accounting varies 2-4x across blocks, so an OOG settle frame at a later
+  block is the same irreversible burn. Spends keep the generous default limit;
+  the payer's worst case is prepaying more gas, refunded on success. The
+  resize still applies to non-spends.
+- **The vector chain tests the v2 nullifier.** `export_vectors.js`,
+  `PoseidonVectors.t.sol`, and `reference/poseidon_bn254.py` all still
+  validated the legacy domainless `nf = Poseidon(TAG_NULL, spend_key, cm)`,
+  a stale reference a future indexer could copy. All three now use the v2
+  derivation `nf = Poseidon(TAG_NULL, Poseidon2(domain, spend_key), cm)`; the
+  exporter draws `domain` after the existing LCG draws so every previously
+  committed vector value is unchanged, and the vectors were regenerated
+  (only `domain`, `nf`, `nf2` differ).
+- **Doc drift.** The probe header now says ten returned words (was nine) and
+  a 100k caller cap (was 60k, stale since the hardening pass raised it).
+
+Acknowledged but deliberately unfixed: the paymaster does not compare the
+proof-bound fee to the transaction's gas cost (harmless while the sender is
+pinned to the operator's own key, required for a permissionless variant, and
+recorded there alongside the SENDER-calldata bind); the pool has no
+root-republish entrypoint (a quiet pool's predeploy entry ages out of the
+8191-slot window until any shield refreshes it); and `gen_smoke.py --random`
+persists no change-note secrets, so shielding real value through it strands
+the change (fixture-driven testbed design). Validated: vectors re-exported,
+`reference/poseidon_bn254.py` and `wallet.py` self-checks, `frametx.py`
+golden vector, both Yul builds, and all 41 Forge tests.
+
 ## Bottom line
 
 The devnet implements the three EIPs cleanly and the pool ran on it end to

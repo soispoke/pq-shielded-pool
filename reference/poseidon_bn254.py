@@ -11,7 +11,7 @@ the same circomlibjs package the circuit's poseidon.circom pairs with.
 `python3 poseidon_bn254.py` checks every vector in
 ../vectors/poseidon_bn254_vectors.json (computed by two independent
 circomlibjs implementations and asserted equal at export), including the
-pool's tagged owner_pk / cm / nf / out_cm chain and the depth-20
+pool's tagged owner_pk / cm / domain-separated nf / out_cm chain and the depth-20
 incremental-tree fixtures. This file is the wallet-side building block and
 the source the Solidity library is checked against.
 """
@@ -82,9 +82,12 @@ def _check():
     assert inner == c["inner"], "inner mismatch"
     cm = tagged(TAG_LEAF, inner, c["value"])
     assert cm == c["cm"], "cm mismatch"
-    nf = tagged(TAG_NULL, c["spend_key"], cm)
+    # v2 nullifiers are domain-separated (mirrors circuits/spend.circom):
+    # nf = Poseidon(TAG_NULL, Poseidon2(domain, spend_key), cm)
+    domain_key = p2(c["domain"], c["spend_key"])
+    nf = tagged(TAG_NULL, domain_key, cm)
     assert nf == c["nf"], "nf mismatch"
-    nf2 = tagged(TAG_NULL, c["spend_key"], tagged(TAG_LEAF, inner, 0))
+    nf2 = tagged(TAG_NULL, domain_key, tagged(TAG_LEAF, inner, 0))
     assert nf2 == c["nf2"], "dummy nf mismatch"
     out_cm1 = tagged(TAG_LEAF, c["out_inner1"], c["out_value1"])
     out_cm2 = tagged(TAG_LEAF, c["out_inner2"], c["out_value2"])

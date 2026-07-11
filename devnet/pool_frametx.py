@@ -205,8 +205,9 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
             frames = [Frame(mode=1, flags=0x03, target=sender, gas_limit=80_000, value=0, data=b"")]
         # The SENDER frame is not part of the capped prefix. It starts
         # generous (EIP-8037 state-dimension accounting inflates gas ~2-4x over
-        # Sepolia numbers) and is then sized down from the simulated per-frame
-        # gas below, when the endpoint exposes ethrex_simulateFrameTransaction.
+        # Sepolia numbers). Non-spends are sized down from the simulated
+        # per-frame gas below; spends keep the generous default, because an
+        # OOG settle frame after payment approval burns the notes.
         frames.append(Frame(mode=2, flags=0, target=pool, gas_limit=sender_gas,
                             value=value, data=calldata))
         tx = FrameTx(
@@ -241,6 +242,17 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
         return
     eff = sim  # the simulation the send is gated on (resized one if adopted)
     if sim is None:
+        # A spend that mines with a reverting SENDER frame still consumes its
+        # nullifiers as protocol keyed nonces at payment approval but never
+        # inserts the outputs: the notes are burned for good. The SENDER-revert
+        # guard below is the only pre-send defense, so refuse to fly blind on
+        # spends. A shield that reverts loses nothing (the deposit stays with
+        # the sender), so shields may proceed on default limits.
+        if protocol_nonces:
+            raise SystemExit(
+                "  simulate: ethrex_simulateFrameTransaction unavailable here; refusing to "
+                "send a nullifier-consuming spend without a pre-send simulation "
+                "(a mined tx whose SENDER frame reverts burns the spent notes)")
         print("  simulate: ethrex_simulateFrameTransaction unavailable here; default gas limits")
     elif sim.get("valid"):
         # gasUsed (top-level and per-frame) is a hex string on success, but the
@@ -250,8 +262,15 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
         total = hexint(sim.get("gasUsed"))
         print(f"  simulate: valid  shape={sim.get('prefixShape')}  payer={sim.get('payer')}  "
               f"gas={total}  ({per})")
+        # Down-size the SENDER frame from the simulated gas ONLY for
+        # non-spends. EIP-8037 state-dimension accounting varies 2-4x across
+        # blocks, so measured + 25% is not a safe margin when the failure is
+        # irreversible: a spend whose SENDER frame OOGs after payment approval
+        # burns the notes (nullifiers consumed, outputs never inserted). For
+        # spends the generous default stays; the payer's worst case is
+        # prepaying more gas, refunded on success.
         used = hexint((sim.get("frames") or [{}])[-1].get("gasUsed"))
-        if used is not None:
+        if used is not None and not protocol_nonces:
             sized = used + used // 4  # measured + 25% for state-gas variance at a later block
             tx2 = build(sender_gas=sized)
             raw2 = "0x" + tx2.raw().hex()
@@ -290,7 +309,12 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
             print(f"  MINED block={int(rcpt['blockNumber'],16)} type={rcpt.get('type')} "
                   f"status={rcpt.get('status')} gasUsed={int(rcpt.get('gasUsed','0x0'),16)}")
             if status != 1:
-                raise SystemExit(f'  tx reverted (status {rcpt.get("status")}); aborting')
+                msg = f'  tx reverted (status {rcpt.get("status")}); aborting'
+                if protocol_nonces:
+                    msg += ("\n  WARNING: the SENDER frame reverted after payment approval, so the"
+                            "\n  nullifiers were consumed as protocol keyed nonces and the spent"
+                            "\n  notes are burned; the output notes were never inserted.")
+                raise SystemExit(msg)
             return rcpt
         time.sleep(2)
     raise SystemExit("  not mined within timeout")

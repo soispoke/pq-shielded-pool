@@ -55,13 +55,14 @@ contract PoseidonVectorsTest {
     }
 
     /// The pool's value-note spend chain, end to end: owner_pk, inner, cm,
-    /// nf, the dummy nf, and both output commitments (the exact values the
-    /// circom circuit computes for the same secrets).
+    /// the domain-separated nf, the dummy nf, and both output commitments
+    /// (the exact values the circom circuit computes for the same secrets).
     function test_pool_chain() external view {
         string memory json = vm.readFile(PATH);
         uint256 spendKey = _u(json, ".pool_chain.spend_key");
         uint256 rho = _u(json, ".pool_chain.rho");
         uint256 value = _u(json, ".pool_chain.value");
+        uint256 domain = _u(json, ".pool_chain.domain");
 
         uint256 ownerPk = PoseidonBN254.hash3(1, spendKey, 0);
         require(ownerPk == _u(json, ".pool_chain.owner_pk"), "owner_pk mismatch");
@@ -69,9 +70,10 @@ contract PoseidonVectorsTest {
         require(inner == _u(json, ".pool_chain.inner"), "inner mismatch");
         uint256 cm = PoseidonBN254.hash3(2, inner, value);
         require(cm == _u(json, ".pool_chain.cm"), "cm mismatch");
-        uint256 nf = PoseidonBN254.hash3(3, spendKey, cm);
+        uint256 domainKey = PoseidonBN254.hash2(domain, spendKey);
+        uint256 nf = PoseidonBN254.hash3(3, domainKey, cm);
         require(nf == _u(json, ".pool_chain.nf"), "nf mismatch");
-        uint256 nf2 = PoseidonBN254.hash3(3, spendKey, PoseidonBN254.hash3(2, inner, 0));
+        uint256 nf2 = PoseidonBN254.hash3(3, domainKey, PoseidonBN254.hash3(2, inner, 0));
         require(nf2 == _u(json, ".pool_chain.nf2"), "dummy nf mismatch");
 
         uint256 outCm1 = PoseidonBN254.hash3(

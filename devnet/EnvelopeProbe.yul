@@ -2,7 +2,7 @@
 /// @notice Stateless frame-transaction envelope reader for the settle-only
 ///         pool. Solidity cannot emit the EIP-8141/8250/8272 introspection
 ///         opcodes (verbatim is Yul-object-only), so ShieldedPool._spend
-///         STATICCALLs this contract and binds the nine returned words:
+///         STATICCALLs this contract and binds the ten returned words:
 ///
 ///           [0] frame count            TXPARAM 0x09
 ///           [1] current frame index    TXPARAM 0x0A
@@ -18,7 +18,7 @@
 ///         Guarded reads: the load opcodes exceptional-halt out of range, so
 ///         keys/refs are read only when the counts cover them. Outside a
 ///         frame transaction TXPARAM itself halts, consuming the forwarded
-///         gas — callers cap it (the pool forwards 60k) and treat the failed
+///         gas — callers cap it (the pool forwards 100k) and treat the failed
 ///         call as "not frame-native". No storage, no calldata, no state.
 object "EnvelopeProbe" {
     code {
