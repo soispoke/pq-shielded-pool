@@ -85,6 +85,24 @@ class FrameTx:
         return bytes([0x06]) + self.encode()
     def sig_hash(self) -> bytes:
         return keccak(bytes([0x06]) + rlp_list(self._envelope(elide_sigs=True)))
+    @staticmethod
+    def _calldata_gas(encoded: bytes) -> int:
+        return sum(4 if b == 0 else 16 for b in encoded)
+    def total_gas_limit(self) -> int:
+        """Match ethrex FrameTransaction::total_gas_limit exactly."""
+        frames_rlp = rlp_list([f.rlp() for f in self.frames])
+        sigs_rlp = rlp_list([s.rlp() for s in self.signatures])
+        calldata_gas = self._calldata_gas(frames_rlp) + self._calldata_gas(sigs_rlp)
+        if self.recent_root_refs:
+            calldata_gas += self._calldata_gas(rlp_list(self.recent_root_refs))
+        signature_gas = sum(2800 if s.scheme == 0 else 6700 if s.scheme == 1 else 0
+                            for s in self.signatures)
+        recent_root_gas = 0 if not self.recent_root_refs else 2400 + len(self.recent_root_refs) * 2002
+        return (15_000 + len(self.frames) * 475 + calldata_gas + signature_gas
+                + sum(f.gas_limit for f in self.frames) + recent_root_gas)
+    def max_cost(self) -> int:
+        return (self.max_fee * self.total_gas_limit()
+                + len(self.blob_hashes) * 131_072 * self.max_blob_fee)
 
 # ---------- golden-vector validation ----------
 if __name__ == "__main__":
@@ -103,6 +121,7 @@ if __name__ == "__main__":
     )
     EXPECT_RLP = "f8ae01c1800794000000000000000000000000000000000000abcde8ca01038082520880821122dc0280940000000000000000000000000000000000001234829c408080f85cf85a8094000000000000000000000000000000000000abcd80b8410101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101843b9aca008506fc23ac0080c0c0"
     EXPECT_SIGHASH = "0x78ad972cb33b083d46ec78db62ffb45e0e53a9cb5eba1414bc1def77ed223fb3"
+    EXPECT_TOTAL_GAS = 81_478
     got_rlp = golden.encode().hex()
     got_sh = "0x" + golden.sig_hash().hex()
     print("RLP match:     ", got_rlp == EXPECT_RLP)
@@ -113,4 +132,10 @@ if __name__ == "__main__":
     if got_sh != EXPECT_SIGHASH:
         print("  expected:", EXPECT_SIGHASH)
         print("  got:     ", got_sh)
-    sys.exit(0 if got_rlp == EXPECT_RLP and got_sh == EXPECT_SIGHASH else 1)
+    got_gas = golden.total_gas_limit()
+    print("total gas match:", got_gas == EXPECT_TOTAL_GAS)
+    if got_gas != EXPECT_TOTAL_GAS:
+        print("  expected:", EXPECT_TOTAL_GAS)
+        print("  got:     ", got_gas)
+    sys.exit(0 if got_rlp == EXPECT_RLP and got_sh == EXPECT_SIGHASH
+             and got_gas == EXPECT_TOTAL_GAS else 1)

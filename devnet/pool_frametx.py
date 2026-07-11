@@ -6,17 +6,16 @@ Each pool interaction rides a type-0x06 frame transaction:
 
   shield:   frames = [ VERIFY(target=sender, self-verify sig -> APPROVE),
                        SENDER(target=pool, value=amount, data=shield(inner)) ]
-  transfer: frames = [ VERIFY(target=POOL_SENDER, self-verify, execution),
-                       VERIFY(target=paymaster, verifyProofOnly(Spend), payment),
+  transfer: frames = [ VERIFY(target=POOL_SENDER, proof authorization, execution),
+                       VERIFY(target=paymaster, bound Spend carrier, payment),
                        SENDER(target=pool, value=0, data=transfer(Spend, feeRecipient)) ]
   withdraw: same, data=withdraw(Spend, recipient, feeRecipient)
 
-The VERIFY frame is the reference self-verify pattern from
-scripts/hegota-devnet/frametx_submit.py: the sender's default EOA code checks
-the envelope's secp256k1 signature and grants execution+payment approval. The
-SENDER frame then executes the pool call as tx.sender, so for spends the frame
-sender MUST be the pool's pinned POOL_SENDER, which is exactly the on-chain
-pinned-sender binding the pool already enforces.
+For the production shape, frame 0 targets SharedPoolSender: it verifies the
+proof, exact nonce-key set, recent-root reference and settlement data before
+approving execution. The SENDER frame then executes the pool call as that
+shared tx.sender, giving every nullifier one EIP-8250 namespace without an
+operator-held key. The legacy EOA sender remains usable for test deployments.
 
 The Groth16 proof is verified INSIDE the pool call (BN254 pairing precompiles),
 so no attester is needed: the whole spend, proof check
@@ -28,9 +27,11 @@ refuses to settle unless the transaction consumed exactly the proven
 nullifiers as protocol keyed nonces and declared the proven root as its
 recent-root reference. The faithful shape is the
 EIP-8141 [only_verify, pay] grammar: an execution-scope self-verify frame
-followed by a payment-scope pay frame targeting the proof-gated paymaster
-(paymaster.py), which staticcalls pool.verifyProofOnly and APPROVEs payment only
-if the proof is valid AND the envelope binds to POOL_SENDER (TXPARAM 0x02),
+followed by a payment-scope pay frame targeting the bounded paymaster
+(paymaster.py). The paymaster authenticates the successful proof-authorized
+frame 0, binds its Spend carrier byte-for-byte to settlement, requires the
+proof-bound fee to cover TXPARAM(0x06), and APPROVEs payment only if the
+envelope binds to POOL_SENDER (TXPARAM 0x02),
 nonce_seq == 0, exactly three frames, nonce_keys == sorted{nf1, nf2}
 (NONCEKEYLOAD), and one declared EIP-8272 recent-root reference carrying the
 pool's source_id and the spend's proven root (RECENTROOTREFLOAD 0xB5). The
@@ -40,12 +41,11 @@ root]]`, with slot the consensus slot of the block that published the root
 knob does); the protocol validates the reference at admission and at block
 execution, which makes root recency protocol-enforced. The pool re-binds the
 same envelope facts in the SENDER frame via EnvelopeProbe.yul. The
-sender bind is what stops a costless dummy-input proof from draining the funded
-paymaster (see REVIEW.md 2026-07-10); the proof is checked before any approval.
-verifySpend
-~243k fits MAX_VERIFY_GAS once raised (500k on the devnet as of 2026-07-08).
-verifyProofOnly reads no RecentRoots storage and the paymaster is SLOAD-free,
-so the pay frame does not trip the observer's StorageReadNonSender ban, and
+sender bind is what lets the paymaster rely on frame 0 rather than perform a
+third Groth16 check. SharedPoolSender's verifyProofOnly call reads no storage,
+and the paymaster is SLOAD-free, so neither frame trips the observer's
+StorageReadNonSender ban. The sender's ~250k proof check plus the paymaster's
+bounded envelope work fit MAX_VERIFY_GAS=500k, and
 since 2026-07-08 non-zero nonce_keys are public-mempool admissible, so the
 faithful spend submits through the public RPC. The paymaster must be funded:
 it is the payer.
@@ -59,6 +59,11 @@ Usage (append --dry-run to any to simulate without submitting):
 signer. It is intended for a deployed SharedPoolSender: the contract's VERIFY
 frame grants execution authority, while any submitter supplies the one outer
 signature the current proof-paymaster grammar requires.
+
+`--max-fee-per-gas` and `--max-priority-fee-per-gas` help construct repeatable
+fee-boundary tests. The builder prints the exact TXPARAM(0x06) value, including
+frame limits, intrinsic and envelope calldata gas, signature verification, and
+recent-root-reference gas, using ethrex's current formula.
 """
 import json
 import subprocess
@@ -174,7 +179,8 @@ def recent_root_ref(url, cfg, e):
 
 
 def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_verify=None,
-                   recent_root_refs=None, dry_run=False, sender_override=None):
+                   recent_root_refs=None, dry_run=False, sender_override=None,
+                   max_fee_override=None, max_priority_override=None):
     signer = int.from_bytes(pk.public_key.to_canonical_address(), "big")
     sender = sender_override if sender_override is not None else signer
     chain_id = int(rpc(url, "eth_chainId", []), 16)
@@ -183,8 +189,10 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
     nonce = int(rpc(url, "eth_getTransactionCount", [nonce_address, "latest"]), 16)
     blk = rpc(url, "eth_getBlockByNumber", ["latest", False])
     base_fee = int(blk.get("baseFeePerGas", "0x0"), 16)
-    max_priority = 10**9
-    max_fee = base_fee * 2 + max_priority
+    max_priority = max_priority_override if max_priority_override is not None else 10**9
+    max_fee = max_fee_override if max_fee_override is not None else base_fee * 2 + max_priority
+    if max_fee < base_fee or max_priority > max_fee:
+        raise SystemExit("fee overrides require max_fee >= base_fee and max_priority <= max_fee")
     nonce_keys = protocol_nonces if protocol_nonces else [0]
     nonce_seq = 0 if protocol_nonces else nonce
 
@@ -193,17 +201,14 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
             # The FAITHFUL shape, EIP-8141 [only_verify, pay] grammar (validated
             # live via OpenSponsor on 2026-07-05). Frame 0 self-verifies for the
             # EXECUTION scope only (0x02, target sender). Frame 1 is the pay
-            # frame (0x01, PAYMENT scope) targeting the proof-gated paymaster,
-            # which staticcalls pool.verifyProofOnly and APPROVEs payment only on
-            # a valid proof; the paymaster must be funded (it is the payer).
-            # verifyProofOnly reads no RecentRoots storage and the paymaster is
-            # SLOAD-free, so the pay frame no longer trips the observer's
-            # StorageReadNonSender ban (see REVIEW.md); it still submits
-            # builder-direct, which it must anyway for nonce_keys=[nf1,nf2].
+            # frame (0x01, PAYMENT scope) targeting the bounded paymaster. Frame
+            # 0 verifies the proof; frame 1 authenticates that sender, binds the
+            # same Spend bytes, and checks fee >= TXPARAM(max_cost) before
+            # approving payment. The paymaster must be funded (it is the payer).
             paymaster, vcalldata = proof_verify
             frames = [
-                Frame(mode=1, flags=0x02, target=sender, gas_limit=20_000, value=0, data=b""),
-                Frame(mode=1, flags=0x01, target=paymaster, gas_limit=300_000, value=0, data=vcalldata),
+                Frame(mode=1, flags=0x02, target=sender, gas_limit=300_000, value=0, data=b""),
+                Frame(mode=1, flags=0x01, target=paymaster, gas_limit=100_000, value=0, data=vcalldata),
             ]
         else:
             # Today's shape: one self-verify frame approves execution AND payment
@@ -307,7 +312,7 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
                          "(if root-not-recent, retry one block later)")
 
     print(f"  frame tx: sender=0x{sender:040x} signer={signer_address} nonce_keys={nonce_keys} "
-          f"raw_len={len(tx.raw())} sig_hash={tx.sig_hash().hex()[:18]}...")
+          f"raw_len={len(tx.raw())} max_cost={tx.max_cost()} sig_hash={tx.sig_hash().hex()[:18]}...")
     txhash = rpc(url, "eth_sendRawTransaction", [raw])
     print("  submitted:", txhash)
     for _ in range(30):
@@ -346,6 +351,24 @@ def main():
             raise SystemExit(f"invalid sender address: {sys.argv[i + 1]}") from None
         if sender_override == 0 or sender_override >= 1 << 160:
             raise SystemExit(f"invalid sender address: {sys.argv[i + 1]}")
+    max_fee_override = None
+    max_priority_override = None
+    for flag, target in (("--max-fee-per-gas", "max_fee"),
+                         ("--max-priority-fee-per-gas", "max_priority")):
+        if flag in sys.argv:
+            i = sys.argv.index(flag)
+            if i + 1 >= len(sys.argv):
+                raise SystemExit(f"{flag} requires a wei value")
+            try:
+                value = int(sys.argv[i + 1], 0)
+            except ValueError:
+                raise SystemExit(f"invalid {flag} value: {sys.argv[i + 1]}") from None
+            if value < 0:
+                raise SystemExit(f"{flag} must be non-negative")
+            if target == "max_fee":
+                max_fee_override = value
+            else:
+                max_priority_override = value
     paymaster = cfg.get("paymaster")
     if "--paymaster" in sys.argv:
         i = sys.argv.index("--paymaster")
@@ -392,14 +415,16 @@ def main():
         calldata = cast_calldata(f"transfer({SPEND_TUPLE},address)", spend_args(e), paymaster)
         print(f"join-split transfer via faithful frame tx (payer {paymaster}, proof verified on-chain)")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
-                       dry_run=dry, sender_override=sender_override)
+                       dry_run=dry, sender_override=sender_override,
+                       max_fee_override=max_fee_override, max_priority_override=max_priority_override)
     elif op == "withdraw":
         e, protocol_nonces, verify, refs = spend_setup("withdraw")
         calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address,address)", spend_args(e),
                                  fix["recipient"], paymaster)
         print(f"join-split withdraw via faithful frame tx (payer {paymaster})")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
-                       dry_run=dry, sender_override=sender_override)
+                       dry_run=dry, sender_override=sender_override,
+                       max_fee_override=max_fee_override, max_priority_override=max_priority_override)
     else:
         raise SystemExit(f"unknown op {op}")
 

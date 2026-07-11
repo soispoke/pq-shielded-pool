@@ -6,9 +6,11 @@ arbitrary value; a spend is a 2-in/2-out join-split proven by a Groth16 SNARK
 (circom + snarkjs) and verified onchain through the BN254 pairing precompiles,
 so no offchain attester is involved.
 
-It runs as an EIP-8141 frame-native application. The paymaster verifies the
-proof before payment approval, when EIP-8250 consumes the two nullifiers; the
-pool verifies it again before settlement. The full shield → transfer → withdraw
+It runs as an EIP-8141 frame-native application. A proof-authorized shared
+sender verifies the spend before execution approval; the paymaster authenticates
+that sender and requires the proof-bound fee to cover its maximum transaction
+liability before payment approval consumes the two EIP-8250 nullifiers. The
+pool verifies the proof again before settlement. The full shield → transfer → withdraw
 flow has run end to end on lambdaclass/ethrex's Hegotá devnet; addresses,
 transaction hashes, and gas are in
 [devnet/REVIEW.md](devnet/REVIEW.md).
@@ -60,7 +62,7 @@ tooling/               npm deps, circuit compile and trusted-setup script
 wallet/                witness builder, proof generation, and end-to-end scripts
 devnet/
   ProofPaymaster.yul   proof, key-set, root-reference, and frame binding
-  SharedPoolSender.yul test-only contract-sender capability probe
+  SharedPoolSender.yul proof-authorized shared nullifier namespace
   EnvelopeProbe.yul    stateless envelope reader used by settlement
   pool_frametx.py      assembles, simulates, and submits the frame transactions
   REVIEW.md            live-run evidence and protocol caveats
@@ -122,4 +124,8 @@ two-dimensional gas accounting raises these figures; see
   disposable testbed must be retired before capacity.
 - **Frame-native only.** Spends require the Hegotá EIP-8141/8250/8272 opcode
   surface and deliberately revert when called as ordinary EVM transactions.
+- **Production sender pending adversarial live validation.** The proof-authorized
+  sender and max-cost paymaster compile, but the final gas-bound pair is not
+  deployed and the malicious-payer and fee-boundary suite has not run. Do not
+  use the earlier candidate addresses for real notes.
 - **Unaudited research code.**

@@ -1,5 +1,5 @@
 /// @title ProofPaymaster
-/// @notice The proof-gated, sender- and spent-set-bound APPROVE paymaster for
+/// @notice The proof-authorized-sender and max-cost-bound APPROVE paymaster for
 ///         the EIP-8141 [only_verify, pay] faithful spend shape on the Hegotá
 ///         devnet. It is the pay VERIFY frame's target (flags 0x01,
 ///         APPROVE_PAYMENT), and it becomes the transaction's payer, so nothing
@@ -15,11 +15,10 @@
 ///      does no ECDSA recovery on it; it is a caller-chosen envelope field), so
 ///      this equality alone would not stop a forged sender. What authenticates
 ///      it is frame 0: the mandatory VERIFY(POOL_SENDER, execution-scope) frame
-///      (checked in binding 2) is a real signature check, and a failing VERIFY
-///      frame marks the WHOLE transaction invalid with a full rollback of the
-///      APPROVE debit. So the drain is closed by binding 0 AND the frame-0
-///      VERIFY together; the frame-0 checks are load-bearing and must not be
-///      weakened on the assumption that the TXPARAM(0x02) equality suffices.
+///      (checked in binding 2) runs the shared sender's proof authorization,
+///      and a failing VERIFY frame marks the WHOLE transaction invalid with a
+///      full rollback of the APPROVE debit. So the drain is closed by binding
+///      0 AND the frame-0 VERIFY together; the frame-0 checks are load-bearing.
 ///      See devnet/REVIEW.md "Paymaster drain".
 ///   1. SPENT-SET BINDING (the in-EVM form of ShieldedPool.checkKeySet). Requires
 ///      len(nonce_keys) == 2 (TXPARAM 0x0D), nonce_seq == 0 (TXPARAM 0x01, the
@@ -40,22 +39,24 @@
 ///      left free: recency is the protocol's window check, not a fixed slot.
 ///   2. ENVELOPE BINDING. Requires one signature, no blobs, and exactly three
 ///      frames. It checks the full [self-verify, pay, sender] grammar, including
-///      each frame's target, mode, flags, value, and data length. The SENDER
+///      each frame's target, mode, flags, gas limit, value, and data length. The SENDER
 ///      frame must target this pool and call transfer(Spend,address) or
 ///      withdraw(Spend,address,address), with the 544-byte Spend tuple
 ///      byte-for-byte equal to the tuple proven in this pay frame. The final
 ///      feeRecipient argument MUST equal this paymaster, so shielded fee value
 ///      is credited to the actual payer. No unrelated or appended execution
 ///      can be charged to it.
-///   3. PROOF / CANONICITY. STATICCALLs pool.verifyProofOnly with its own
-///      calldata (which is verifyProofOnly(Spend)); it reverts on a bad proof, a
-///      non-canonical field element, or an out-of-range amount. It does NOT read
-///      the RecentRoots contract, so this frame reads no non-sender storage and
-///      clears the ERC-7562 observer's non-sender-SLOAD ban. Root RECENCY is
-///      protocol-enforced through the declared reference (binding 1b); the
-///      settle-only pool re-checks the same envelope bindings in the SENDER
-///      frame through EnvelopeProbe.yul (no pool-side root store remains).
-///   4. APPROVE(scope = 1 = APPROVE_PAYMENT). Scope 0x1 does not require
+///   3. SENDER AUTHENTICATION. Frame 0 targets the immutable POOL_SENDER in
+///      VERIFY / execution-only mode. The transaction is valid only if that
+///      proof-authorized contract checked the exact proof, key set, root, and
+///      settlement calldata and called APPROVE_EXECUTION. The paymaster does
+///      not repeat its Groth16 check, keeping the validation prefix below the
+///      devnet's 500k budget; the pool still verifies again during settlement.
+///   4. ECONOMIC BINDING. The proof-bound fee MUST cover TXPARAM(0x06), the
+///      exact maximum cost APPROVE_PAYMENT debits and later refunds down to
+///      actual cost. This prevents an open submitter choosing gas parameters
+///      whose maximum liability exceeds the paymaster's compensation.
+///   5. APPROVE(scope = 1 = APPROVE_PAYMENT). Scope 0x1 does not require
 ///      frame_target == sender, so it composes with the execution-scope
 ///      self-verify frame ahead of it.
 ///
@@ -68,8 +69,7 @@
 ///      appended to the initcode; the constructor appends them to the DEPLOYED
 ///      code instead of storage, and the runtime reads them back with CODECOPY
 ///      from its own last 64 bytes (pool at codesize-64, poolSender at
-///      codesize-32). Combined with verifyProofOnly (no RecentRoots read), the
-///      pay frame touches no storage outside its own code, so it does not trip
+///      codesize-32). The pay frame touches no storage, so it does not trip
 ///      StorageReadNonSender.
 ///
 ///      APPROVE operand order matches OpenSponsor's compiled `60 01 5f 5f aa`.
@@ -115,13 +115,10 @@ object "ProofPaymaster" {
 
             // receive() — accept funding; the pay-frame target is the payer.
             if iszero(calldatasize()) { stop() }
-            // Bind the pay-frame calldata to exactly verifyProofOnly(Spend):
-            // selector 0x8cc8fe8d, and the full static 548-byte encoding. Without
-            // this the STATICCALL below would succeed for ANY non-reverting pool
-            // selector (e.g. currentRoot()), and APPROVE would fire with no proof
-            // -- sponsoring an unproven transaction and draining the paymaster.
-            // (Selector is fixed by the Spend tuple shape; regenerate with
-            // paymaster.py if either changes.)
+            // Bind the pay-frame data carrier to exactly the canonical
+            // verifyProofOnly(Spend) encoding: selector 0x8cc8fe8d and the full
+            // static 548 bytes. Frame 2's Spend tuple is byte-equal below, and
+            // the proof-authorized sender verified that exact tuple in frame 0.
             if iszero(eq(calldatasize(), 548)) { revert(0, 0) }
             if iszero(eq(shr(224, calldataload(0)), 0x8cc8fe8d)) { revert(0, 0) }
 
@@ -138,10 +135,10 @@ object "ProofPaymaster" {
 
             let nf1 := calldataload(68)
             let nf2 := calldataload(100)
-            // A positive proof-bound fee implies at least one non-zero input;
-            // conservation therefore makes a dummy-only sponsorship proof
-            // impossible. The fee is credited back to this payer below.
-            if iszero(calldataload(228)) { revert(0, 0) }
+            // The fee is proof-bound (and frame 2 is byte-equal below). It must
+            // cover the same maximum cost APPROVE_PAYMENT will debit.
+            let fee := calldataload(228)
+            if lt(fee, txParam(0x06)) { revert(0, 0) }
             let lo := nf1
             let hi := nf2
             if gt(lo, hi) { lo := nf2  hi := nf1 }
@@ -172,11 +169,12 @@ object "ProofPaymaster" {
             if iszero(eq(txParam(0x0B), 1)) { revert(0, 0) }
             if txParam(0x07) { revert(0, 0) }
 
-            // frame 0: EOA self-verification for execution only.
+            // frame 0: proof-authorized shared sender, execution only.
             if iszero(eq(frameParam(0, 0x00), poolSender)) { revert(0, 0) }
             if iszero(eq(frameParam(0, 0x02), 1)) { revert(0, 0) } // VERIFY
             if iszero(eq(frameParam(0, 0x03), 2)) { revert(0, 0) } // execution
             if frameParam(0, 0x04) { revert(0, 0) } // empty data
+            if iszero(eq(frameParam(0, 0x01), 300000)) { revert(0, 0) }
             if frameParam(0, 0x08) { revert(0, 0) } // zero value
 
             // frame 1: this paymaster, payment approval only, with this calldata.
@@ -184,6 +182,7 @@ object "ProofPaymaster" {
             if iszero(eq(frameParam(1, 0x02), 1)) { revert(0, 0) } // VERIFY
             if iszero(eq(frameParam(1, 0x03), 1)) { revert(0, 0) } // payment
             if iszero(eq(frameParam(1, 0x04), 548)) { revert(0, 0) }
+            if iszero(eq(frameParam(1, 0x01), 100000)) { revert(0, 0) }
             if frameParam(1, 0x08) { revert(0, 0) }
 
             // frame 2: the only paid execution. It must call this pool with the
@@ -191,6 +190,7 @@ object "ProofPaymaster" {
             if iszero(eq(frameParam(2, 0x00), pool)) { revert(0, 0) }
             if iszero(eq(frameParam(2, 0x02), 2)) { revert(0, 0) } // SENDER
             if frameParam(2, 0x03) { revert(0, 0) }
+            if iszero(eq(frameParam(2, 0x01), 10000000)) { revert(0, 0) }
             if frameParam(2, 0x08) { revert(0, 0) }
             let senderDataLen := frameParam(2, 0x04)
             let senderSelector := shr(224, frameDataLoad(2, 0))
@@ -208,15 +208,8 @@ object "ProofPaymaster" {
                 if iszero(eq(frameDataLoad(2, offset), calldataload(offset))) { revert(0, 0) }
             }
 
-            // 3. proof / canonicity, via the pool (no RecentRoots read).
-            //    Forward the pay-frame calldata verbatim.
-            calldatacopy(0, 0, calldatasize())
-            // forward a large gas literal, not GAS(0x5a): the observer bans the
-            // GAS opcode in validation frames. The EVM caps the request at 63/64
-            // of remaining gas, so this forwards essentially all of it.
-            if iszero(staticcall(0xffffffffffffffff, pool, 0, calldatasize(), 0, 0)) { revert(0, 0) }
-
-            // 4. all bindings hold — approve payment
+            // 3-4. Frame 0 is the proof-authorized sender; fee covers max cost.
+            // 5. All bindings hold — approve payment.
             verbatim_3i_0o(hex"AA", 0, 0, 1)
         }
     }

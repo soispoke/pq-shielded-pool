@@ -16,7 +16,12 @@ Each honest proof is verified off-chain against the committed verification
 key before it lands in the fixture. Groth16 proving is randomised, so the
 fixture pairs with the committed Groth16Verifier.sol from the same setup.
 
-Run from the wallet/ directory:  python3 gen_smoke.py [--random]
+Run from the wallet/ directory:
+  python3 gen_smoke.py [--random] [--chain-id=N] [--source-id=0x...]
+                       [--fee-wei=N]
+
+`--fee-wei` adjusts change and withdrawal value to preserve conservation. It
+exists for paymaster boundary tests immediately below and at TXPARAM(max_cost).
 """
 import json
 import subprocess
@@ -105,18 +110,24 @@ def main():
         w.set_seed(20260702)
     chain_id = TEST_CHAIN_ID
     source_id = TEST_SOURCE_ID
+    fee_wei = ETH * 5 // 100
     for arg in sys.argv[1:]:
         if arg.startswith("--chain-id="):
             chain_id = int(arg.split("=", 1)[1], 0)
         elif arg.startswith("--source-id="):
             source_id = arg.split("=", 1)[1]
+        elif arg.startswith("--fee-wei="):
+            fee_wei = int(arg.split("=", 1)[1], 0)
     domain = w.domain_scalar(chain_id, source_id)
 
     # notes: Alice's deposit, Bob's payment target, Alice's change target
     sk_a, rho_a = w.new_note()
     sk_b, rho_b = w.new_note()
     sk_a2, rho_a2 = w.new_note()
-    v_shield, v_bob, v_change, v_fee = ETH, ETH * 60 // 100, ETH * 35 // 100, ETH * 5 // 100
+    v_shield, v_bob, v_fee = ETH, ETH * 60 // 100, fee_wei
+    if not 0 < v_fee < v_bob:
+        raise SystemExit("--fee-wei must be positive and below the 0.6 ETH payment note")
+    v_change = v_shield - v_bob - v_fee
     inner_a = w.inner(sk_a, rho_a)
     cm_a = w.commitment(sk_a, rho_a, v_shield)
 

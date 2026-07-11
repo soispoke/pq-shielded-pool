@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Compile the test-only SharedPoolSender.yul capability probe.
-
-This stage binds frame grammar but not proof validity. Do not use it with real
-notes; its production successor must validate proof, keys and root before
-APPROVE_EXECUTION.
+"""Compile and parameterize the proof-authorized SharedPoolSender.yul.
 
 Usage:
   shared_sender.py --initcode 0x<pool>  deploy initcode

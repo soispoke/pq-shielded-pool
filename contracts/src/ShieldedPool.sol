@@ -320,7 +320,7 @@ contract ShieldedPool {
         }
     }
 
-    /// Fee-routing migration seam. Today the proof-gated paymaster binds the
+    /// Fee-routing migration seam. Today the bounded paymaster binds the
     /// calldata recipient to itself. Once frame transactions expose their
     /// consensus-resolved payer as an authenticated TXPARAM, this function can
     /// read that value and the external feeRecipient argument can be retired.

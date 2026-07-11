@@ -1343,3 +1343,44 @@ root itself before `APPROVE_EXECUTION`. The remaining ethrex ask is the
 authenticated resolved-payer TXPARAM; the other pool-side hardening is the
 proof-bound fee-versus-gas rule and, later, deciding whether to consolidate the
 duplicate proof checks.
+
+## Production shared sender and bounded paymaster implemented (2026-07-11)
+
+The capability probe has a production successor in source. Frame 0 now copies
+the complete static Spend tuple from frame 2 and calls the pool's storage-free
+`verifyProofOnly` before approval. It also requires
+`nonce_keys == sorted{nf1,nf2}` at sequence zero, binds the one recent-root
+reference to the pool source and proven root, checks transfer/withdraw shape,
+rejects zero or non-canonical settlement recipients, and pins the 300k sender,
+100k paymaster, and 10M settlement gas limits. The last check closes a separate
+open-submitter burn: copying a valid spend with too little frame-2 gas must fail
+before approval rather than consume its nullifiers and OOG in settlement. Only
+then does the sender call `APPROVE_EXECUTION`.
+
+This makes the paymaster's Groth16 check redundant and, under the devnet's 500k
+validation-prefix limit, impossible to retain alongside the sender check. The
+paymaster therefore authenticates frame 0 as the immutable shared sender,
+keeps its byte-exact frame-2 and self-recipient bindings, and replaces its proof
+call with `fee >= TXPARAM(0x06)`. Selector 0x06 is ethrex's single maximum-cost
+definition: the value `APPROVE_PAYMENT` debits and later refunds down to actual
+cost. Sender and paymaster frame limits are 300k and 100k, leaving the pool's
+settlement verification as the second independent proof check.
+
+`feeRecipient` remains the one settlement field outside the proof. This is an
+explicit open-payer auction for the interim ABI: another paymaster may copy a
+pending valid Spend, replace only that recipient with itself, sign a new
+envelope, and race it. The user's inputs, outputs, amount and fee are unchanged;
+the winner funds the transaction and receives the fixed fee, while the loser
+fails keyed-nonce validation rather than mining a revert. An authenticated
+resolved-payer TXPARAM removes this calldata choice in the next migration.
+
+The pre-gas-binding sender candidate deployed at `0x68B1D87F…`
+(`0x66ad8cc0…`) with the precomputed pool `0x3Aa5ebB1…`, which then deployed
+at `0x8e00fc4f…`. The workspace external-spend cap stopped the run before
+source-id retrieval, proof generation, paymaster deployment and adversarial
+simulation. The subsequent gas-limit bind changed the sender runtime, so the
+current source supersedes that deployed candidate. Those contracts hold no test
+notes and are not validation evidence. Required completion with a fresh pair:
+an honest arbitrary-signer spend, bad proof and wrong-key cases through a
+malicious self-funded payer with `payer=None`, replay rejection, and fee values
+immediately below and at `TXPARAM(0x06)`.

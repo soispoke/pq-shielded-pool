@@ -1,18 +1,13 @@
 /// @title SharedPoolSender
-/// @notice TEST-ONLY contract-sender capability probe for the shielded pool.
-///         Every spend uses this contract as tx.sender, so EIP-8250 nullifier
-///         keys share one sender namespace without an operator-held key.
+/// @notice Proof-authorized execution identity for the shielded pool. Every
+///         spend uses this contract as tx.sender, so EIP-8250 nullifier keys
+///         share one sender namespace without an operator-held key.
 ///
-///         DO NOT use this stage with real notes. It authenticates the frame
-///         grammar but deliberately delegates proof/key/root validity to the
-///         paymaster and pool. A malicious self-funded payment approver could
-///         therefore consume a revealed victim nullifier and let settlement
-///         revert. The production successor MUST verify the exact proof,
-///         nonce-key set and recent-root reference before APPROVE_EXECUTION.
-///
-///         This capability stage authenticates the exact transaction
-///         grammar and delegates spend validity to the proof paymaster and the
-///         pool, both of which independently verify the proof and envelope.
+///         This contract authenticates the exact transaction grammar, proof,
+///         nonce-key set, and recent-root reference before approving execution.
+///         The pool verifies the proof again during settlement as the
+///         independent noteholder-safety boundary. The paymaster authenticates
+///         this frame and therefore does not perform a third proof check.
 ///         It approves execution only when all of the following hold:
 ///
 ///           - this is frame 0 of exactly three frames;
@@ -20,13 +15,13 @@
 ///           - frame 0 is VERIFY / execution-only, empty and zero-value;
 ///           - frame 1 is VERIFY / payment-only and zero-value;
 ///           - frame 2 is SENDER, directly targets the configured pool,
-///             carries zero value, and calls the exact transfer/withdraw ABI;
+///             carries zero value, has the fixed safe settlement gas limit,
+///             and calls the exact transfer/withdraw ABI;
 ///           - two keyed nonces at seq 0, one recent-root reference, one outer
 ///             signature, and no blobs are present.
 ///
 ///         The configured pool is appended to deployed code, never storage,
-///         so validation remains SLOAD-free. The safe next stage must bind the
-///         full spend tuple here before this can replace the pinned operator.
+///         and pool.verifyProofOnly is calldata-only, so validation is SLOAD-free.
 object "SharedPoolSender" {
     code {
         // initcode tail = pool(32); append it to the deployed runtime.
@@ -49,6 +44,9 @@ object "SharedPoolSender" {
             function frameDataLoad(frameIndex, offset) -> value {
                 value := verbatim_2i_1o(hex"B1", offset, frameIndex)
             }
+            function recentRootRef(field, index) -> value {
+                value := verbatim_2i_1o(hex"B5", field, index)
+            }
 
             codecopy(0, sub(codesize(), 32), 32)
             let pool := and(mload(0), 0xffffffffffffffffffffffffffffffffffffffff)
@@ -69,29 +67,73 @@ object "SharedPoolSender" {
             if iszero(eq(frameParam(0, 0x02), 1)) { revert(0, 0) }
             if iszero(eq(frameParam(0, 0x03), 2)) { revert(0, 0) }
             if frameParam(0, 0x04) { revert(0, 0) }
+            if iszero(eq(frameParam(0, 0x01), 300000)) { revert(0, 0) }
             if frameParam(0, 0x08) { revert(0, 0) }
 
-            // Frame 1: a payment-only VERIFY frame. The selected paymaster is
-            // responsible for its own proof, key, root and calldata checks.
+            // Frame 1: a payment-only VERIFY frame. The selected paymaster
+            // authenticates this sender, binds settlement and caps liability.
             if iszero(eq(frameParam(1, 0x02), 1)) { revert(0, 0) }
             if iszero(eq(frameParam(1, 0x03), 1)) { revert(0, 0) }
+            if iszero(eq(frameParam(1, 0x01), 100000)) { revert(0, 0) }
             if frameParam(1, 0x08) { revert(0, 0) }
 
             // Frame 2: the only execution, directly into the configured pool.
             if iszero(eq(frameParam(2, 0x00), pool)) { revert(0, 0) }
             if iszero(eq(frameParam(2, 0x02), 2)) { revert(0, 0) }
             if frameParam(2, 0x03) { revert(0, 0) }
+            // Exact, deliberately generous settlement gas prevents a copied
+            // valid spend being re-wrapped to OOG after nullifier consumption.
+            if iszero(eq(frameParam(2, 0x01), 10000000)) { revert(0, 0) }
             if frameParam(2, 0x08) { revert(0, 0) }
             let dataLen := frameParam(2, 0x04)
             let selector := shr(224, frameDataLoad(2, 0))
             switch dataLen
             case 580 {
                 if iszero(eq(selector, 0x751a8fc5)) { revert(0, 0) }
+                // transfer: publicAmount == 0, ctx == 0, canonical nonzero
+                // fee recipient (the selected paymaster in today's ABI).
+                if frameDataLoad(2, 196) { revert(0, 0) }
+                if frameDataLoad(2, 260) { revert(0, 0) }
+                let feeRecipient := frameDataLoad(2, 548)
+                if or(iszero(feeRecipient), shr(160, feeRecipient)) { revert(0, 0) }
             }
             case 612 {
                 if iszero(eq(selector, 0x215ae4c7)) { revert(0, 0) }
+                // withdraw: positive public amount and ctx names the canonical
+                // recipient exactly, so settlement cannot fail after approval.
+                if iszero(frameDataLoad(2, 196)) { revert(0, 0) }
+                let recipient := frameDataLoad(2, 548)
+                if or(iszero(recipient), shr(160, recipient)) { revert(0, 0) }
+                if iszero(eq(frameDataLoad(2, 260), recipient)) { revert(0, 0) }
+                let feeRecipient := frameDataLoad(2, 580)
+                if or(iszero(feeRecipient), shr(160, feeRecipient)) { revert(0, 0) }
             }
             default { revert(0, 0) }
+
+            // The protocol nonce set is exactly the proof's two nullifiers.
+            let nf1 := frameDataLoad(2, 68)
+            let nf2 := frameDataLoad(2, 100)
+            let lo := nf1
+            let hi := nf2
+            if gt(lo, hi) { lo := nf2  hi := nf1 }
+            if iszero(eq(verbatim_1i_1o(hex"B9", 0), lo)) { revert(0, 0) }
+            if iszero(eq(verbatim_1i_1o(hex"B9", 1), hi)) { revert(0, 0) }
+
+            // The declared protocol-validated reference names this pool's
+            // source and the exact root carried by the proof.
+            mstore(0, pool)
+            mstore(32, 0)
+            if iszero(eq(recentRootRef(0, 0), keccak256(0, 64))) { revert(0, 0) }
+            if iszero(eq(recentRootRef(2, 0), frameDataLoad(2, 4))) { revert(0, 0) }
+
+            // Build verifyProofOnly(Spend) from frame 2 in memory. Spend is a
+            // static 544-byte tuple at offsets [4, 548); its selector is fixed.
+            mstore(0, shl(224, 0x8cc8fe8d))
+            for { let offset := 4 } lt(offset, 548) { offset := add(offset, 32) } {
+                mstore(offset, frameDataLoad(2, offset))
+            }
+            // Fixed literal, not GAS: validation observers ban the GAS opcode.
+            if iszero(staticcall(500000, pool, 0, 548, 0, 0)) { revert(0, 0) }
 
             // APPROVE_EXECUTION. Scope 0x2 also requires frame target ==
             // tx.sender at the protocol handler, repeating the identity bind.

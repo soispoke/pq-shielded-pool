@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Deploy bytecode for ProofPaymaster, the proof-gated, sender- and
-spent-set-bound APPROVE paymaster for the faithful spend shape. Source:
+"""Deploy bytecode for ProofPaymaster, the proof-authorized-sender and
+max-cost-bound APPROVE paymaster for the faithful spend shape. Source:
 ProofPaymaster.yul (this dir).
 
 The pay VERIFY frame (flags 0x01, APPROVE_PAYMENT) targets this contract with
@@ -26,10 +26,13 @@ The pay VERIFY frame (flags 0x01, APPROVE_PAYMENT) targets this contract with
      tuple proven in the pay frame, and the fee recipient must equal this
      paymaster, so the payer cannot be charged for unrelated execution and is
      credited the proof-bound prepayment.
-  3. proof / canonicity: STATICCALLs pool.verifyProofOnly (calldata-only, no
-     storage), so the frame reads no non-sender storage. Root recency is
-     enforced by the protocol through the declared reference (1b); the
-     settle-only pool re-binds the same envelope facts via EnvelopeProbe.
+  3. sender authentication: frame 0 targets the immutable POOL_SENDER in
+     VERIFY / execution-only mode. That contract verifies the exact proof,
+     nonce keys, root reference and settlement data before APPROVE_EXECUTION.
+     The paymaster does not repeat the Groth16 check; the pool still verifies
+     independently during settlement.
+  4. economic binding: the proof-bound fee covers TXPARAM(0x06), the same
+     maximum transaction cost APPROVE_PAYMENT debits from this payer.
 
 SLOAD-free: two 32-byte constructor args, pool || poolSender, are appended to the
 initcode; the constructor appends them to the DEPLOYED code (not storage) and the
