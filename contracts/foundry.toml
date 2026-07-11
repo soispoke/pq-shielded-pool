@@ -29,3 +29,7 @@ solc_version = "0.8.30"
 optimizer = true
 optimizer_runs = 1
 via_ir = false
+# the step-2 test suite no longer compiles under legacy codegen (stack too
+# deep in the mock-probe tests); only the two libraries are deployed from
+# this profile, so skip tests entirely
+skip = ["test/**"]

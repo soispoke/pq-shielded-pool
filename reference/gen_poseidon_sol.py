@@ -33,21 +33,36 @@ def hexlines(b, per=3):
     return "\n".join(f'        hex"{b[i:i + step].hex()}"' for i in range(0, len(b), step))
 
 
-def mix(t, M):
-    """Yul for new_state = M * state with inlined matrix literals."""
+def mix(t, M, indent):
+    """Yul for new_state = M * state with inlined matrix literals.
+
+    Lazy reduction: each term mulmod-reduces its (possibly unreduced) input,
+    so the row sum of t terms < t*P fits a word without addmod ((t+1)*P must
+    stay < 2^256, which holds for t = 3 and t = 4 over BN254; a t = 5 blob
+    would overflow and need the addmod form back).
+    """
+    pad = " " * indent
     lines = []
     for i in range(t):
-        terms = []
-        for j in range(t):
-            m = int(M[i][j])
-            terms.append(f"mulmod({m}, s{j}, {P})")
+        terms = [f"mulmod({int(M[i][j])}, s{j}, {P})" for j in range(t)]
         expr = terms[0]
         for term in terms[1:]:
-            expr = f"addmod({expr}, {term}, {P})"
-        lines.append(f"                n{i} := {expr}")
+            expr = f"add({expr}, {term})"
+        lines.append(f"{pad}n{i} := {expr}")
     for i in range(t):
-        lines.append(f"                s{i} := n{i}")
+        lines.append(f"{pad}s{i} := n{i}")
     return "\n".join(lines)
+
+
+def sbox(i, indent):
+    """Inline x^5 for one lane, using n0 (dead until the mix rewrites it) as
+    the x^2 scratch: a fresh local would be one stack slot too many for
+    legacy codegen in hash3 (the devnet libsmall profile), and a Yul
+    function call costs ~25 gas per invocation. Reduces the lane mod P as a
+    side effect, which the lazy-reduction invariant uses."""
+    pad = " " * indent
+    return (f"{pad}n0 := mulmod(s{i}, s{i}, {P})\n"
+            f"{pad}s{i} := mulmod(mulmod(n0, n0, {P}), s{i}, {P})")
 
 
 def hash_fn(t):
@@ -58,21 +73,25 @@ def hash_fn(t):
     half = rf // 2
     n = t - 1
     args = ", ".join(f"uint256 x{i}" for i in range(n))
-    inits = "\n".join(f"            let s{i + 1} := x{i}" for i in range(n))
-    arks = "\n".join(
-        f"                s{i} := addmod(s{i}, mload(add(cp, {32 * i})), {P})" for i in range(t))
-    full_sbox = "\n".join(f"                    s{i} := pow5(s{i})" for i in range(t))
+    # reduce inputs once at entry: the lazy-reduction bound needs state < t*P,
+    # and callers may pass any uint256 (addmod used to absorb that implicitly)
+    inits = "\n".join(f"            let s{i + 1} := mod(x{i}, {P})" for i in range(n))
     decls = " ".join(f"let n{i} := 0" for i in range(t))
+    arks = "\n".join(
+        f"                s{i} := add(s{i}, mload(add(cp, {32 * i})))" for i in range(t))
+    extra_sbox = "\n".join(sbox(i, 20) for i in range(1, t))
     return f"""    /// @notice circomlib Poseidon({n}): state [0, inputs...], output state[0].
     /// @dev    public, so the library deploys once and the pool stays under
     ///         the EIP-170 code-size limit (via-IR inlines internal copies).
+    ///         Lazily reduced: between the entry mod and the s-boxes, state
+    ///         words carry values up to t*P and only mulmod reduces; the ark
+    ///         and mix use plain add (sums bounded by (t+1)*P < 2^256, which
+    ///         holds for t <= 4 over BN254), and the output takes one final
+    ///         mod. Lane 0 passes the s-box every round; lanes 1..{n} only in
+    ///         the {half} initial and {rf - half} terminal full rounds.
     function hash{n}({args}) public pure returns (uint256 out) {{
         bytes memory c = C{t};
         assembly ("memory-safe") {{
-            function pow5(v) -> y {{
-                let vv := mulmod(v, v, {P})
-                y := mulmod(mulmod(vv, vv, {P}), v, {P})
-            }}
             let cp := add(c, 32)
             let s0 := 0
 {inits}
@@ -80,13 +99,13 @@ def hash_fn(t):
             for {{ let r := 0 }} lt(r, {rounds}) {{ r := add(r, 1) }} {{
 {arks}
                 cp := add(cp, {32 * t})
-                switch or(lt(r, {half}), gt(r, {half + rp - 1}))
-                case 1 {{
-{full_sbox}
+{sbox(0, 16)}
+                if or(lt(r, {half}), gt(r, {half + rp - 1})) {{
+{extra_sbox}
                 }}
-                default {{ s0 := pow5(s0) }}
-{mix(t, cfg["M"])}
+{mix(t, cfg["M"], 16)}
             }}
+            s0 := mod(s0, {P})
             out := s0
         }}
     }}"""

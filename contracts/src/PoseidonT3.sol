@@ -82,39 +82,42 @@ library PoseidonT3 {
     /// @notice circomlib Poseidon(2): state [0, inputs...], output state[0].
     /// @dev    public, so the library deploys once and the pool stays under
     ///         the EIP-170 code-size limit (via-IR inlines internal copies).
+    ///         Lazily reduced: between the entry mod and the s-boxes, state
+    ///         words carry values up to t*P and only mulmod reduces; the ark
+    ///         and mix use plain add (sums bounded by (t+1)*P < 2^256, which
+    ///         holds for t <= 4 over BN254), and the output takes one final
+    ///         mod. Lane 0 passes the s-box every round; lanes 1..2 only in
+    ///         the 4 initial and 4 terminal full rounds.
     function hash2(uint256 x0, uint256 x1) public pure returns (uint256 out) {
         bytes memory c = C3;
         assembly ("memory-safe") {
             mstore(0x00, 21888242871839275222246405745257275088548364400416034343698204186575808495617)
-            function pow5(v) -> y {
-                let q := mload(0x00)
-                let vv := mulmod(v, v, q)
-                y := mulmod(mulmod(vv, vv, q), v, q)
-            }
             let cp := add(c, 32)
             let s0 := 0
-            let s1 := x0
-            let s2 := x1
+            let s1 := mod(x0, mload(0x00))
+            let s2 := mod(x1, mload(0x00))
             let n0 := 0 let n1 := 0 let n2 := 0
             for { let r := 0 } lt(r, 65) { r := add(r, 1) } {
-                s0 := addmod(s0, mload(add(cp, 0)), mload(0x00))
-                s1 := addmod(s1, mload(add(cp, 32)), mload(0x00))
-                s2 := addmod(s2, mload(add(cp, 64)), mload(0x00))
+                s0 := add(s0, mload(add(cp, 0)))
+                s1 := add(s1, mload(add(cp, 32)))
+                s2 := add(s2, mload(add(cp, 64)))
                 cp := add(cp, 96)
-                switch or(lt(r, 4), gt(r, 60))
-                case 1 {
-                    s0 := pow5(s0)
-                    s1 := pow5(s1)
-                    s2 := pow5(s2)
+                n0 := mulmod(s0, s0, mload(0x00))
+                s0 := mulmod(mulmod(n0, n0, mload(0x00)), s0, mload(0x00))
+                if or(lt(r, 4), gt(r, 60)) {
+                    n0 := mulmod(s1, s1, mload(0x00))
+                    s1 := mulmod(mulmod(n0, n0, mload(0x00)), s1, mload(0x00))
+                    n0 := mulmod(s2, s2, mload(0x00))
+                    s2 := mulmod(mulmod(n0, n0, mload(0x00)), s2, mload(0x00))
                 }
-                default { s0 := pow5(s0) }
-                n0 := addmod(addmod(mulmod(7511745149465107256748700652201246547602992235352608707588321460060273774987, s0, mload(0x00)), mulmod(10370080108974718697676803824769673834027675643658433702224577712625900127200, s1, mload(0x00)), mload(0x00)), mulmod(19705173408229649878903981084052839426532978878058043055305024233888854471533, s2, mload(0x00)), mload(0x00))
-                n1 := addmod(addmod(mulmod(18732019378264290557468133440468564866454307626475683536618613112504878618481, s0, mload(0x00)), mulmod(20870176810702568768751421378473869562658540583882454726129544628203806653987, s1, mload(0x00)), mload(0x00)), mulmod(7266061498423634438633389053804536045105766754026813321943009179476902321146, s2, mload(0x00)), mload(0x00))
-                n2 := addmod(addmod(mulmod(9131299761947733513298312097611845208338517739621853568979632113419485819303, s0, mload(0x00)), mulmod(10595341252162738537912664445405114076324478519622938027420701542910180337937, s1, mload(0x00)), mload(0x00)), mulmod(11597556804922396090267472882856054602429588299176362916247939723151043581408, s2, mload(0x00)), mload(0x00))
+                n0 := add(add(mulmod(7511745149465107256748700652201246547602992235352608707588321460060273774987, s0, mload(0x00)), mulmod(10370080108974718697676803824769673834027675643658433702224577712625900127200, s1, mload(0x00))), mulmod(19705173408229649878903981084052839426532978878058043055305024233888854471533, s2, mload(0x00)))
+                n1 := add(add(mulmod(18732019378264290557468133440468564866454307626475683536618613112504878618481, s0, mload(0x00)), mulmod(20870176810702568768751421378473869562658540583882454726129544628203806653987, s1, mload(0x00))), mulmod(7266061498423634438633389053804536045105766754026813321943009179476902321146, s2, mload(0x00)))
+                n2 := add(add(mulmod(9131299761947733513298312097611845208338517739621853568979632113419485819303, s0, mload(0x00)), mulmod(10595341252162738537912664445405114076324478519622938027420701542910180337937, s1, mload(0x00))), mulmod(11597556804922396090267472882856054602429588299176362916247939723151043581408, s2, mload(0x00)))
                 s0 := n0
                 s1 := n1
                 s2 := n2
             }
+            s0 := mod(s0, mload(0x00))
             out := s0
         }
     }

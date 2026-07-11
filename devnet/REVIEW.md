@@ -1078,6 +1078,99 @@ the change (fixture-driven testbed design). Validated: vectors re-exported,
 `reference/poseidon_bn254.py` and `wallet.py` self-checks, `frametx.py`
 golden vector, both Yul builds, and all 41 Forge tests.
 
+## Gas review (2026-07-11): Poseidon codegen, and where the verify frame's floor is
+
+A pass looking for gas reductions, with the VERIFY-frame side as the
+priority, under the constraint that nothing about the statement, the
+bindings, or the trust structure changes.
+
+**The verify frame is precompile-floor-bound.** `verifyProofOnly` measures
+246k, of which the snarkjs verifier is 241k: 181k is the one pairing check
+(45k + 4 x 34k, EIP-1108 protocol pricing), 54k the nine public-input scalar
+muls (9 x 6k ecMul), and ~6k the verifier's own field checks and dispatch.
+Within this statement there are ~5k of total slack, so no implementation
+change moves the number. The two real levers both change the statement or
+the architecture, and are documented rather than taken:
+
+- **Compress the nine publics to one** via an in-circuit keccak of
+  `[nf1, nf2, outCm1, outCm2, root, domain, publicAmount, fee, ctx]`. Drops
+  eight scalar muls (241k to ~193k onchain; the onchain digest recompute is
+  one keccak of 288 bytes, well under 1k gas) at the cost of roughly 150k
+  extra R1CS constraints, proving time from ~600 ms to seconds, and a full
+  circuit/ceremony/fixture regeneration. Even then the verify frame sits at
+  ~2x the standard 100k `MAX_VERIFY_GAS`, so this buys a better devnet
+  number, not admission under a mainnet-standard budget. (Compressing with
+  Poseidon instead is in-circuit cheap but the onchain recompute, 4 x hash3,
+  costs more than the muls it saves.)
+- **Fold the deployment-constant `domain` into the verification key** (add
+  `domain * IC6` into IC0 at generation). Saves one mul (6k) but changes the
+  Spend tuple, both function selectors, and every hardcoded offset in the
+  paymaster and tooling. Not worth it alone.
+
+**The redundant SENDER-frame re-verification is removable without the payer
+TXPARAM.** The step-2 rationale for keeping `_verifyProof` in `_spend` was
+that the pool cannot authenticate WHO verified in the prefix. It can: bind,
+through the probe, frame 1's target == a pool-pinned paymaster address plus
+frame 1's mode == VERIFY and flags == payment-only (frames == 3 and the
+settle-frame target are already bound). In that grammar frame 1 is the only
+frame that can approve payment, a transaction whose payment is unapproved is
+invalid at consensus, and the pinned paymaster approves only after
+staticcalling `verifyProofOnly` on calldata it binds byte-for-byte to frame
+2's Spend tuple. Inclusion therefore implies the proof was verified over
+exactly this spend, and the in-execution re-verify (~246k, ~13% of the live
+transaction) can go. Two costs keep this a decision rather than a change:
+the pool and paymaster become mutually pinned (deployable with a CREATE
+address precompute), and a paymaster bug becomes a noteholder bug, where
+today the pool's own check protects noteholders independently of the
+paymaster protecting its gas float. The payer TXPARAM would still be the
+cleaner form of the same authentication.
+
+**Implemented: the Poseidon codegen pass.** Tree hashing dominates the
+execution frame (~22 hash2 per spend at ~35k each, ~65% of a settle), and
+the generated Yul had real slack. Three output-identical changes to
+`gen_poseidon_sol.py`:
+
+- **Lazy reduction.** `mulmod`/`addmod` reduce arbitrary 256-bit operands,
+  so intermediate reductions are unnecessary: the ark and mix now use plain
+  `add`, with state bounded by (t+1) * P < 2^256 (holds for t <= 4 over
+  BN254; the generator documents the bound), inputs reduced once at entry,
+  and one final `mod` on the output.
+- **Inlined s-box.** x^5 as straight-line mulmods instead of a Yul function
+  call per lane per round, reusing `n0` (dead until the mix rewrites it) as
+  the x^2 scratch because a fresh local is one stack slot too many for
+  legacy codegen in hash3.
+- **One loop kept.** A three-loop variant (full/partial/full, no per-round
+  branch) measured slightly faster but duplicated the inlined mix matrices
+  for +1.3KB of runtime, and the devnet prices code bytes at ~1,545 gas
+  each at deploy; the single loop with an `if` for the full-round lanes
+  keeps the library sizes unchanged (libsmall: T3 7,027 to 6,996 bytes, T4
+  9,291 to 9,262).
+
+Measured, default via-IR profile: hash2 34,957 to 29,326 (-16%), hash3
+55,899 to 41,251 (-26%); under the legacy `libsmall` codegen the devnet
+actually deploys: hash2 41,938 to 32,542 and hash3 58,413 to 45,284 (both
+-22%). Operation level (via-IR): shield 894,845 to 761,946 (-15%), transfer
+1,173,758 to 1,055,507 (-10%), withdraw 1,217,891 to 1,094,009 (-10%); the
+live settle-only transfer (1.94M at the old codegen) should drop by roughly
+200k, to be confirmed on the next live run. The hash function itself is
+unchanged (same constants, same rounds, bit-identical outputs), so no
+circuit, fixture, or vector changes: validated by the differential
+circomlibjs vectors, the exhaustive incremental-tree test, and all 41 Forge
+tests.
+
+Also fixed in passing: `FOUNDRY_PROFILE=libsmall` no longer compiles the
+test suite (the step-2 mock-probe tests are stack-too-deep under legacy
+codegen, which had silently broken `run_live.sh`'s library deploys on a
+fresh checkout); the profile now sets `skip = ["test/**"]`.
+
+**Evaluated and rejected:** the circomlibjs optimized-schedule Poseidon
+(sparse partial-round matrices) would have saved ~11k per hash2 before this
+pass, but lazy reduction already captured most of that; the remaining ~3-4k
+per hash does not justify ~6KB of extra constants, which only fit the
+per-deploy budget as a separate data contract read back with EXTCODECOPY.
+Dropping the `isLeaf` duplicate-commitment guard (two fresh SSTOREs, ~44k
+per spend) would trade depositor protection for gas and stays.
+
 ## Bottom line
 
 The devnet implements the three EIPs cleanly and the pool ran on it end to

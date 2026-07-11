@@ -26,12 +26,9 @@ def hoist(fn):
     # overflows legacy codegen's stack in hash3, and via-IR emits ~3KB of
     # dispatch glue, both of which push PoseidonT4 past the deploy budget.
     # Writing scratch space is allowed in memory-safe assembly; `bytes memory
-    # c = C4` allocates at the free pointer, so 0x00 is free. pow5 reads it
-    # into a local once (Yul functions can't reference outer variables).
-    body = re.search(r"function pow5\(v\) -> y \{.*?\n            \}", fn, re.S).group(0)
-    fn = fn.replace(body, body
-                    .replace("-> y {", "-> y {\n                let q := mload(0x00)")
-                    .replace(LIT, "q"))
+    # c = C4` allocates at the free pointer, so 0x00 is free. An mload(0x00)
+    # costs 6 gas to PUSH32's 3, but each avoided literal saves 30 bytes of
+    # runtime, which the devnet deploy budget values at ~1545 gas/byte.
     fn = fn.replace(LIT, "mload(0x00)")
     fn = fn.replace('assembly ("memory-safe") {',
                     'assembly ("memory-safe") {\n            mstore(0x00, ' + LIT + ')')
