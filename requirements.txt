@@ -1,2 +1,4 @@
-eth-hash==0.7.1
+# eth-hash needs an explicit keccak backend; without one `eth_hash.auto`
+# raises ImportError at first use. Pin pycryptodome via the extra.
+eth-hash[pycryptodome]==0.7.1
 eth-keys==0.7.0
