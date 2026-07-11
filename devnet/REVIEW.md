@@ -1235,11 +1235,22 @@ techniques, none free:
   unrolling with inline constants, which is exactly what the hegota deploy
   budget (~10.7KB) forbids; its T4 (14.2KB) does not fit either. Its
   remaining techniques (lazy reduction, x^5 via squared squares, scratch
-  memory) are already in our generator as of this pass. A middle form,
-  T4-style shared round functions with constants as arguments applied to
-  T3, should land near 24-25k per hash inside ~9-10KB; that ~4-5k per hash
-  (~100k per spend) is the one implementation-only follow-up left on the
-  table.
+  memory) are already in our generator as of this pass. The middle form,
+  T4-style shared round functions with the round constants as call-site
+  literal arguments, was BUILT AND MEASURED, and fails on this toolchain:
+  under via-IR the inliner expands all 65 call sites regardless of
+  optimizer runs (29.5KB, over EIP-170, and per-path compiler restrictions
+  cannot isolate a library the test unit imports), and under the legacy
+  runs=1 profile the devnet deploys, unoptimized call sites shuffle nine
+  stack items per round and hash2 measured 65.9k, twice the loop form's
+  32.5k. A second variant, keeping the loop but un-hoisting the modulus to
+  inline PUSH32s, also measured worse under legacy (55.4k): at runs=1 the
+  optimizer rematerializes repeated 32-byte literals through CODECOPY, the
+  same heuristic foundry.toml already documents for via-IR at low runs.
+  Via-IR gas is insensitive to the hoist either way (29.3k both forms).
+  Conclusion: the committed loop form with the hoisted modulus is the
+  local optimum for this solc under the deploy budget; the ~8k/hash to
+  poseidon-solidity's number is the price of fitting in 10.7KB.
 
 Also checked and consciously not adopted: Railgun's frontier
 pre-initialization (it shifts ~17k per slot from first users to the
