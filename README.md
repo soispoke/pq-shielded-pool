@@ -6,10 +6,11 @@ arbitrary value; a spend is a 2-in/2-out join-split proven by a Groth16 SNARK
 (circom + snarkjs) and verified onchain through the BN254 pairing precompiles,
 so no offchain attester is involved.
 
-It runs as an EIP-8141 frame-native application: a spend is one frame
-transaction whose proof is verified inside the SENDER frame. The full shield →
-transfer → withdraw flow has run end to end on lambdaclass/ethrex's Hegotá
-devnet; addresses, transaction hashes, and gas are in
+It runs as an EIP-8141 frame-native application. The paymaster verifies the
+proof before payment approval, when EIP-8250 consumes the two nullifiers; the
+pool verifies it again before settlement. The full shield → transfer → withdraw
+flow has run end to end on lambdaclass/ethrex's Hegotá devnet; addresses,
+transaction hashes, and gas are in
 [devnet/REVIEW.md](devnet/REVIEW.md).
 
 ## How a spend works
@@ -35,22 +36,21 @@ also pull credits, so recipient code cannot revert settlement.
 
 ## Contracts
 
-The pool enforces four checks around each proof:
+The pool enforces four bindings around each proof:
 
 1. the sender is the pinned `POOL_SENDER`;
-2. the 2 nullifiers are consumed as one keyed-nonce set `{nf1, nf2}`
-   (EIP-8250: shared `nonce_seq = 0`, atomic all-or-nothing);
-3. the proof's root is one of the pool's recent roots (EIP-8272);
-4. the operation shape is well-formed (transfer vs withdraw).
+2. the transaction consumed exactly `{nf1, nf2}` as its EIP-8250 keyed-nonce
+   set at `nonce_seq = 0`;
+3. its single protocol-validated EIP-8272 reference carries this pool's source
+   ID and the proven root;
+4. the transaction has the exact three-frame settlement shape.
 
 Nullifiers are separated by `domain = H(chain_id, source_id)` and the circuit
 rejects `nf1 == nf2`. The duplicate-key rule repeats that check in the envelope.
 
 ```
 contracts/src/
-  ShieldedPool.sol     the pool: Merkle tree, shield/transfer/withdraw, the four checks
-  NonceManager.sol     EIP-8250 keyed nonces (consumeFreshMany, MAX_NONCE_KEYS = 16)
-  RecentRoots.sol      EIP-8272 recent-roots ring
+  ShieldedPool.sol     the frame-native pool and incremental Merkle tree
   Groth16Verifier.sol  snarkjs verifier (GENERATED; GPL-3.0, see NOTICE)
   PoseidonT3/T4.sol    Poseidon over BN254 (GENERATED); PoseidonBN254.sol is the facade
 circuits/spend.circom  the 2-in/2-out join-split circuit
@@ -58,7 +58,10 @@ reference/             Python Poseidon reference and the Solidity generator
 vectors/               Poseidon test vectors exported from circomlibjs
 tooling/               npm deps, circuit compile and trusted-setup script
 wallet/                witness builder, proof generation, and end-to-end scripts
-devnet/                frame-transaction tooling and the devnet write-up (REVIEW.md)
+devnet/
+  ProofPaymaster.yul   proof, key-set, root-reference, and frame binding
+  EnvelopeProbe.yul   stateless envelope reader used by settlement
+  REVIEW.md            live-run evidence and protocol caveats
 ```
 
 ## Run
@@ -83,10 +86,10 @@ proofs.
 
 | operation | gas |
 |---|---:|
-| verifySpend (proof + root check) | ~250k |
-| shield | ~1.20M |
-| transfer | ~1.13M |
-| withdraw | ~1.20M |
+| verifyProofOnly | ~248k |
+| shield | ~1.12M |
+| transfer settlement | ~1.10M |
+| withdraw settlement | ~1.14M |
 
 Each spend inserts two output commitments into the Merkle frontier and
 recomputes the 20-level root once. On the Hegotá devnet, EIP-8037's
@@ -103,5 +106,9 @@ two-dimensional gas accounting raises these figures; see
   onchain; only internal transfer amounts are hidden, and equal deposit and
   withdrawal amounts are linkable.
 - **Finite tree.** Depth 20 admits 1,048,576 commitments. There is no silent
-  epoch rollover because old epoch roots would age out and strand notes.
+  epoch rollover because old epoch roots would age out and strand notes. Once
+  full, a newly approved spend with fresh outputs would revert after protocol
+  nonce consumption. This disposable testbed must be retired before capacity.
+- **Frame-native only.** Spends require the Hegotá EIP-8141/8250/8272 opcode
+  surface and deliberately revert when called as ordinary EVM transactions.
 - **Unaudited research code.**

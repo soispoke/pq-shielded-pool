@@ -968,10 +968,14 @@ history. RecentRoots.sol, NonceManager.sol, and the Spend tuple's `slot`
 field are deleted; `_publishRoot` writes only the native predeploy;
 `sourceId` is self-computed (`keccak256(abi.encode(this, SALT))`). `_spend`
 is settle-only: it binds the transaction envelope through
-**EnvelopeProbe.yul** (88 bytes deployed), a stateless Yul reader the pool
+**EnvelopeProbe.yul**, a stateless Yul reader the pool
 STATICCALLs because Solidity cannot emit the frame-tx opcodes. It requires
-frames == 3 and current index == 2 (exactly-once per consumption — without
-it a crafted multi-SENDER-frame tx could settle twice per key consumption),
+frames == 3, current index == 2, and the settle frame's target == the pool
+(exactly-once per consumption: one frame is one call, so a settle frame
+targeting the pool directly is the only entry; a re-entering intermediary,
+even POOL_SENDER itself were it a contract, has a different frame target and
+cannot double-credit one protocol nonce consumption, and the sender pin
+already blocks any intermediary whose address is not POOL_SENDER),
 nonce_keys == sorted{nf1, nf2} at seq 0, and one declared reference equal to
 (sourceId, s.root); then it checks the proof and settles. The proof check
 stays pool-side deliberately: the paymaster's prefix check protects its gas
@@ -980,7 +984,7 @@ verified in the prefix (a payer TXPARAM would allow exactly that — a second
 use for the one remaining ethrex ask). Transfers and withdraws are therefore
 faithful-shape only; the legacy self-paying path no longer settles. Tests
 run against a mock probe armed with the envelope facts (the opcodes do not
-exist on anvil); 39 forge tests and the real-proof smoke pass.
+exist on anvil); 41 forge tests and the real-proof smoke pass.
 
 **Validated live the same day** (fresh stack, public mempool, blocks
 136700-136720): shield `0x217ef8dc…` (block 136707), settle-only transfer
@@ -993,6 +997,43 @@ EIP-8272 predeploy. Remaining known bounds: TreeFull is an accepted
 operational limit (a revert there now burns notes for good; disposable
 2^20-leaf testbed), and fee routing to arbitrary relayers still waits on the
 payer TXPARAM.
+
+## Security-review hardening (2026-07-11)
+
+Three independent audits followed the migration: the Solidity, the two Yul
+contracts (verbatim operand orders, offsets, and selectors checked against the
+ethrex source, not the comments), and the Python tooling. No high or critical
+defect survived; the load-bearing checks (nullifier/root binding, drain
+closure, return-data handling, claim reentrancy) were confirmed sound. The
+changes made:
+
+- **Exactly-once no longer depends on POOL_SENDER's shape.** The one real
+  finding: `frames == 3 && frameIndex == 2` proved a settle frame existed but
+  not that the pool was entered once; a contract (or 7702-delegated) POOL_SENDER
+  targeted by the settle frame could re-enter and double-credit one nonce
+  consumption. `_spend` now also binds the settle frame's target == the pool
+  (probe word 10, `FRAMEPARAM(2, 0x00)`), closing it independently of the
+  paymaster and the sender's shape.
+- **Fail-closed deployment.** The constructor rejects a zero sender and a
+  code-less probe or verifier.
+- **Bounded verify gas.** The pool's `verifier.verifyProof` and all three
+  Groth16 precompile calls forward a fixed 500,000 (was 30,000,000); a valid
+  verify is ~248k, and a corrupted-proof revert is now bounded. The probe
+  STATICCALL cap rose 60k to 100k (its ~10 introspection opcodes are a fixed,
+  non-inflatable cost) for opcode-repricing headroom.
+- **Tooling and CI.** Yul deploy tools validate their mode/address arguments;
+  `pool_frametx.py`'s recent-root reference is self-checked against the
+  committed predeploy entry (a wrong derived slot fails loudly instead of
+  broadcasting an unadmittable tx), and its now-single faithful path dropped
+  the dead dual-path flags. Python deps are pinned; a CI workflow compiles the
+  circuit, regenerates and diffs the Yul, runs the cross-language vectors and
+  all 41 Forge tests, and gates `npm audit`. `SECURITY.md` records the trust
+  boundary, the finite-tree burn condition, and the toolchain advisories.
+
+Re-validated live on a fresh public-devnet stack (blocks 137366-137383): shield,
+settle-only transfer (1,940,073 gas), and withdraw all mined through the public
+mempool with the hardened 320-byte probe and the new settle-frame-target bind,
+all four nullifiers consumed as protocol keyed nonces, credits correct.
 
 ## Bottom line
 

@@ -8,19 +8,19 @@ Usage:
   probe.py --initcode   deploy initcode  -> cast send --create
   probe.py --runtime    expected deployed code -> cast code check
 """
-import sys
+import argparse
 from functools import lru_cache
 from pathlib import Path
 import subprocess
 
-from paymaster import _solc
+from paymaster import solc_binary
 
 
 @lru_cache(maxsize=1)
 def _compiled() -> tuple[bytes, bytes]:
     source = Path(__file__).with_name("EnvelopeProbe.yul")
     result = subprocess.run(
-        [_solc(), "--strict-assembly", "--optimize", "--optimize-runs", "200", "--bin", source.name],
+        [solc_binary(), "--strict-assembly", "--optimize", "--optimize-runs", "200", "--bin", source.name],
         cwd=source.parent, capture_output=True, text=True, check=True,
     )
     marker = "Binary representation:\n"
@@ -35,6 +35,11 @@ def _compiled() -> tuple[bytes, bytes]:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--initcode", dest="mode", action="store_const", const="--initcode")
+    mode.add_argument("--runtime", dest="mode", action="store_const", const="--runtime")
+    args = parser.parse_args()
     init, runtime = _compiled()
-    out = {"--initcode": init, "--runtime": runtime}[sys.argv[1]]
+    out = {"--initcode": init, "--runtime": runtime}[args.mode]
     print("0x" + out.hex())

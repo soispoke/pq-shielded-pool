@@ -10,11 +10,17 @@ from pathlib import Path
 
 VERIFIER = Path(__file__).parent.parent / "contracts" / "src" / "Groth16Verifier.sol"
 NEEDLE = "staticcall(sub(gas(), 2000),"
-REPLACEMENT = "staticcall(30000000,"
+REPLACEMENT = "staticcall(500000,"
+LEGACY_REPLACEMENT = "staticcall(30000000,"
 
 
 def main():
     source = VERIFIER.read_text()
+    if source.count(LEGACY_REPLACEMENT) == 3:
+        source = source.replace(LEGACY_REPLACEMENT, REPLACEMENT)
+        VERIFIER.write_text(source)
+        print("tightened 3 legacy verifier gas requests to 500000")
+        return
     count = source.count(NEEDLE)
     if count == 0 and source.count(REPLACEMENT) == 3:
         print("verifier already uses 3 fixed-gas precompile calls")

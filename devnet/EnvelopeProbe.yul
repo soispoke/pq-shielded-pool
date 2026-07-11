@@ -13,6 +13,7 @@
 ///           [6] recent-root ref count  TXPARAM 0x0F
 ///           [7] ref[0].source_id       RECENTROOTREFLOAD 0xB5 (0 when none)
 ///           [8] ref[0].root            RECENTROOTREFLOAD 0xB5 (0 when none)
+///           [9] frame[2].target        FRAMEPARAM 0xB3 (0 when < 3 frames)
 ///
 ///         Guarded reads: the load opcodes exceptional-halt out of range, so
 ///         keys/refs are read only when the counts cover them. Outside a
@@ -29,7 +30,8 @@ object "EnvelopeProbe" {
             function txParam(param) -> value {
                 value := verbatim_1i_1o(hex"B0", param)
             }
-            mstore(0, txParam(0x09))
+            let frames := txParam(0x09)
+            mstore(0, frames)
             mstore(32, txParam(0x0A))
             let keyCount := txParam(0x0D)
             mstore(64, keyCount)
@@ -43,7 +45,10 @@ object "EnvelopeProbe" {
                 mstore(224, verbatim_2i_1o(hex"B5", 0, 0)) // field 0: source_id
                 mstore(256, verbatim_2i_1o(hex"B5", 2, 0)) // field 2: root
             }
-            return(0, 288)
+            // frame[2].target: guarded, since FRAMEPARAM halts out of range.
+            // FRAMEPARAM pops frameIndex first (stack top), then param 0x00.
+            if gt(frames, 2) { mstore(288, verbatim_2i_1o(hex"B3", 2, 0x00)) }
+            return(0, 320)
         }
     }
 }

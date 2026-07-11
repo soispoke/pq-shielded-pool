@@ -1,0 +1,2 @@
+eth-hash==0.7.1
+eth-keys==0.7.0

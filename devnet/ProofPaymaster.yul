@@ -7,16 +7,20 @@
 ///         valid AND submitted by the pool's pinned POOL_SENDER.
 ///
 /// In the pay frame it does the following, reverting (no APPROVE) on any failure:
-///   0. SENDER BINDING. TXPARAM(0x02) (the authenticated tx.sender) MUST equal
-///      the pool's POOL_SENDER. This is the check that actually closes the
-///      paymaster-drain: a spend proof is costless to mint (two zero-value dummy
-///      inputs conserve at 0, skip membership, and expose two fresh distinct
-///      nullifiers), so "valid proof" is NOT evidence of ownership or value.
-///      Because this pool pins POOL_SENDER everywhere (ShieldedPool._spend
-///      reverts otherwise), only POOL_SENDER can produce a spend the SENDER
-///      frame will accept; binding the payer's sponsorship to that same pinned
-///      sender means a third party cannot forge POOL_SENDER's signature and so
-///      cannot get sponsored. See devnet/REVIEW.md "Paymaster drain".
+///   0. SENDER BINDING. TXPARAM(0x02) (tx.sender) MUST equal POOL_SENDER. This
+///      closes the paymaster drain, but note WHY: a spend proof is costless to
+///      mint (two zero-value dummy inputs conserve at 0, skip membership, and
+///      expose two fresh distinct nullifiers), so "valid proof" is NOT evidence
+///      of ownership. tx.sender is ALSO not authenticated on its own (ethrex
+///      does no ECDSA recovery on it; it is a caller-chosen envelope field), so
+///      this equality alone would not stop a forged sender. What authenticates
+///      it is frame 0: the mandatory VERIFY(POOL_SENDER, execution-scope) frame
+///      (checked in binding 2) is a real signature check, and a failing VERIFY
+///      frame marks the WHOLE transaction invalid with a full rollback of the
+///      APPROVE debit. So the drain is closed by binding 0 AND the frame-0
+///      VERIFY together; the frame-0 checks are load-bearing and must not be
+///      weakened on the assumption that the TXPARAM(0x02) equality suffices.
+///      See devnet/REVIEW.md "Paymaster drain".
 ///   1. SPENT-SET BINDING (the in-EVM form of ShieldedPool.checkKeySet). Requires
 ///      len(nonce_keys) == 2 (TXPARAM 0x0D), nonce_seq == 0 (TXPARAM 0x01, the
 ///      EIP-8250 single-use requirement), and nonce_keys == sorted{nf1, nf2}
@@ -55,12 +59,10 @@
 ///      frame_target == sender, so it composes with the execution-scope
 ///      self-verify frame ahead of it.
 ///
-/// @dev Fee routing. The pool pays `fee` to msg.sender, which in this shape is
-///      the SENDER-frame sender == POOL_SENDER, NOT the payer (this paymaster).
-///      For the single-operator pool that is the same economic entity that funds
-///      the paymaster, so the loop nets out. A distinct third-party payer would
-///      not be reimbursed by `fee` and would need the pool to route the fee to
-///      the payer (a payer TXPARAM, not currently exposed). See REVIEW.md.
+/// @dev Fee routing. The SENDER calldata names this paymaster as feeRecipient,
+///      and the pool records a pull credit for that exact address. Anyone may
+///      later push the credit to the paymaster itself, replenishing its gas
+///      float without giving the caller any redirect authority.
 ///
 /// @dev SLOAD-free. Two 32-byte constructor args, pool || poolSender, are
 ///      appended to the initcode; the constructor appends them to the DEPLOYED

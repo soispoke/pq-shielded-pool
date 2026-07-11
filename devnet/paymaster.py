@@ -44,16 +44,16 @@ Usage:
   paymaster.py --runtime  0x<pool> 0x<poolSender>   expected deployed code -> cast code check
 """
 import os
+import argparse
 import shutil
 import subprocess
-import sys
 from functools import lru_cache
 from pathlib import Path
 
 SOLC_VERSION = "0.8.30"
 
 
-def _solc() -> str:
+def solc_binary() -> str:
     candidates = [
         os.environ.get("SOLC"),
         shutil.which("solc"),
@@ -75,7 +75,7 @@ def _solc() -> str:
 def _compiled() -> tuple[bytes, bytes]:
     source = Path(__file__).with_name("ProofPaymaster.yul")
     result = subprocess.run(
-        [_solc(), "--strict-assembly", "--optimize", "--optimize-runs", "200", "--bin", source.name],
+        [solc_binary(), "--strict-assembly", "--optimize", "--optimize-runs", "200", "--bin", source.name],
         cwd=source.parent, capture_output=True, text=True, check=True,
     )
     marker = "Binary representation:\n"
@@ -102,9 +102,23 @@ def runtime(pool: int = 0, pool_sender: int = 0) -> bytes:
     return deployed + pool.to_bytes(32, "big") + pool_sender.to_bytes(32, "big")
 
 
+def address(value: str) -> int:
+    try:
+        parsed = int(value, 16)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a hexadecimal address") from exc
+    if parsed <= 0 or parsed >= 1 << 160:
+        raise argparse.ArgumentTypeError("address must be nonzero and exactly 20 bytes or less")
+    return parsed
+
+
 if __name__ == "__main__":
-    mode = sys.argv[1]
-    pool = int(sys.argv[2], 16) if len(sys.argv) > 2 else 0
-    pool_sender = int(sys.argv[3], 16) if len(sys.argv) > 3 else 0
-    out = {"--initcode": initcode, "--runtime": runtime}[mode](pool, pool_sender)
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--initcode", dest="mode", action="store_const", const="--initcode")
+    mode.add_argument("--runtime", dest="mode", action="store_const", const="--runtime")
+    parser.add_argument("pool", type=address)
+    parser.add_argument("pool_sender", type=address)
+    args = parser.parse_args()
+    out = {"--initcode": initcode, "--runtime": runtime}[args.mode](args.pool, args.pool_sender)
     print("0x" + out.hex())

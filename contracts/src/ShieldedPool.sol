@@ -30,7 +30,7 @@ import {Groth16Verifier} from "./Groth16Verifier.sol";
 ///         deposit's value. The spend circuit proves conservation
 ///         (v_in1 + v_in2 = v_out1 + v_out2 + publicAmount + fee) over
 ///         range-checked values; a zero-value input is a dummy that skips the
-///         membership check and contributes nothing). Outputs are always two commitments,
+///         membership check and contributes nothing. Outputs are always two commitments,
 ///         appended with the duplicate-no-op discipline.
 ///
 ///         Root state is protocol-native too: _publishRoot writes each new
@@ -45,6 +45,7 @@ contract ShieldedPool {
     bytes32 public constant SALT = bytes32(0); // the pool's root-source salt
     uint256 internal constant P = PoseidonBN254.P;
     uint256 internal constant MAX_VALUE = 1 << 128; // circuit range-check bound
+    uint256 internal constant VERIFIER_GAS_LIMIT = 500_000;
     bytes32 public constant DOMAIN_TAG = 0x40752e102d2a749c61d42a71e297edd3b493de639003b9480a700d589d98065b;
     // The EIP-8272 predeploy (0x…8272 on ethrex's Hegotá build). Empty code:
     // ethrex intercepts CALL-family invocations natively; on anvil/Forge a
@@ -96,8 +97,14 @@ contract ShieldedPool {
     error ZeroFeeRecipient();
     error NoCredit();
     error RootPublishFailed();
+    error InvalidPoolSender();
+    error InvalidProbe();
+    error InvalidVerifier();
 
     constructor(address poolSender, address probe_, Groth16Verifier verifier_) {
+        if (poolSender == address(0)) revert InvalidPoolSender();
+        if (probe_ == address(0) || probe_.code.length == 0) revert InvalidProbe();
+        if (address(verifier_) == address(0) || address(verifier_).code.length == 0) revert InvalidVerifier();
         POOL_SENDER = poolSender;
         probe = probe_;
         verifier = verifier_;
@@ -150,6 +157,11 @@ contract ShieldedPool {
     }
 
     /// Consume two notes, create two notes. Value stays shielded except the fee.
+    /// `feeRecipient` is NOT bound by the proof (unlike the withdraw recipient,
+    /// which `s.ctx` commits to). In the faithful shape the paymaster binds the
+    /// exact SENDER calldata, including this argument, to itself, so the fee
+    /// reaches the actual payer; a deployment that submits spends without that
+    /// paymaster binding gets no fee-recipient guarantee from the pool.
     function transfer(Spend calldata s, address feeRecipient) external {
         if (s.publicAmount != 0 || s.ctx != bytes32(0)) revert TransferShape();
         _spend(s);
@@ -195,7 +207,7 @@ contract ShieldedPool {
         // would emit one for a default-gas external call. The EVM caps the
         // request at 63/64 of remaining gas. (Groth16Verifier's precompile
         // calls are patched to forward a fixed literal for the same reason.)
-        if (!verifier.verifyProof{gas: 30000000}(
+        if (!verifier.verifyProof{gas: VERIFIER_GAS_LIMIT}(
                 s.pA,
                 s.pB,
                 s.pC,
@@ -232,9 +244,12 @@ contract ShieldedPool {
         if (s.nf1 == bytes32(0) || s.nf2 == bytes32(0)) revert ZeroNullifier();
         // Envelope facts via the probe. Gas-capped: outside a frame
         // transaction the opcodes exceptional-halt and consume everything
-        // forwarded, so cap the burn and turn it into a named revert.
-        (bool ok, bytes memory ret) = probe.staticcall{gas: 60_000}("");
-        if (!ok || ret.length != 288) revert NotFrameNative();
+        // forwarded, so cap the burn and turn it into a named revert. 100k
+        // leaves generous headroom over the probe's ~10 fixed introspection
+        // opcodes (attacker cannot inflate the count) against future
+        // opcode repricing.
+        (bool ok, bytes memory ret) = probe.staticcall{gas: 100_000}("");
+        if (!ok || ret.length != 320) revert NotFrameNative();
         (
             uint256 frames,
             uint256 frameIndex,
@@ -244,12 +259,20 @@ contract ShieldedPool {
             bytes32 k1,
             uint256 refCount,
             bytes32 refSource,
-            bytes32 refRoot
-        ) = abi.decode(ret, (uint256, uint256, uint256, uint256, bytes32, bytes32, uint256, bytes32, bytes32));
-        // exactly-once per consumption: the faithful grammar has ONE settle
-        // frame, index 2 of 3. Without this, a crafted multi-SENDER-frame tx
-        // could settle the same consumption twice (fee credited twice).
-        if (frames != 3 || frameIndex != 2) revert NotFaithfulShape();
+            bytes32 refRoot,
+            address settleTarget
+        ) = abi.decode(ret, (uint256, uint256, uint256, uint256, bytes32, bytes32, uint256, bytes32, bytes32, address));
+        // Exactly-once per consumption. The faithful grammar has ONE settle
+        // frame, index 2 of 3, and the protocol calls each frame's target
+        // once. Requiring frame 2 to target THIS pool directly means the
+        // single frame-2 call is the only entry: a settle frame pointing at
+        // some intermediary (even POOL_SENDER itself, were it a contract or a
+        // 7702-delegated EOA that re-enters twice) has settleTarget != this
+        // and cannot double-credit against one protocol nonce consumption.
+        // The sender pin already blocks any intermediary whose address is not
+        // POOL_SENDER; this closes the residual case where POOL_SENDER is the
+        // intermediary. frameIndex == 2 ensures we are executing that frame.
+        if (frames != 3 || frameIndex != 2 || settleTarget != address(this)) revert NotFaithfulShape();
         // the protocol's consumed key set == exactly the proven nullifiers
         // (strictly increasing at consensus, so matching {lo, hi} also
         // rejects nf1 == nf2)

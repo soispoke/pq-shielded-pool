@@ -89,11 +89,12 @@ contract ShieldedPoolBN254Test {
     }
 
     /// Arm the mock probe with the envelope facts the faithful shape carries
-    /// for this spend: 3 frames, settling at index 2, nonce_keys == sorted
-    /// {nf1, nf2} at seq 0, one reference (pool source_id, proven root).
+    /// for this spend: 3 frames, settling at index 2 targeting the pool,
+    /// nonce_keys == sorted {nf1, nf2} at seq 0, one reference (pool source_id,
+    /// proven root).
     function _arm(ShieldedPool.Spend memory s) internal {
         (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
-        probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root);
+        probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool));
     }
 
     /// Shield Alice's 1.0-ether note so the pool's tree matches the fixture's
@@ -135,11 +136,11 @@ contract ShieldedPoolBN254Test {
     function test_wrong_frame_shape_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
         (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
-        probe.set(4, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root); // four frames
+        probe.set(4, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool)); // four frames
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
         pool.transfer(s, POOL_SENDER);
-        probe.set(3, 1, 2, 0, lo, hi, 1, pool.sourceId(), s.root); // wrong index
+        probe.set(3, 1, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool)); // wrong index
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
         pool.transfer(s, POOL_SENDER);
@@ -151,19 +152,19 @@ contract ShieldedPoolBN254Test {
     function test_wrong_key_set_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
         (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
-        probe.set(3, 2, 2, 0, hi, lo, 1, pool.sourceId(), s.root); // unsorted
+        probe.set(3, 2, 2, 0, hi, lo, 1, pool.sourceId(), s.root, address(pool)); // unsorted
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
         pool.transfer(s, POOL_SENDER);
-        probe.set(3, 2, 2, 0, lo, bytes32(uint256(hi) ^ 1), 1, pool.sourceId(), s.root); // wrong key
+        probe.set(3, 2, 2, 0, lo, bytes32(uint256(hi) ^ 1), 1, pool.sourceId(), s.root, address(pool)); // wrong key
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
         pool.transfer(s, POOL_SENDER);
-        probe.set(3, 2, 1, 0, lo, bytes32(0), 1, pool.sourceId(), s.root); // one key
+        probe.set(3, 2, 1, 0, lo, bytes32(0), 1, pool.sourceId(), s.root, address(pool)); // one key
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
         pool.transfer(s, POOL_SENDER);
-        probe.set(3, 2, 2, 1, lo, hi, 1, pool.sourceId(), s.root); // seq != 0
+        probe.set(3, 2, 2, 1, lo, hi, 1, pool.sourceId(), s.root, address(pool)); // seq != 0
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
         pool.transfer(s, POOL_SENDER);
@@ -174,17 +175,30 @@ contract ShieldedPoolBN254Test {
     function test_wrong_reference_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
         (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
-        probe.set(3, 2, 2, 0, lo, hi, 0, bytes32(0), bytes32(0)); // no reference
+        probe.set(3, 2, 2, 0, lo, hi, 0, bytes32(0), bytes32(0), address(pool)); // no reference
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
         pool.transfer(s, POOL_SENDER);
-        probe.set(3, 2, 2, 0, lo, hi, 1, bytes32(uint256(1)), s.root); // foreign source
+        probe.set(3, 2, 2, 0, lo, hi, 1, bytes32(uint256(1)), s.root, address(pool)); // foreign source
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
         pool.transfer(s, POOL_SENDER);
-        probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), bytes32(uint256(999))); // wrong root
+        probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), bytes32(uint256(999)), address(pool)); // wrong root
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
+        pool.transfer(s, POOL_SENDER);
+    }
+
+    /// The settle frame must target the pool directly. If it targets an
+    /// intermediary (e.g. a contract POOL_SENDER that re-enters the pool
+    /// twice), settleTarget != address(this) and the double-credit is refused.
+    /// This is what makes exactly-once independent of POOL_SENDER's shape.
+    function test_wrong_settle_target_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
+        probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, POOL_SENDER); // frame 2 targets sender, not pool
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
         pool.transfer(s, POOL_SENDER);
     }
 
@@ -220,9 +234,11 @@ contract ShieldedPoolBN254Test {
     function test_corrupted_proof_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.pA[0] = addmod(s.pA[0], 1, 21888242871839275222246405745257275088696311157297823662689037894645226208583);
+        uint256 before = gasleft();
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
         pool.transfer(s, POOL_SENDER);
+        assertTrue(before - gasleft() < 1_500_000, "invalid proof consumed unbounded gas");
     }
 
     /// A valid proof cannot have its amounts re-priced: fee and publicAmount
@@ -391,6 +407,17 @@ contract ShieldedPoolBN254Test {
 
     // ---- shield rules ----
 
+    function test_constructor_rejects_invalid_immutables() public {
+        vm.expectRevert(ShieldedPool.InvalidPoolSender.selector);
+        new ShieldedPool(address(0), address(probe), verifier);
+
+        vm.expectRevert(ShieldedPool.InvalidProbe.selector);
+        new ShieldedPool(POOL_SENDER, address(1), verifier);
+
+        vm.expectRevert(ShieldedPool.InvalidVerifier.selector);
+        new ShieldedPool(POOL_SENDER, address(probe), Groth16Verifier(address(1)));
+    }
+
     function test_shield_zero_value_reverts() public {
         vm.expectRevert(ShieldedPool.ZeroValueShield.selector);
         pool.shield{value: 0}(bytes32(uint256(1)));
@@ -456,7 +483,7 @@ contract ShieldedPoolBN254Test {
         );
     }
 
-    function test_tree_root_matches_reference() public {
+    function test_tree_root_matches_reference() public view {
         string memory vecs = vm.readFile("../vectors/poseidon_bn254_vectors.json");
         assertTrue(
             uint256(pool.currentRoot()) == vm.parseUint(vm.parseJsonString(vecs, ".tree.root_empty")),
@@ -537,7 +564,7 @@ contract ShieldedPoolBN254Test {
 }
 
 /// Configurable stand-in for devnet/EnvelopeProbe.yul: anvil/Forge has no
-/// frame-tx opcodes, so tests arm the nine envelope words a faithful
+/// frame-tx opcodes, so tests arm the ten envelope words a faithful
 /// transaction would expose (or halt, emulating a non-frame context).
 contract MockEnvelopeProbe {
     bytes blob;
@@ -552,10 +579,11 @@ contract MockEnvelopeProbe {
         bytes32 k1,
         uint256 refCount,
         bytes32 refSource,
-        bytes32 refRoot
+        bytes32 refRoot,
+        address settleTarget
     ) external {
         halted = false;
-        blob = abi.encode(frames, frameIndex, keyCount, nonceSeq, k0, k1, refCount, refSource, refRoot);
+        blob = abi.encode(frames, frameIndex, keyCount, nonceSeq, k0, k1, refCount, refSource, refRoot, settleTarget);
     }
 
     function setHalted() external {
