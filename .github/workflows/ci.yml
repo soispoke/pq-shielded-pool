@@ -52,11 +52,14 @@ jobs:
             0x0000000000000000000000000000000000000001 \
             0x0000000000000000000000000000000000000002 >/dev/null
           python devnet/probe.py --runtime >/dev/null
+          python devnet/shared_sender.py --runtime \
+            0x0000000000000000000000000000000000000001 >/dev/null
 
       - name: Check Python and frame-vector code
         run: |
           python -m py_compile \
             devnet/frametx.py devnet/paymaster.py devnet/pool_frametx.py devnet/probe.py \
+            devnet/shared_sender.py \
             wallet/gen_smoke.py wallet/wallet.py \
             reference/gen_poseidon_sol.py reference/poseidon_bn254.py \
             tooling/patch_verifier.py

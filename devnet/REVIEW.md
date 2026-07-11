@@ -1309,3 +1309,37 @@ ETH of fee credit for A and 0.05 ETH for B. Independent push claims
 (`0x29654d8a…`, `0x66cd0682…`) transferred each credit only to its recorded
 paymaster and cleared both mappings. The test used an isolated temporary copy,
 so it did not replace the repository's recorded deployment or fixtures.
+
+## Shared contract sender validated live (2026-07-11)
+
+Ethrex's contract-sender path works for the pool without a client change.
+`SharedPoolSender.yul` is a test-only, storage-free capability probe whose
+address is the EIP-8250 namespace. In frame 0 it checks the three-frame grammar,
+the configured pool target and transfer/withdraw selector, two keys at sequence
+zero, one reference, one signature, and no blobs before calling
+`APPROVE_EXECUTION`. The proof paymaster and settle-only pool retain the full
+proof, key-set, reference and byte-exact calldata checks. The outer signature
+is therefore only transaction authentication data required by today's
+paymaster grammar; it does not control the shared sender.
+
+A fresh deployment broke the circular constructor bind by precomputing the
+pool's CREATE address. Shared sender `0x0DCd1Bf9…` was deployed first with the
+future pool `0x9A676e78…` embedded in code, then that pool was created with the
+shared sender as its immutable `POOL_SENDER`. A negative simulation changing
+frame 2's target returned `valid=False`, `payer=None`, and `validation prefix
+frame reverted`, showing frame 0 rejected before the paymaster could approve.
+The honest transfer then mined through the public mempool as type 0x06
+(`0x21c62a0c…`, block 141923, 1,743,376 gas). Its RPC envelope records
+`sender = 0x0DCd1Bf9…` but the sole signature signer is the unrelated deployer
+EOA `0xf39Fd6e…`; frame 0 used 583 gas, frame 1 resolved the proof paymaster
+`0x0b306bf9…`, and settlement credited that payer exactly 0.05 ETH. This is
+live evidence that contract execution authorization does not require an
+operator-held sender key. It is NOT yet safe as a permissionless sender: because
+this capability stage delegates proof/key/root validity to the selected
+paymaster, a malicious self-funded payer could approve a transaction using a
+revealed victim nullifier and deliberately burn it when pool settlement reverts.
+The production successor must verify the proof, exact nonce-key set and recent
+root itself before `APPROVE_EXECUTION`. The remaining ethrex ask is the
+authenticated resolved-payer TXPARAM; the other pool-side hardening is the
+proof-bound fee-versus-gas rule and, later, deciding whether to consolidate the
+duplicate proof checks.

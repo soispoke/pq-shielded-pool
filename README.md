@@ -60,6 +60,7 @@ tooling/               npm deps, circuit compile and trusted-setup script
 wallet/                witness builder, proof generation, and end-to-end scripts
 devnet/
   ProofPaymaster.yul   proof, key-set, root-reference, and frame binding
+  SharedPoolSender.yul test-only contract-sender capability probe
   EnvelopeProbe.yul    stateless envelope reader used by settlement
   pool_frametx.py      assembles, simulates, and submits the frame transactions
   REVIEW.md            live-run evidence and protocol caveats

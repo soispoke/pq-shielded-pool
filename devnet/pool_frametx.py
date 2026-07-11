@@ -52,8 +52,13 @@ it is the payer.
 
 Usage (append --dry-run to any to simulate without submitting):
   pool_frametx.py <rpc> deploy-config.json fixture.json shield   <priv>
-  pool_frametx.py <rpc> deploy-config.json fixture.json transfer <pool_sender_priv> [--paymaster 0x...]
-  pool_frametx.py <rpc> deploy-config.json fixture.json withdraw <pool_sender_priv> [--paymaster 0x...]
+  pool_frametx.py <rpc> deploy-config.json fixture.json transfer <signer_priv> [--sender 0x...] [--paymaster 0x...]
+  pool_frametx.py <rpc> deploy-config.json fixture.json withdraw <signer_priv> [--sender 0x...] [--paymaster 0x...]
+
+`--sender` decouples the authenticated frame sender from the outer signature's
+signer. It is intended for a deployed SharedPoolSender: the contract's VERIFY
+frame grants execution authority, while any submitter supplies the one outer
+signature the current proof-paymaster grammar requires.
 """
 import json
 import subprocess
@@ -169,10 +174,13 @@ def recent_root_ref(url, cfg, e):
 
 
 def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_verify=None,
-                   recent_root_refs=None, dry_run=False):
-    sender = int.from_bytes(pk.public_key.to_canonical_address(), "big")
+                   recent_root_refs=None, dry_run=False, sender_override=None):
+    signer = int.from_bytes(pk.public_key.to_canonical_address(), "big")
+    sender = sender_override if sender_override is not None else signer
     chain_id = int(rpc(url, "eth_chainId", []), 16)
-    nonce = int(rpc(url, "eth_getTransactionCount", [pk.public_key.to_checksum_address(), "latest"]), 16)
+    signer_address = pk.public_key.to_checksum_address()
+    nonce_address = "0x" + sender.to_bytes(20, "big").hex()
+    nonce = int(rpc(url, "eth_getTransactionCount", [nonce_address, "latest"]), 16)
     blk = rpc(url, "eth_getBlockByNumber", ["latest", False])
     base_fee = int(blk.get("baseFeePerGas", "0x0"), 16)
     max_priority = 10**9
@@ -213,12 +221,12 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
         tx = FrameTx(
             chain_id=chain_id, nonce_keys=nonce_keys, nonce_seq=nonce_seq, sender=sender,
             frames=frames,
-            signatures=[FrameSig(FrameSig.SECP256K1, sender, b"", b"")],
+            signatures=[FrameSig(FrameSig.SECP256K1, signer, b"", b"")],
             max_priority_fee=max_priority, max_fee=max_fee,
             recent_root_refs=recent_root_refs)
         s = pk.sign_msg_hash(tx.sig_hash())
         sig = bytes([s.v + 27]) + s.r.to_bytes(32, "big") + s.s.to_bytes(32, "big")
-        tx.signatures = [FrameSig(FrameSig.SECP256K1, sender, b"", sig)]
+        tx.signatures = [FrameSig(FrameSig.SECP256K1, signer, b"", sig)]
         return tx
 
     tx = build()
@@ -298,7 +306,7 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
                          f"({eff.get('executionError') or eff['executionStatus']}); not sending "
                          "(if root-not-recent, retry one block later)")
 
-    print(f"  frame tx: sender={pk.public_key.to_checksum_address()} nonce_keys={nonce_keys} "
+    print(f"  frame tx: sender=0x{sender:040x} signer={signer_address} nonce_keys={nonce_keys} "
           f"raw_len={len(tx.raw())} sig_hash={tx.sig_hash().hex()[:18]}...")
     txhash = rpc(url, "eth_sendRawTransaction", [raw])
     print("  submitted:", txhash)
@@ -327,6 +335,17 @@ def main():
     pool = int(cfg["pool"], 16)
     pk = keys.PrivateKey(bytes.fromhex(priv.removeprefix("0x")))
     dry = "--dry-run" in sys.argv
+    sender_override = None
+    if "--sender" in sys.argv:
+        i = sys.argv.index("--sender")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("--sender requires an address")
+        try:
+            sender_override = int(sys.argv[i + 1], 16)
+        except ValueError:
+            raise SystemExit(f"invalid sender address: {sys.argv[i + 1]}") from None
+        if sender_override == 0 or sender_override >= 1 << 160:
+            raise SystemExit(f"invalid sender address: {sys.argv[i + 1]}")
     paymaster = cfg.get("paymaster")
     if "--paymaster" in sys.argv:
         i = sys.argv.index("--paymaster")
@@ -372,13 +391,15 @@ def main():
         e, protocol_nonces, verify, refs = spend_setup("transfer")
         calldata = cast_calldata(f"transfer({SPEND_TUPLE},address)", spend_args(e), paymaster)
         print(f"join-split transfer via faithful frame tx (payer {paymaster}, proof verified on-chain)")
-        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs, dry_run=dry)
+        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
+                       dry_run=dry, sender_override=sender_override)
     elif op == "withdraw":
         e, protocol_nonces, verify, refs = spend_setup("withdraw")
         calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address,address)", spend_args(e),
                                  fix["recipient"], paymaster)
         print(f"join-split withdraw via faithful frame tx (payer {paymaster})")
-        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs, dry_run=dry)
+        build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
+                       dry_run=dry, sender_override=sender_override)
     else:
         raise SystemExit(f"unknown op {op}")
 
