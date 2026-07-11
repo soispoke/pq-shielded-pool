@@ -52,8 +52,8 @@ it is the payer.
 
 Usage (append --dry-run to any to simulate without submitting):
   pool_frametx.py <rpc> deploy-config.json fixture.json shield   <priv>
-  pool_frametx.py <rpc> deploy-config.json fixture.json transfer <pool_sender_priv>
-  pool_frametx.py <rpc> deploy-config.json fixture.json withdraw <pool_sender_priv>
+  pool_frametx.py <rpc> deploy-config.json fixture.json transfer <pool_sender_priv> [--paymaster 0x...]
+  pool_frametx.py <rpc> deploy-config.json fixture.json withdraw <pool_sender_priv> [--paymaster 0x...]
 """
 import json
 import subprocess
@@ -327,6 +327,26 @@ def main():
     pool = int(cfg["pool"], 16)
     pk = keys.PrivateKey(bytes.fromhex(priv.removeprefix("0x")))
     dry = "--dry-run" in sys.argv
+    paymaster = cfg.get("paymaster")
+    if "--paymaster" in sys.argv:
+        i = sys.argv.index("--paymaster")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("--paymaster requires an address")
+        paymaster = sys.argv[i + 1]
+    for arg in sys.argv[6:]:
+        if arg.startswith("--paymaster="):
+            paymaster = arg.split("=", 1)[1]
+    if op in ("transfer", "withdraw"):
+        if not paymaster:
+            raise SystemExit("spend requires cfg.paymaster or --paymaster 0x...")
+        try:
+            paymaster_int = int(paymaster, 16)
+        except ValueError:
+            raise SystemExit(f"invalid paymaster address: {paymaster}") from None
+        if paymaster_int == 0 or paymaster_int >= 1 << 160:
+            raise SystemExit(f"invalid paymaster address: {paymaster}")
+    else:
+        paymaster_int = None
 
     def spend_setup(op_name):
         """Protocol nonces, verify frame, and recent-root reference for a
@@ -338,7 +358,7 @@ def main():
         facts in the SENDER frame via EnvelopeProbe."""
         e = fix[op_name]
         protocol_nonces = sorted([int(e["nf1"], 16), int(e["nf2"], 16)])  # strictly increasing
-        verify = (int(cfg["paymaster"], 16),
+        verify = (paymaster_int,
                   cast_calldata(f"verifyProofOnly({SPEND_TUPLE})", spend_args(e)))
         refs = [recent_root_ref(url, cfg, {"slot": cfg[f"_slot_{op_name}"], "root": e["root"]})]
         return e, protocol_nonces, verify, refs
@@ -350,14 +370,14 @@ def main():
         build_and_send(url, pk, pool, value, calldata, dry_run=dry)
     elif op == "transfer":
         e, protocol_nonces, verify, refs = spend_setup("transfer")
-        calldata = cast_calldata(f"transfer({SPEND_TUPLE},address)", spend_args(e), cfg["paymaster"])
-        print("join-split transfer via faithful frame tx (proof verified on-chain)")
+        calldata = cast_calldata(f"transfer({SPEND_TUPLE},address)", spend_args(e), paymaster)
+        print(f"join-split transfer via faithful frame tx (payer {paymaster}, proof verified on-chain)")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs, dry_run=dry)
     elif op == "withdraw":
         e, protocol_nonces, verify, refs = spend_setup("withdraw")
         calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address,address)", spend_args(e),
-                                 fix["recipient"], cfg["paymaster"])
-        print("join-split withdraw via faithful frame tx")
+                                 fix["recipient"], paymaster)
+        print(f"join-split withdraw via faithful frame tx (payer {paymaster})")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs, dry_run=dry)
     else:
         raise SystemExit(f"unknown op {op}")

@@ -384,6 +384,35 @@ contract ShieldedPoolBN254Test {
         assertTrue(pool.feeCredit(address(pm)) == 0, "credit cleared after push");
     }
 
+    /// Fee routing is selected per spend, not pinned in the pool. This models
+    /// two independently deployed proof paymasters: each binds its own address
+    /// into the SENDER calldata and receives only the fee for the spend it paid.
+    function test_distinct_paymasters_receive_only_their_bound_fees() public {
+        PassiveReceiver paymasterA = new PassiveReceiver();
+        PassiveReceiver paymasterB = new PassiveReceiver();
+
+        ShieldedPool.Spend memory ts = _shieldA();
+        vm.prank(POOL_SENDER);
+        pool.transfer(ts, address(paymasterA));
+
+        ShieldedPool.Spend memory ws = _spendOf(".withdraw");
+        _arm(ws);
+        address recipient = vm.parseAddress(vm.parseJsonString(j, ".recipient"));
+        vm.prank(POOL_SENDER);
+        pool.withdraw(ws, recipient, address(paymasterB));
+
+        assertTrue(pool.feeCredit(address(paymasterA)) == ts.fee, "paymaster A received only transfer fee");
+        assertTrue(pool.feeCredit(address(paymasterB)) == ws.fee, "paymaster B received only withdraw fee");
+
+        uint256 aBefore = address(paymasterA).balance;
+        uint256 bBefore = address(paymasterB).balance;
+        vm.prank(address(paymasterB));
+        pool.claimFee(payable(address(paymasterA)));
+        assertTrue(address(paymasterA).balance == aBefore + ts.fee, "A's credit can only be pushed to A");
+        assertTrue(address(paymasterB).balance == bBefore, "B cannot redirect A's credit");
+        assertTrue(pool.feeCredit(address(paymasterB)) == ws.fee, "B's credit remains separate");
+    }
+
     function test_failed_fee_claim_preserves_credit() public {
         ShieldedPool.Spend memory s = _shieldA();
         vm.prank(POOL_SENDER);

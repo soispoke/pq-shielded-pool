@@ -1286,3 +1286,17 @@ most time were self-inflicted or diagnosable: fund from the genesis set (not the
 faucet), budget deploys at ~1,545 gas per runtime byte under the 2^24 per-tx
 cap, fund the pay-frame paymaster (it is the payer), and treat a
 perpetually-pending tx as a builder-side rejection with no error surface.
+
+## Per-transaction paymaster selection (2026-07-11)
+
+The pool does not pin frame 1 to one paymaster: settlement accepts a fee
+recipient, and each proof paymaster binds that recipient to its own address.
+The transaction builder now exposes `--paymaster 0x...`, overriding the
+deployment default and using the same address for the VERIFY payment frame and
+the settlement credit. The pool routes the address through `_feeRecipient`, a
+backward-compatible seam for replacing the calldata value with an authenticated
+resolved-payer TXPARAM when ethrex exposes it. A real-proof Forge lifecycle
+selects two passive paymaster addresses for consecutive spends and confirms
+their credits remain isolated and non-redirectable. This validates pool
+accounting and transaction construction locally; the Yul self-binding across
+two funded paymaster deployments still needs a live devnet run.

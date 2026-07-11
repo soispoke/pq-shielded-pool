@@ -313,10 +313,19 @@ contract ShieldedPool {
         }
         _publishRoot();
         if (s.fee != 0) {
-            if (feeRecipient == address(0)) revert ZeroFeeRecipient();
-            feeCredit[feeRecipient] += s.fee;
-            emit FeeCredited(feeRecipient, s.fee);
+            address resolvedFeeRecipient = _feeRecipient(feeRecipient);
+            if (resolvedFeeRecipient == address(0)) revert ZeroFeeRecipient();
+            feeCredit[resolvedFeeRecipient] += s.fee;
+            emit FeeCredited(resolvedFeeRecipient, s.fee);
         }
+    }
+
+    /// Fee-routing migration seam. Today the proof-gated paymaster binds the
+    /// calldata recipient to itself. Once frame transactions expose their
+    /// consensus-resolved payer as an authenticated TXPARAM, this function can
+    /// read that value and the external feeRecipient argument can be retired.
+    function _feeRecipient(address calldataRecipient) internal pure returns (address) {
+        return calldataRecipient;
     }
 
     // ---- encodings ----
