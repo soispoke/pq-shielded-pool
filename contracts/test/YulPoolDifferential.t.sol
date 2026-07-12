@@ -188,9 +188,11 @@ contract YulPoolDifferentialTest {
     /// with each pool's own pin and probe arming. Calldata differs only in
     /// the domain field (bound to each pool's address), so the comparison is
     /// on the revert selector: both implementations must fail the SAME check
-    /// first, all the way down the cascade to the shared verifier.
+    /// first through every settlement-side check. Proof validity is deliberately
+    /// excluded: the Yul architecture authenticates it once in frame 0, whose
+    /// frame opcodes cannot run under Forge, while Solidity rechecks it here.
     function testFuzz_spend_cascade_parity(uint8 mutation, bytes32 junk) public {
-        mutation = mutation % 8;
+        mutation = mutation % 7 + 1;
         ShieldedPool.Spend memory s;
         s.root = bytes32(uint256(junk) % P);
         s.nf1 = bytes32(uint256(keccak256(abi.encode(junk, "nf1"))) % P);
@@ -208,8 +210,6 @@ contract YulPoolDifferentialTest {
         if (mutation == 5) s.fee = 1 << 128; // ValueTooLarge
         bool wrongKeys = mutation == 6;
         bool wrongRef = mutation == 7;
-        // mutation == 0: everything plausible -> shared verifier says ProofInvalid
-
         bytes4 errS = _spendRevert(address(sol), POOL_SENDER, s, halt, wrongKeys, wrongRef);
         bytes4 errY = _spendRevert(yul, yul, s, halt, wrongKeys, wrongRef);
         assertTrue(errS == errY, "revert cascade diverged");

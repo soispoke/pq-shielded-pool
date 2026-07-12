@@ -63,6 +63,43 @@ contract PoseidonT4Shim {
     }
 }
 
+/// Payout recipient that tries to re-enter both settlement entrypoints while
+/// the pool is paying a pull credit. The nested calls originate from this
+/// contract, not from the pool, even though the outer payout CALL was issued
+/// by the pool. Both must therefore fail the pool-as-sender caller check.
+contract ReentrantSettlementProbe {
+    address public target;
+    bytes public transferCall;
+    bytes public withdrawCall;
+    bool public attempted;
+    bool public transferSucceeded;
+    bool public withdrawSucceeded;
+    bytes4 public transferError;
+    bytes4 public withdrawError;
+
+    function arm(address target_, bytes calldata transferCall_, bytes calldata withdrawCall_) external {
+        target = target_;
+        transferCall = transferCall_;
+        withdrawCall = withdrawCall_;
+    }
+
+    receive() external payable {
+        attempted = true;
+        bytes memory ret;
+        (transferSucceeded, ret) = target.call(transferCall);
+        transferError = _selector(ret);
+        (withdrawSucceeded, ret) = target.call(withdrawCall);
+        withdrawError = _selector(ret);
+    }
+
+    function _selector(bytes memory ret) private pure returns (bytes4 out) {
+        if (ret.length < 4) return bytes4(0);
+        assembly {
+            out := mload(add(ret, 32))
+        }
+    }
+}
+
 /// The ShieldedPool.t.sol attack battery, ported to the Yul pool-as-sender
 /// (devnet/ShieldedPool.yul). Every behavioral test is the same; the
 /// adaptations are exactly the design deltas:
@@ -310,56 +347,50 @@ contract YulShieldedPoolTest {
         pool.transfer(s, SUBMITTER);
     }
 
-    function test_corrupted_proof_reverts() public {
+    function test_corrupted_proof_rejected_at_authentication() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.pA[0] = addmod(s.pA[0], 1, 21888242871839275222246405745257275088696311157297823662689037894645226208583);
         uint256 before = gasleft();
-        vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.verifyProofOnly(s);
         assertTrue(before - gasleft() < 1_500_000, "invalid proof consumed unbounded gas");
     }
 
     /// A valid proof cannot have its amounts re-priced: fee and publicAmount
     /// are public signals the proof binds, so tampering kills the proof.
-    function test_tampered_fee_reverts() public {
+    function test_tampered_fee_rejected_at_authentication() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.fee = s.fee + 1;
-        vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.verifyProofOnly(s);
     }
 
-    function test_tampered_outputs_revert() public {
+    function test_tampered_outputs_rejected_at_authentication() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.outCm1 = bytes32(uint256(12345));
-        vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.verifyProofOnly(s);
     }
 
     function test_wrong_domain_reverts_before_verifier() public {
         ShieldedPool.Spend memory s = _shieldA();
         s.domain = bytes32(uint256(s.domain) ^ 1);
-        vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.InvalidDomain.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.verifyProofOnly(s);
     }
 
     /// The root is bound by the PROOF, not only by the reference binding.
-    function test_referenced_but_unproven_root_reverts_in_verifier() public {
+    function test_referenced_but_unproven_root_rejected_at_authentication() public {
         ShieldedPool.Spend memory s = _shieldA();
         pool.shield{value: 1 ether}(bytes32(uint256(1)));
         s.root = pool.currentRoot();
-        _arm(s); // reference now carries the new root, so that check passes
-        vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.verifyProofOnly(s);
     }
 
     /// ctx and publicAmount are bound by the PROOF, not only by the shape
     /// checks.
-    function test_rebound_ctx_and_repriced_amount_revert_in_verifier() public {
+    function test_rebound_ctx_and_repriced_amount_rejected_at_authentication() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(address(pool));
         pool.transfer(ts, SUBMITTER);
@@ -367,17 +398,13 @@ contract YulShieldedPoolTest {
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         address payable evil = payable(address(0xBEEF));
         ws.ctx = pool.ctxFor(evil);
-        _arm(ws);
-        vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.withdraw(ws, evil, SUBMITTER);
+        pool.verifyProofOnly(ws);
 
         ShieldedPool.Spend memory wp = _spendOf(".withdraw");
         wp.publicAmount = wp.publicAmount + 1;
-        _arm(wp);
-        vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.withdraw(wp, vm.parseAddress(vm.parseJsonString(j, ".recipient")), SUBMITTER);
+        pool.verifyProofOnly(wp);
     }
 
     // ---- 5. operation-shape attacks ----
@@ -447,6 +474,35 @@ contract YulShieldedPoolTest {
         pool.claimFee(payable(address(pm)));
         assertTrue(address(pm).balance == before + s.fee, "credit pushed to passive recipient");
         assertTrue(pool.feeCredit(address(pm)) == 0, "credit cleared after push");
+    }
+
+    /// A payout CALL gives arbitrary recipient code control while the pool is
+    /// on the stack, but a callback into the pool has caller == recipient, not
+    /// caller == pool. Even ABI-valid transfer and withdraw payloads therefore
+    /// stop at NotPoolSender before reading the probe or verifying a proof.
+    function test_payout_reentrancy_cannot_enter_settlement_as_pool() public {
+        ReentrantSettlementProbe recipient = new ReentrantSettlementProbe();
+        ShieldedPool.Spend memory ts = _shieldA();
+        vm.prank(address(pool));
+        pool.transfer(ts, address(recipient));
+
+        ShieldedPool.Spend memory ws = _spendOf(".withdraw");
+        address withdrawalRecipient = vm.parseAddress(vm.parseJsonString(j, ".recipient"));
+        recipient.arm(
+            address(pool),
+            abi.encodeWithSelector(IYulPool.transfer.selector, ts, address(recipient)),
+            abi.encodeWithSelector(IYulPool.withdraw.selector, ws, withdrawalRecipient, address(recipient))
+        );
+
+        pool.claimFee(payable(address(recipient)));
+
+        assertTrue(recipient.attempted(), "recipient callback did not run");
+        assertTrue(!recipient.transferSucceeded(), "reentrant transfer entered settlement");
+        assertTrue(!recipient.withdrawSucceeded(), "reentrant withdraw entered settlement");
+        assertTrue(recipient.transferError() == ShieldedPool.NotPoolSender.selector, "wrong transfer rejection");
+        assertTrue(recipient.withdrawError() == ShieldedPool.NotPoolSender.selector, "wrong withdraw rejection");
+        assertTrue(address(recipient).balance == ts.fee, "recipient did not retain the paid credit");
+        assertTrue(pool.feeCredit(address(recipient)) == 0, "paid credit was not cleared");
     }
 
     /// Fee routing is selected per spend, not pinned in the pool.

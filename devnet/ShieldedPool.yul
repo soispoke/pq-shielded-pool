@@ -278,9 +278,11 @@ object "ShieldedPool" {
 
             // ================= proof verification ============================
             // Reads the Spend at calldata offset `base` (base=4 for a direct
-            // call, since Spend is a static 544-byte tuple). Canonicity + range
-            // + Groth16 over the nine public signals. No storage reads.
-            function verifySpend(base) {
+            // call, since Spend is a static 544-byte tuple). These cheap checks
+            // stay in settlement even though proof verification happens once,
+            // in frame 0: they preserve canonical ABI/state behavior without a
+            // second pairing call. No storage reads.
+            function validateSpend(base) {
                 let root := calldataload(add(base, 0))
                 let dom := calldataload(add(base, 32))
                 let nf1 := calldataload(add(base, 64))
@@ -301,6 +303,21 @@ object "ShieldedPool" {
                 if iszero(lt(ctx, P)) { fail(errNotCanonical()) }
                 if iszero(lt(pub, maxValue())) { fail(errValueTooLarge()) }
                 if iszero(lt(fee, maxValue())) { fail(errValueTooLarge()) }
+            }
+
+            // Canonical/range checks plus Groth16 over the nine public signals.
+            // Called by verifyProofOnly from the authenticated frame-0 path.
+            function verifySpend(base) {
+                validateSpend(base)
+                let root := calldataload(add(base, 0))
+                let dom := calldataload(add(base, 32))
+                let nf1 := calldataload(add(base, 64))
+                let nf2 := calldataload(add(base, 96))
+                let oc1 := calldataload(add(base, 128))
+                let oc2 := calldataload(add(base, 160))
+                let pub := calldataload(add(base, 192))
+                let fee := calldataload(add(base, 224))
+                let ctx := calldataload(add(base, 256))
                 // build verifyProof(uint256[2] a, uint256[2][2] b, uint256[2] c,
                 // uint256[9] input) at mem 0x80 (keep 0x00..0x80 scratch free).
                 let m := 0x80
@@ -330,8 +347,10 @@ object "ShieldedPool" {
             // return). The keyed nonces were consumed by the protocol at
             // payment approval; this checks THIS tx consumed exactly the proven
             // nullifiers, the proven root rode as the recent-root reference,
-            // and the proof holds. msg.sender must be the pool itself: the pool
-            // IS the sender, so the frame-2 self-call has caller() == address().
+            // nullifiers and the proven root rode as the recent-root reference.
+            // Proof validity was authenticated over this exact frame-2 tuple by
+            // the pool's frame-0 code before APPROVE_EXECUTION. msg.sender must
+            // be the pool itself, so the frame-2 self-call has caller() == address().
             function spendCheck(base) {
                 if iszero(eq(caller(), address())) { fail(errNotPoolSender()) }
                 let nf1 := calldataload(add(base, 64))
@@ -364,7 +383,7 @@ object "ShieldedPool" {
                 let root := calldataload(add(base, 0))
                 if or(or(iszero(eq(refCount, 1)), iszero(eq(refSource, sourceId()))),
                        iszero(eq(refRoot, root))) { fail(errRootNotBound()) }
-                verifySpend(base)
+                validateSpend(base)
                 emitNoteSpent(nf1)
                 emitNoteSpent(nf2)
             }

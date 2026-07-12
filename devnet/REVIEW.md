@@ -1597,17 +1597,70 @@ the same signed envelope. Settlement executes as that frame 2, so the
 tuple it settles is the tuple whose proof was verified, and trusting
 frame 0 adds no third party.
 
-NOT taken. A focused soundness review owes three checks first: (1) the
-scope-0x2 approver-target == tx.sender rule re-verified in ethrex source
-at the pinned commit (checked for the shared-sender design, not since);
-(2) a written argument that no path yields caller() == pool outside the
-SENDER frame (the claim payouts hand msg.sender == pool to arbitrary
-recipient code, which cannot make the pool issue a call, but this belongs
-on paper, not in memory); (3) the probe-side envelope checks stay
-regardless, they carry exactly-once and non-frame rejection, not proof
-validity. Also on the efficiency table, from the same review: batched
-spends with batched Groth16 verification, batched leaf insertion,
-frame-calldata reuse instead of the duplicated proof tuple in the pay
-frame, storage and event trims, LeanIMT (already surveyed), and the
-authenticated payer TXPARAM that retires the calldata fee-recipient
-machinery (already a documented seam).
+The focused gate passed on 2026-07-12 and the change was then taken and
+measured live (below). The public Hegotá branch was pinned at ethrex
+`2d64fba453caf3eaf91fec135490ccff0dbf2412`. Its runtime approval handler
+checks `frame_target == tx.sender` before setting `sender_approved` for
+both scope 0x2 and scope 0x3
+([source](https://github.com/lambdaclass/ethrex/blob/2d64fba453caf3eaf91fec135490ccff0dbf2412/crates/vm/levm/src/opcode_handlers/frame_tx.rs#L121-L173)).
+The opcode handler first requires the executing call frame's destination
+to equal the resolved frame target, so a helper reached below the target
+cannot issue the approval on its behalf
+([source](https://github.com/lambdaclass/ethrex/blob/2d64fba453caf3eaf91fec135490ccff0dbf2412/crates/vm/levm/src/opcode_handlers/frame_tx.rs#L204-L249)).
+Mempool prefix validation repeats the target-to-sender check for every
+VERIFY role carrying the execution bit, with anti-regression tests for
+both only-verify and self-verify shapes; both tests pass at the pinned
+revision. During execution, a SENDER frame
+is entered only after `sender_approved` and receives `tx.sender` as its
+caller
+([source](https://github.com/lambdaclass/ethrex/blob/2d64fba453caf3eaf91fec135490ccff0dbf2412/crates/vm/levm/src/vm.rs#L1636-L1652)).
+This matches EIP-8141's explicit rule that APPROVE_EXECUTION is valid only
+when the resolved target equals `tx.sender`.
+
+The pool call graph supplies the second half. Its external calls target
+only the two immutable Poseidon libraries, the immutable verifier, the
+immutable envelope probe, the recent-root predeploy, arbitrary pull-credit
+recipients, and one self-staticcall whose selector and calldata are fixed
+to `verifyProofOnly`. A callback from any library, verifier, probe, or
+payout recipient has that callee as `caller`, not the pool. The sole path
+with `caller == pool` below frame 0 is the fixed self-staticcall, which is
+static and cannot enter either settlement selector. No pool path performs
+an arbitrary self-call, DELEGATECALL, CALLCODE, CREATE, or SELFDESTRUCT.
+`test_payout_reentrancy_cannot_enter_settlement_as_pool` exercises the
+only adversarial external-control edge: a fee recipient callbacks with
+ABI-valid transfer and withdraw payloads while the pool is paying it, and
+both stop at `NotPoolSender` while the payout succeeds.
+
+The conclusion is narrow. For this immutable pool-as-sender runtime,
+frame-0 proof verification authenticates the exact frame-2 Spend strongly
+enough that the settlement Groth16 check is redundant. It would not carry
+over automatically to an upgradeable dispatcher or mutable implementation
+binding. The removal retains everything else: `spendCheck`'s caller, frame
+index/count/target, keyed-nonce set and recent-root bindings (exactly-once
+settlement and non-frame rejection, independent of proof validity), and
+the canonicity/range checks, split into `validateSpend` so settlement
+keeps them without the pairing call while `verifyProofOnly` keeps the full
+check for frame 0 and the paymaster carrier. The proof-attack tests moved
+to the authentication boundary (`*_rejected_at_authentication` against
+`verifyProofOnly`), the differential cascade excludes proof validity by
+design (Solidity still rechecks in settlement, the Yul architecture
+verifies once in frame 0, whose opcodes Forge cannot run), and the
+payout-reentrancy regression pins the caller() == pool argument.
+
+Measured live on a fresh pool (`0x09bb66c0…`, Poseidon/verifier/probe
+reused, deployed code byte-exact): transfer 1,494,000 gas against
+1,735,435 on the double-verification pool (-241,435, -13.9%), withdraw
+1,633,984 against 1,875,441 (-241,457, -12.9%), the settle frame dropping
+1,402,141 to 1,160,688. The adversarial cases still fail closed with
+`payer=None` in the validation prefix, now provably on frame 0 alone: a
+flipped proof bit and a 5M down-gassed settle frame are both rejected
+before payment approval. Same-block inclusion reconfirmed (two disjoint
+race transfers both mined in block 152407) and both replays rejected at
+admission with `Nonce mismatch: expected 1, got 0`. Inputs and mined raws
+archived byte-exact in `devnet/vectors/2026-07-12-single-verification/`.
+
+Also on the efficiency table: batched spends with batched Groth16
+verification, batched leaf insertion, frame-calldata reuse instead of the
+duplicated proof tuple in the pay frame, storage and event trims, LeanIMT
+(already surveyed), and the authenticated payer TXPARAM that retires the
+calldata fee-recipient machinery (already a documented seam).
