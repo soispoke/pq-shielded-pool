@@ -14,6 +14,7 @@ via_ir = true
 fs_permissions = [
     { access = "read", path = "../vectors" },
     { access = "read", path = "../wallet" },
+    { access = "read", path = "../devnet/build" },
 ]
 
 # Legacy-codegen profile for the split Poseidon libraries (PoseidonT3/T4):

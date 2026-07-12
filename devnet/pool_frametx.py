@@ -6,16 +6,20 @@ Each pool interaction rides a type-0x06 frame transaction:
 
   shield:   frames = [ VERIFY(target=sender, self-verify sig -> APPROVE),
                        SENDER(target=pool, value=amount, data=shield(inner)) ]
-  transfer: frames = [ VERIFY(target=POOL_SENDER, proof authorization, execution),
+  transfer: frames = [ VERIFY(target=pool, proof authorization, execution),
                        VERIFY(target=paymaster, bound Spend carrier, payment),
                        SENDER(target=pool, value=0, data=transfer(Spend, feeRecipient)) ]
   withdraw: same, data=withdraw(Spend, recipient, feeRecipient)
 
-For the production shape, frame 0 targets SharedPoolSender: it verifies the
-proof, exact nonce-key set, recent-root reference and settlement data before
-approving execution. The SENDER frame then executes the pool call as that
-shared tx.sender, giving every nullifier one EIP-8250 namespace without an
-operator-held key. The legacy EOA sender remains usable for test deployments.
+For spends the pool IS the transaction sender (EIP-8250's intended shape:
+FrameTx { sender = PrivacyPool, nonce_keys = [nA, nB], nonce_seq = 0 }). The
+pool's frame-0 VERIFY (empty calldata) authenticates the proof, exact
+nonce-key set, recent-root reference and settlement data before approving
+execution; the SENDER frame is then a self-call that settles. Every
+nullifier gets one EIP-8250 namespace under the pool's address without an
+operator-held key, so spends with disjoint nullifiers are includable in the
+same block. Spends default to sender = cfg pool; --sender overrides (for
+adversarial vectors or legacy split-sender deployments).
 
 The Groth16 proof is verified INSIDE the pool call (BN254 pairing precompiles),
 so no attester is needed: the whole spend, proof check
@@ -56,9 +60,9 @@ Usage (append --dry-run to any to simulate without submitting):
   pool_frametx.py <rpc> deploy-config.json fixture.json withdraw <signer_priv> [--sender 0x...] [--paymaster 0x...]
 
 `--sender` decouples the authenticated frame sender from the outer signature's
-signer. It is intended for a deployed SharedPoolSender: the contract's VERIFY
-frame grants execution authority, while any submitter supplies the one outer
-signature the current proof-paymaster grammar requires.
+signer. Spends default it to the pool itself: the pool's VERIFY frame grants
+execution authority, while any submitter supplies the one outer signature the
+current proof-paymaster grammar requires.
 
 `--max-fee-per-gas` and `--max-priority-fee-per-gas` help construct repeatable
 fee-boundary tests. The builder prints the exact TXPARAM(0x06) value, including
@@ -71,6 +75,15 @@ rejection vectors. `--settle-gas N` overrides the pinned 10M settlement frame
 gas, for down-gassing vectors. `--save-raw <path>` writes the signed raw
 transaction bytes, so mined transactions can be replayed as admission-level
 rejection vectors and archived.
+
+Nonce-race flags (see wallet/gen_nonce_race.py): `--note N` shields the note at
+index N of a fixture's `shields` array (two notes into one tree). `--spend-key
+KEY` drives the spend from fix[KEY] instead of fix[op], so the fixture's second
+transfer `transfer_c` shares the harness. `--root-slot N` sets the recent-root
+publication block directly (both race transfers bind the same root R, so they
+share the block where the second shield completed the tree). Two transfers that
+consume disjoint nullifier sets are both admissible from one shared sender at
+nonce_seq 0 in either order: no sequential account nonce serializes them.
 """
 import json
 import subprocess
@@ -368,6 +381,24 @@ def main():
     settle_gas_override = None
     save_raw = None
     nonce_keys_override = None
+    note_index = None
+    spend_key_override = None
+    root_slot_override = None
+    if "--note" in sys.argv:
+        i = sys.argv.index("--note")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("--note requires an index into fixture['shields']")
+        note_index = int(sys.argv[i + 1], 0)
+    if "--spend-key" in sys.argv:
+        i = sys.argv.index("--spend-key")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("--spend-key requires a fixture key (e.g. transfer_c)")
+        spend_key_override = sys.argv[i + 1]
+    if "--root-slot" in sys.argv:
+        i = sys.argv.index("--root-slot")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("--root-slot requires the block number that published the root")
+        root_slot_override = int(sys.argv[i + 1], 0)
     if "--settle-gas" in sys.argv:
         i = sys.argv.index("--settle-gas")
         if i + 1 >= len(sys.argv):
@@ -411,6 +442,10 @@ def main():
         if arg.startswith("--paymaster="):
             paymaster = arg.split("=", 1)[1]
     if op in ("transfer", "withdraw"):
+        # The pool is the sender (frame-0 VERIFY identity and settle target in
+        # one contract); --sender still overrides for adversarial vectors.
+        if sender_override is None:
+            sender_override = pool
         if not paymaster:
             raise SystemExit("spend requires cfg.paymaster or --paymaster 0x...")
         try:
@@ -429,17 +464,35 @@ def main():
         (NONCEKEYLOAD) and the declared recent-root reference (pool source_id +
         proven root, RECENTROOTREFLOAD), and staticcalls verifyProofOnly (proof
         + canonicity, no storage read). The pool re-binds the same envelope
-        facts in the SENDER frame via EnvelopeProbe."""
-        e = fix[op_name]
+        facts in the SENDER frame via EnvelopeProbe.
+
+        `--spend-key KEY` reads the spend entry from fix[KEY] instead of
+        fix[op_name] (the nonce-race fixture carries two transfers, `transfer`
+        and `transfer_c`, against one shared root). `--root-slot N` overrides
+        the recent-root publication block: both race transfers bind the SAME
+        root R, so they share the block where the second shield completed the
+        tree, rather than distinct cfg _slot_transfer/_slot_withdraw values."""
+        fix_key = spend_key_override if spend_key_override is not None else op_name
+        e = fix[fix_key]
         protocol_nonces = sorted([int(e["nf1"], 16), int(e["nf2"], 16)])  # strictly increasing
         verify = (paymaster_int,
                   cast_calldata(f"verifyProofOnly({SPEND_TUPLE})", spend_args(e)))
-        refs = [recent_root_ref(url, cfg, {"slot": cfg[f"_slot_{op_name}"], "root": e["root"]})]
+        slot = root_slot_override if root_slot_override is not None else cfg[f"_slot_{op_name}"]
+        refs = [recent_root_ref(url, cfg, {"slot": slot, "root": e["root"]})]
         return e, protocol_nonces, verify, refs
 
     if op == "shield":
-        value = int(fix["shield_value"])
-        calldata = cast_calldata("shield(bytes32)", fix["inner_a"])
+        if "shields" in fix:
+            # nonce-race fixture: shield the note at --note N from the shields
+            # array (both notes go into one tree; the second shield publishes
+            # the shared root R the two race transfers reference).
+            if note_index is None:
+                raise SystemExit("this fixture has a 'shields' array; pass --note N (0-based)")
+            s = fix["shields"][note_index]
+            value, inner = int(s["value"]), s["inner"]
+        else:
+            value, inner = int(fix["shield_value"]), fix["inner_a"]
+        calldata = cast_calldata("shield(bytes32)", inner)
         print(f"shield {value} wei via frame tx -> pool {cfg['pool']}")
         build_and_send(url, pk, pool, value, calldata, dry_run=dry)
     elif op == "transfer":

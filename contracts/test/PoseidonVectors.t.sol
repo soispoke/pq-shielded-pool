@@ -29,7 +29,9 @@ contract PoseidonVectorsTest {
     function _arr(string memory json, string memory key) internal pure returns (uint256[] memory out) {
         string[] memory v = vm.parseJsonStringArray(json, key);
         out = new uint256[](v.length);
-        for (uint256 i = 0; i < v.length; i++) out[i] = vm.parseUint(v[i]);
+        for (uint256 i = 0; i < v.length; i++) {
+            out[i] = vm.parseUint(v[i]);
+        }
     }
 
     function test_poseidon2_vectors() external view {
@@ -38,8 +40,9 @@ contract PoseidonVectorsTest {
             string memory idx = vm.toString(k);
             uint256[] memory input = _arr(json, string.concat(".poseidon2[", idx, "].in"));
             uint256 expected = _u(json, string.concat(".poseidon2[", idx, "].out"));
-            require(PoseidonBN254.hash2(input[0], input[1]) == expected,
-                    string.concat("poseidon2 mismatch at vector ", idx));
+            require(
+                PoseidonBN254.hash2(input[0], input[1]) == expected, string.concat("poseidon2 mismatch at vector ", idx)
+            );
         }
     }
 
@@ -49,8 +52,10 @@ contract PoseidonVectorsTest {
             string memory idx = vm.toString(k);
             uint256[] memory input = _arr(json, string.concat(".poseidon3[", idx, "].in"));
             uint256 expected = _u(json, string.concat(".poseidon3[", idx, "].out"));
-            require(PoseidonBN254.hash3(input[0], input[1], input[2]) == expected,
-                    string.concat("poseidon3 mismatch at vector ", idx));
+            require(
+                PoseidonBN254.hash3(input[0], input[1], input[2]) == expected,
+                string.concat("poseidon3 mismatch at vector ", idx)
+            );
         }
     }
 
@@ -76,11 +81,9 @@ contract PoseidonVectorsTest {
         uint256 nf2 = PoseidonBN254.hash3(3, domainKey, PoseidonBN254.hash3(2, inner, 0));
         require(nf2 == _u(json, ".pool_chain.nf2"), "dummy nf mismatch");
 
-        uint256 outCm1 = PoseidonBN254.hash3(
-            2, _u(json, ".pool_chain.out_inner1"), _u(json, ".pool_chain.out_value1"));
+        uint256 outCm1 = PoseidonBN254.hash3(2, _u(json, ".pool_chain.out_inner1"), _u(json, ".pool_chain.out_value1"));
         require(outCm1 == _u(json, ".pool_chain.out_cm1"), "out_cm1 mismatch");
-        uint256 outCm2 = PoseidonBN254.hash3(
-            2, _u(json, ".pool_chain.out_inner2"), _u(json, ".pool_chain.out_value2"));
+        uint256 outCm2 = PoseidonBN254.hash3(2, _u(json, ".pool_chain.out_inner2"), _u(json, ".pool_chain.out_value2"));
         require(outCm2 == _u(json, ".pool_chain.out_cm2"), "out_cm2 mismatch");
     }
 

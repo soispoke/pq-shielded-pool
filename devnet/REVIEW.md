@@ -1450,3 +1450,118 @@ README classifies replayability honestly: nullifier consumption freezes the
 bad-proof, down-gas, and fee-boundary vectors as recorded history, which is
 the design working as intended. Future live suites should write their vectors
 directory in the same pass as the run itself.
+
+## No nonce race between private spends on one shared sender (2026-07-12)
+
+The shared sender exists so many users transact through one address without an
+operator key. The open question that leaves is whether they then contend for
+that address's nonce: if the sender carried a single sequential account nonce,
+two users' spends would race for the next value and the loser would be
+rejected, reintroducing the serialization the design set out to remove. They do
+not, because a spend's nonce is not the account nonce. Each spend declares its
+two nullifiers as its EIP-8250 keyed-nonce set at sequence zero, so two spends
+with disjoint nullifiers occupy disjoint namespaces under the shared address
+and are both admissible in any order. This run proves that end to end on the
+live deployment.
+
+Two 0.25 ETH notes A and C were shielded into the existing suite pool
+`0x7cFD0Ea4…` (`0xc08d30c1…` block 149768 leaf 5; `0x39cc320f…` block 149769
+leaf 6). The fixture generator seeds its Merkle tree from the pool's five prior
+`LeafAppended` leaves and asserts the reconstructed root equals the on-chain
+`currentRoot` before appending A and C, so the fixture root R
+`0x28212f1c…` is the root the pool actually held after both shields; block
+149769 published it to the EIP-8272 predeploy. Two independent transfers then
+proved membership against that one R with disjoint nullifier sets.
+
+Before mining, both simulated valid at the same head: transfer A
+`valid=True payer=paymasterA`, transfer C `valid=True payer=paymasterB`, each
+at `nonce_seq 0`, neither depending on the other having landed. Both then mined
+from sender `0x27cc5Cd9…` at `nonce_seq 0`: A `0xef2c645b…` block 149804
+(1,815,133 gas, paymaster A, nullifiers `0x22ee9ffc…`/`0x0710bb15…`, outputs at
+leaves 7-8) and C `0xd08e00dd…` block 149807 (1,648,914 gas, independently
+selected paymaster B, disjoint nullifiers `0x0bfff7df…`/`0x0c64520a…`, outputs
+at leaves 9-10). Two transactions from one sender both mined at sequence zero,
+which a shared account nonce cannot express: the second would need sequence one
+and reject at zero. Replaying either mined raw now produces exactly that
+sequential rejection, `Nonce mismatch: expected 1, got 0`, because the spend's
+keys are consumed and its sequence has advanced to one, while the other spend's
+namespace was never touched. Disjoint keyed nonces, not ordering, is what
+separates them.
+
+The run reused the suite paymasters and a zero-balance throwaway envelope
+signer; the shields were funded from the well-known genesis test key. It added
+three flags to `pool_frametx.py` (`--note` to shield from a fixture's `shields`
+array, `--spend-key` to drive the fixture's second transfer, `--root-slot` to
+bind both spends to the shared root's publication block) and taught
+`wallet/gen_nonce_race.py` to reconstruct the live tree. Inputs and recorded
+outputs are archived byte-exact in
+`devnet/vectors/2026-07-12-nonce-race/`. The 0.475 ETH now in output notes at
+leaves 7-10 is reconstructable from the generator's deterministic seed; 0.025
+ETH went to the two paymasters as the proof-bound fees.
+
+## Pool-as-sender: the pool is the transaction sender, same-block spends proven (2026-07-12)
+
+The slides (ACDE #240) specify `FrameTx { sender = PrivacyPool }`: one
+contract is both the frame-0 VERIFY identity and the settlement target. The
+suite deployment instead used a separate `SharedPoolSender` as the sender
+with the pool pinned behind it, a split that existed only because Solidity
+cannot emit the frame-tx opcodes. This run closed that gap: `ShieldedPool.yul`
+reimplements the pool as a single Yul object that reads the envelope opcodes,
+verifies the proof, emits `APPROVE_EXECUTION`, and settles the spend as a
+frame-2 self-call (`msg.sender == address(this)` replaces the `POOL_SENDER`
+pin). Poseidon and the Groth16 verifier remain the deployed Solidity
+contracts, called from Yul. This is a RESEARCH IMPLEMENTATION for the
+disposable devnet: only the opcode-facing shell must be Yul, so the preferred
+production architecture is a thin immutable Yul dispatcher at the pool
+address delegating settlement to the audited Solidity implementation; the
+monolith exists to demonstrate the design end to end (header of
+ShieldedPool.yul states this).
+
+Equivalence to `ShieldedPool.sol` is enforced two ways, with the Solidity
+implementation as the spec. The ported battery (`YulShieldedPool.t.sol`, 41
+tests) drives the Yul pool with the fixture's real proofs at the same CREATE
+slot so the domain binds, asserting identical roots, named error selectors,
+events and ordering. The differential harness (`YulPoolDifferential.t.sol`)
+deploys both pools side by side and fuzzes identical raw calldata through
+them, comparing success, returndata bytes, and tree state word-for-word;
+that pass forced the Yul dispatcher to reproduce solc's decoder exactly
+(per-selector minimum calldata lengths, dirty-address-word rejection instead
+of masking, callvalue guards on non-payables, the 0..20 `filledSubtrees`
+bounds with identical revert encoding). Hand-written Yul cost three real
+bugs before any deployment, all the same class (a helper clobbering scratch
+memory another expression still held): the immutable loader corrupting the
+Poseidon call selector, a wrong delegatecall "fix" reverted after a direct
+test, and `domainVal()` corrupted by `sourceId()` mid-buffer, which would
+have broken every live spend and which the ported suite caught through its
+fixture-domain fail-fast.
+
+Deployment (fresh stack from genesis account #3; addresses and slots in
+`devnet/vectors/2026-07-12-pool-as-sender/`) surfaced one tooling defect:
+the deployed pool code failed the byte-equality check not because the deploy
+was wrong but because the naive first-0xfe split used to derive the expected
+runtime is unsound for this object; the optimizer hoists the constructor's
+zeroRoot constant into a data segment appended after the runtime subobject
+(and the init contains eleven incidental 0xfe bytes). The check now derives
+expected code by deployment simulation (`cast call --create`), which
+confirmed the on-chain runtime byte-exact; `yul_pool.py` documents why it
+deliberately has no `--runtime` mode.
+
+The live run then validated the whole design. Smoke: shield `0x4f604bf4…`
+(block 151509), transfer `0x1dd7a3a6…` (151513, paymaster A), withdraw
+`0xd4a6ff2d…` (151517, paymaster B), every spend carrying
+`sender = the pool itself`, frame-0 verify+approve executing the pool's own
+code at ~247k of the 300k budget; credits exact, claims paid, pool balance
+ended at exactly the change note. The headline: two transfers proven against
+one root with disjoint nullifier sets, both dry-run valid at head 151545,
+submitted back-to-back through the public RPC, were BOTH pending
+concurrently from the one pool sender and BOTH MINED IN BLOCK 151546
+(txIndex 0 and 1, status 1). The prior nonce-race run had proven only
+replay independence (its transfers were submitted sequentially and landed
+in different blocks); this proves same-block builder handling. It also
+answers a mempool-policy question empirically: EIP-8250 leaves EIP-8141's
+one-pending-per-sender guidance untouched, but the public Hegotá endpoint
+and its builder pipeline accepted concurrent disjoint-key transactions from
+one sender. That is one node configuration's policy, not evidence about
+propagation behavior across other ethrex configurations. Replaying either mined raw is rejected at admission with
+`Nonce mismatch: expected 1, got 0`, the consumed lane advanced, the other
+untouched. Raws archived byte-exact in the vector directory.

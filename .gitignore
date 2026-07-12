@@ -5,3 +5,7 @@ __pycache__/
 venv/
 build/
 wallet/artifacts/
+
+# the Yul pool initcode artifact is read by the forge suites; keep it tracked
+!devnet/build/
+!devnet/build/shielded_pool_init.hex
