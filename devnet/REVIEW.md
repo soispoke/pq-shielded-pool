@@ -1664,3 +1664,58 @@ verification, batched leaf insertion, frame-calldata reuse instead of the
 duplicated proof tuple in the pay frame, storage and event trims, LeanIMT
 (already surveyed), and the authenticated payer TXPARAM that retires the
 calldata fee-recipient machinery (already a documented seam).
+
+## Dispatcher refactor: the delegatecall-in-VERIFY wall, and the seam that survives it (2026-07-12)
+
+The roadmap's next production step was "thin immutable Yul dispatcher +
+Solidity settlement," and it is now built and live-validated. The 5116-byte
+monolith (ShieldedPool.yul) is split into a 1425-byte immutable dispatcher
+(ShieldedPoolDispatcher.yul) at the pool address and a 7352-byte Solidity
+implementation (ShieldedPoolLogic.sol) reached only by DELEGATECALL. Storage,
+address, msg.sender, and msg.value are the pool's when the logic runs;
+sourceId/domain became runtime functions (immutables would resolve to the
+logic's own deploy address, wrong under delegatecall). The hand-audited
+fund-holding surface drops from ~5KB of Yul to ~1.4KB, and the settlement
+equivalence oracle collapses to one: the Solidity logic IS the settlement,
+with DispatcherPool.t.sol (25 tests: ported battery, storage-layout contract,
+delegatecall-context identity, payout reentrancy, shield-parity vs the
+ShieldedPool.sol spec) as the check.
+
+The instructive part is what the local suite could not catch. The FIRST
+dispatcher delegated everything, including the frame-0 proof check: frame-0
+self-staticcalled verifyProofOnly, which the proxy DELEGATECALLed to the logic
+so it would run with address(this) == the pool and compute the right domain.
+That deploy (0x110f9fd7) passed ethrex_simulateFrameTransaction (valid=True,
+frame-0 251,729 gas, status success) but the builder never included a single
+transfer: pending 50+ blocks while the chain advanced. ethrex's validation
+observer bans DELEGATECALL inside a VERIFY frame (the delegate target's code
+could vary between simulation and inclusion, breaking validation determinism);
+the dry-run simulator does not enforce it, the builder does, and a validation
+rejection is silently dropped rather than errored (the finding-4 pattern).
+
+The fix respects the real seam: the VERIFY frame's work (parse envelope,
+verify proof, approve) MUST run at the sender address in Yul under the
+observer, so proof verification is inlined into the dispatcher as a direct
+STATICCALL to the immutable Groth16 verifier (observer-legal, exactly what the
+monolith and SharedPoolSender did live), with domain computed in Yul. The
+dispatcher carries the verifier as a second immutable (tail = impl ||
+verifier) and grew 889 -> 1425 bytes. Settlement stays delegated. The inline
+dispatcher (0xe3275ba1, byte-exact vs cast call --create) then mined the full
+smoke lifecycle with sender = the pool (shield 152950, transfer 152952 at
+1,501,073 gas, withdraw 152955 at 1,641,117), ~7k gas (~0.45%) above the
+monolith single-verification pool for the delegatecall hop; reproved same-block
+inclusion (two disjoint-nullifier transfers both in block 152969); and rejected
+both replays at admission. Archived in
+devnet/vectors/2026-07-12-dispatcher/.
+
+Two honest notes. The single-verification argument does NOT carry over for
+free: it now rests on the DISPATCHER's frame-0 code and its verifier binding
+being immutable (both baked in the code tail, never stored), not on "one
+monolithic contract." That holds for this deployment and is stated in
+ShieldedPoolLogic's _spend comment. And the live flipped-proof / down-gassed
+adversarial cases were confounded (rejected on Nonce mismatch, because the
+reused race nullifiers were already consumed, before frame-0's proof check
+runs); frame-0's proof-rejection logic is covered by the forge suite and is
+the same inline-staticcall mechanism the monolith proved live, but a clean
+live proof-rejection on a fresh note (needing live-tree reconstruction) was
+not run.
