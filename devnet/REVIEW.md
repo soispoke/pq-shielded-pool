@@ -1384,3 +1384,54 @@ notes and are not validation evidence. Required completion with a fresh pair:
 an honest arbitrary-signer spend, bad proof and wrong-key cases through a
 malicious self-funded payer with `payer=None`, replay rejection, and fee values
 immediately below and at `TXPARAM(0x06)`.
+
+## Production shared sender validated live (2026-07-12)
+
+The full adversarial suite ran on a fresh Hegotá deployment of the final
+gas-bound runtime, from a disposable deployer funded out of the well-known
+genesis account. The circular bind deployed as designed: SharedPoolSender
+`0x27cc5Cd9…` (deployer nonce 5) embeds the pool's precomputed CREATE address,
+and the pool `0x7cFD0Ea4…` (nonce 6) landed on exactly that address with the
+sender as its immutable `POOL_SENDER`. Both runtimes were verified byte-equal
+to the checked-in generators. Two independent paymasters (`0x66e5efe3…`,
+`0xc72a24f2…`, 0.15 ETH each) and a 13-byte always-approve malicious payer
+(`0x7395a10b…`, runtime `3615600b5760015f5faa005b00`, 0.06 ETH) completed the
+rig. One operational lesson: the 576-byte sender runtime needs ~1.1M deploy gas
+under EIP-8037, so the first attempt at a 1M limit failed and burned a nonce;
+budget 2M.
+
+The honest path proved the headline property. A spend signed by a
+freshly generated key holding zero wei simulated valid and mined:
+shield `0x9948b72e…` (block 142347, 1 ETH), transfer `0x0af5a301…`
+(block 142399, 1,744,804 gas) paid by paymaster A, withdraw `0xad0e83de…`
+(block 142406, 1,884,797 gas) paid by independently selected paymaster B. The
+mined envelopes record the contract as `sender` with a single signature from
+the unfunded key. Frame budgets held live: the sender's full authorization
+(grammar, NONCEKEYLOAD key set, reference, Groth16 staticcall) used 250,824
+gas of its pinned 300k on the transfer and 250,857 on the withdraw; the
+paymaster used 42,355 and 42,345 of its 100k. Each paymaster accrued exactly
+0.05 ETH, push claims (`0xafa68683…`, `0x3d9627bc…`) paid each credit only to
+its own paymaster, both mappings returned to zero, and the recipient held the
+proven 0.55 ETH withdrawal credit.
+
+Every adversarial case failed closed, before payment approval, with
+`payer=None` and `validation prefix frame reverted`. Through the funded
+always-approve payer: a proof with one flipped bit in pA; a nonce-key set
+that is not the proof's two nullifiers; and a settle frame down-gassed to 5M
+against the pinned 10M. Replaying the mined transfer's exact raw bytes was
+rejected at admission with `Nonce mismatch: expected 1, got 0`, invalid rather
+than mined-and-reverted, so replay cannot burn notes. The economic bind is
+exact to the wei: with the proof-bound fee at 0.05 ETH, a max-fee choice
+giving `TXPARAM(0x06)` = 50,000,000,000,721,585 wei was rejected by the
+paymaster while 49,999,999,991,784,987 wei simulated valid, and the observed
+accept/reject flips tracked `fee >= max_cost` through the RLP-length-induced
+total-gas wobble (10,443,555 to 10,443,579 gas across nearby max-fee values).
+
+With this, the operator-held sender key is removed from the trust structure
+and demonstrated unnecessary live: execution authority is the proof itself,
+payment is an open per-transaction paymaster market with an exact solvency
+bound, and the only signature in the envelope is arbitrary transaction
+authentication data. The remaining migration items are unchanged: the
+authenticated resolved-payer TXPARAM ask to ethrex, retiring the calldata
+`feeRecipient` through `_feeRecipient`, and the documented interim
+fee-recipient auction.
