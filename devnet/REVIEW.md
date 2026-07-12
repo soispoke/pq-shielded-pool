@@ -1565,3 +1565,49 @@ one sender. That is one node configuration's policy, not evidence about
 propagation behavior across other ethrex configurations. Replaying either mined raw is rejected at admission with
 `Nonce mismatch: expected 1, got 0`, the consumed lane advanced, the other
 untouched. Raws archived byte-exact in the vector directory.
+
+## Classification, and the redundant settlement verify (2026-07-12)
+
+Post-milestone review verdict, recorded so future work targets the right
+layer: protocol research and prototype validation are the strong parts
+(real proofs, differential fuzzing, ABI and event parity, archived raws,
+byte-exact deployment checks, live same-block evidence); the implementation
+is experimental. The fund-holding pool is 600+ lines of handwritten Yul
+whose development surfaced four genuine Yul-class defects, all fixed and
+regression-covered, all of the same manual-memory class that Solidity makes
+unrepresentable. Differential fuzzing is strong evidence of equivalence,
+not proof. No independent audits, no formal verification, no long-horizon
+stateful invariant runs. The next production step is the thin immutable
+Yul dispatcher delegating settlement to Solidity, not more Yul polishing.
+
+The clearest remaining inefficiency is the settlement-frame Groth16
+re-verification inside spendCheck, ~247k of the ~1.4M settle frame (~14%
+of a spend). The original rationale for keeping it (v2 REVIEW: the pool
+cannot authenticate WHO verified in the validation prefix) was written for
+the split design and dissolves under pool-as-sender. The candidate
+argument: settlement requires caller() == address(this), which inside a
+frame transaction means tx.sender == the pool; execution only runs after
+an APPROVE_EXECUTION with scope 0x2, which the protocol handler accepts
+only from a VERIFY frame targeting tx.sender; the only code at that
+address is this immutable pool, whose only APPROVE_EXECUTION site is the
+empty-calldata frame-0 path, which approves only after binding the full
+grammar, the exact keyed-nonce set, the recent-root reference, and
+staticcalling verifyProofOnly on the byte-exact frame-2 Spend read from
+the same signed envelope. Settlement executes as that frame 2, so the
+tuple it settles is the tuple whose proof was verified, and trusting
+frame 0 adds no third party.
+
+NOT taken. A focused soundness review owes three checks first: (1) the
+scope-0x2 approver-target == tx.sender rule re-verified in ethrex source
+at the pinned commit (checked for the shared-sender design, not since);
+(2) a written argument that no path yields caller() == pool outside the
+SENDER frame (the claim payouts hand msg.sender == pool to arbitrary
+recipient code, which cannot make the pool issue a call, but this belongs
+on paper, not in memory); (3) the probe-side envelope checks stay
+regardless, they carry exactly-once and non-frame rejection, not proof
+validity. Also on the efficiency table, from the same review: batched
+spends with batched Groth16 verification, batched leaf insertion,
+frame-calldata reuse instead of the duplicated proof tuple in the pay
+frame, storage and event trims, LeanIMT (already surveyed), and the
+authenticated payer TXPARAM that retires the calldata fee-recipient
+machinery (already a documented seam).
