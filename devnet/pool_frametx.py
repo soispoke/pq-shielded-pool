@@ -64,6 +64,13 @@ signature the current proof-paymaster grammar requires.
 fee-boundary tests. The builder prints the exact TXPARAM(0x06) value, including
 frame limits, intrinsic and envelope calldata gas, signature verification, and
 recent-root-reference gas, using ethrex's current formula.
+
+Adversarial-suite flags (spends only; see devnet/vectors/ for archived runs):
+`--nonce-keys 0x..,0x..` replaces the protocol nonce keys, for wrong-key
+rejection vectors. `--settle-gas N` overrides the pinned 10M settlement frame
+gas, for down-gassing vectors. `--save-raw <path>` writes the signed raw
+transaction bytes, so mined transactions can be replayed as admission-level
+rejection vectors and archived.
 """
 import json
 import subprocess
@@ -180,7 +187,8 @@ def recent_root_ref(url, cfg, e):
 
 def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_verify=None,
                    recent_root_refs=None, dry_run=False, sender_override=None,
-                   max_fee_override=None, max_priority_override=None):
+                   max_fee_override=None, max_priority_override=None,
+                   settle_gas_override=None, save_raw=None):
     signer = int.from_bytes(pk.public_key.to_canonical_address(), "big")
     sender = sender_override if sender_override is not None else signer
     chain_id = int(rpc(url, "eth_chainId", []), 16)
@@ -234,8 +242,11 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
         tx.signatures = [FrameSig(FrameSig.SECP256K1, signer, b"", sig)]
         return tx
 
-    tx = build()
+    tx = build() if settle_gas_override is None else build(sender_gas=settle_gas_override)
     raw = "0x" + tx.raw().hex()
+    if save_raw:
+        with open(save_raw, "w") as f:
+            f.write(raw)
 
     # Dry-run first: pre-check validity, report the resolved payer, and size
     # the (uncapped) SENDER frame from the simulated gas. Degrades to the
@@ -250,6 +261,7 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
             print(f"  dry-run: valid={sim.get('valid')}  shape={sim.get('prefixShape')}  "
                   f"payer={sim.get('payer')}  status={sim.get('executionStatus')}")
             print(f"           violation={sim.get('violation')}")
+            print(f"           max_cost={tx.max_cost()}  total_gas_limit={tx.total_gas_limit()}")
             if g is not None:
                 print(f"           gas={g:,}  ({per})")
         return
@@ -353,6 +365,26 @@ def main():
             raise SystemExit(f"invalid sender address: {sys.argv[i + 1]}")
     max_fee_override = None
     max_priority_override = None
+    settle_gas_override = None
+    save_raw = None
+    nonce_keys_override = None
+    if "--settle-gas" in sys.argv:
+        i = sys.argv.index("--settle-gas")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("--settle-gas requires a gas value")
+        settle_gas_override = int(sys.argv[i + 1], 0)
+    if "--save-raw" in sys.argv:
+        i = sys.argv.index("--save-raw")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("--save-raw requires a path")
+        save_raw = sys.argv[i + 1]
+    if "--nonce-keys" in sys.argv:
+        i = sys.argv.index("--nonce-keys")
+        if i + 1 >= len(sys.argv):
+            raise SystemExit("--nonce-keys requires 0x..,0x..")
+        nonce_keys_override = sorted(int(x, 16) for x in sys.argv[i + 1].split(","))
+        if len(nonce_keys_override) != 2:
+            raise SystemExit("--nonce-keys requires exactly two keys")
     for flag, target in (("--max-fee-per-gas", "max_fee"),
                          ("--max-priority-fee-per-gas", "max_priority")):
         if flag in sys.argv:
@@ -412,19 +444,25 @@ def main():
         build_and_send(url, pk, pool, value, calldata, dry_run=dry)
     elif op == "transfer":
         e, protocol_nonces, verify, refs = spend_setup("transfer")
+        if nonce_keys_override is not None:
+            protocol_nonces = nonce_keys_override
         calldata = cast_calldata(f"transfer({SPEND_TUPLE},address)", spend_args(e), paymaster)
         print(f"join-split transfer via faithful frame tx (payer {paymaster}, proof verified on-chain)")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
                        dry_run=dry, sender_override=sender_override,
-                       max_fee_override=max_fee_override, max_priority_override=max_priority_override)
+                       max_fee_override=max_fee_override, max_priority_override=max_priority_override,
+                       settle_gas_override=settle_gas_override, save_raw=save_raw)
     elif op == "withdraw":
         e, protocol_nonces, verify, refs = spend_setup("withdraw")
+        if nonce_keys_override is not None:
+            protocol_nonces = nonce_keys_override
         calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address,address)", spend_args(e),
                                  fix["recipient"], paymaster)
         print(f"join-split withdraw via faithful frame tx (payer {paymaster})")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
                        dry_run=dry, sender_override=sender_override,
-                       max_fee_override=max_fee_override, max_priority_override=max_priority_override)
+                       max_fee_override=max_fee_override, max_priority_override=max_priority_override,
+                       settle_gas_override=settle_gas_override, save_raw=save_raw)
     else:
         raise SystemExit(f"unknown op {op}")
 

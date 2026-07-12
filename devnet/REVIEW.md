@@ -1435,3 +1435,18 @@ authentication data. The remaining migration items are unchanged: the
 authenticated resolved-payer TXPARAM ask to ethrex, retiring the calldata
 `feeRecipient` through `_feeRecipient`, and the documented interim
 fee-recipient auction.
+
+### Suite vectors archived (2026-07-12)
+
+A review pass noted the adversarial simulations above were documented but not
+persisted as replayable inputs. `devnet/vectors/2026-07-12-shared-sender-suite/`
+now archives the run byte-exact: the live deploy config, the deployment-bound
+fixture, the flipped-bit proof fixture, the mined transfer's raw bytes, and
+every command with its recorded output. The suite flags it used
+(`--nonce-keys`, `--settle-gas`, `--save-raw`) moved from the run's scratch
+copy into the checked-in `pool_frametx.py`, and the wrong-key and raw-replay
+vectors were re-executed from the archive with identical results. The vector
+README classifies replayability honestly: nullifier consumption freezes the
+bad-proof, down-gas, and fee-boundary vectors as recorded history, which is
+the design working as intended. Future live suites should write their vectors
+directory in the same pass as the run itself.
