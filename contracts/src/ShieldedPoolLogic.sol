@@ -233,8 +233,9 @@ contract ShieldedPoolLogic {
     /// at payment approval, so this only checks that THIS transaction is the
     /// one that consumed exactly the proven nullifiers, that the proven root
     /// rides as the transaction's protocol-validated recent-root reference,
-    /// and that the proof holds; then it settles. The pool keeps no spent set
-    /// and no root history.
+    /// and that the authenticated values remain canonical; then it settles.
+    /// The dispatcher already proved the byte-exact Spend in frame 0. The pool
+    /// keeps no spent set and no root history.
     ///
     /// The proof re-verification that ShieldedPool.sol and the monolith keep
     /// here is REDUNDANT for the pool-as-sender dispatcher: execution approval

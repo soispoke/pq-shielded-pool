@@ -46,8 +46,8 @@ knob does); the protocol validates the reference at admission and at block
 execution, which makes root recency protocol-enforced. The pool re-binds the
 same envelope facts in the SENDER frame via EnvelopeProbe.yul. The
 sender bind is what lets the paymaster rely on frame 0 rather than perform a
-third Groth16 check. SharedPoolSender's verifyProofOnly call reads no storage,
-and the paymaster is SLOAD-free, so neither frame trips the observer's
+second Groth16 check. The preferred immutable dispatcher verifies inline and
+the paymaster is SLOAD-free, so neither frame trips the observer's
 StorageReadNonSender ban. The sender's ~250k proof check plus the paymaster's
 bounded envelope work fit MAX_VERIFY_GAS=500k, and
 since 2026-07-08 non-zero nonce_keys are public-mempool admissible, so the
@@ -70,6 +70,8 @@ frame limits, intrinsic and envelope calldata gas, signature verification, and
 recent-root-reference gas, using ethrex's current formula.
 
 Adversarial-suite flags (spends only; see devnet/vectors/ for archived runs):
+`--flip-proof` flips one bit in pA[0] in both proof-bearing frames, producing a
+reproducible invalid-proof vector without hand-editing a fixture.
 `--nonce-keys 0x..,0x..` replaces the protocol nonce keys, for wrong-key
 rejection vectors. `--settle-gas N` overrides the pinned 10M settlement frame
 gas, for down-gassing vectors. `--save-raw <path>` writes the signed raw
@@ -384,6 +386,7 @@ def main():
     note_index = None
     spend_key_override = None
     root_slot_override = None
+    flip_proof = "--flip-proof" in sys.argv
     if "--note" in sys.argv:
         i = sys.argv.index("--note")
         if i + 1 >= len(sys.argv):
@@ -473,7 +476,11 @@ def main():
         root R, so they share the block where the second shield completed the
         tree, rather than distinct cfg _slot_transfer/_slot_withdraw values."""
         fix_key = spend_key_override if spend_key_override is not None else op_name
-        e = fix[fix_key]
+        # Copy before adversarial mutation so the loaded fixture remains an
+        # immutable source of truth for subsequent operations in this process.
+        e = json.loads(json.dumps(fix[fix_key]))
+        if flip_proof:
+            e["proof"]["pA"][0] = hex(int(e["proof"]["pA"][0], 16) ^ 1)
         protocol_nonces = sorted([int(e["nf1"], 16), int(e["nf2"], 16)])  # strictly increasing
         verify = (paymaster_int,
                   cast_calldata(f"verifyProofOnly({SPEND_TUPLE})", spend_args(e)))

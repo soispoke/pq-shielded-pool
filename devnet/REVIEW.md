@@ -1513,7 +1513,7 @@ pin). Poseidon and the Groth16 verifier remain the deployed Solidity
 contracts, called from Yul. This is a RESEARCH IMPLEMENTATION for the
 disposable devnet: only the opcode-facing shell must be Yul, so the preferred
 production architecture is a thin immutable Yul dispatcher at the pool
-address delegating settlement to the audited Solidity implementation; the
+address delegating settlement to the reviewable Solidity implementation; the
 monolith exists to demonstrate the design end to end (header of
 ShieldedPool.yul states this).
 
@@ -1719,3 +1719,25 @@ runs); frame-0's proof-rejection logic is covered by the forge suite and is
 the same inline-staticcall mechanism the monolith proved live, but a clean
 live proof-rejection on a fresh note (needing live-tree reconstruction) was
 not run.
+
+## Dispatcher fresh-note adversarial validation (2026-07-13)
+
+The final dispatcher evidence gap is closed. A disposable dispatcher pool
+(`0xa85233c6…`) received a new 0.2 ETH note in block 162088, producing a
+transfer whose nullifiers had never been submitted. The unchanged transfer
+simulated valid with the expected payer and a successful settlement. Flipping
+one bit in `pA[0]` made frame-0 authorization revert with `payer=None`; setting
+the settlement frame to 5M gas likewise failed the immutable 10M envelope bind
+before payment approval. Re-simulating the valid baseline afterward still
+passed, proving neither negative result was a replay or nonce-mismatch
+confound. The exact fixture, config, and three signed raws are archived in
+`devnet/vectors/2026-07-13-dispatcher-fresh-adversarial/`.
+
+The repository closure pass also made the dispatcher milestone the public
+default in `README.md` and `SECURITY.md`. CI now regenerates and diffs the
+dispatcher artifact, compiles the current Python surface, formats the full
+Solidity tree, and rejects Forge lint warnings. A clean build discovers and
+passes all 117 Forge tests. The disposable run also caught a stale operational
+limit: current `ShieldedPoolLogic` deployment exhausted the script's 6M gas
+cap. The deployment succeeded at 12M, and `run_live_dispatcher.sh` now carries
+that tested limit.

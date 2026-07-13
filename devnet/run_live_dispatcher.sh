@@ -43,7 +43,7 @@ echo "==> ShieldedPoolLogic (Solidity settlement implementation; constructor pro
 # The implementation holds probe/verifier as immutables (read from its code
 # under DELEGATECALL) and links PoseidonT3/T4. It is only ever delegatecalled
 # by the dispatcher; deployed here as a normal contract.
-LOGIC=$(forge create --root $BN --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $PRICE --gas-limit 6000000 --broadcast \
+LOGIC=$(forge create --root $BN --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $PRICE --gas-limit 12000000 --broadcast \
   src/ShieldedPoolLogic.sol:ShieldedPoolLogic \
   --libraries "src/PoseidonT3.sol:PoseidonT3:$T3" \
   --libraries "src/PoseidonT4.sol:PoseidonT4:$T4" \
@@ -51,7 +51,7 @@ LOGIC=$(forge create --root $BN --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $P
 echo "    logic=$LOGIC"
 
 echo "==> ShieldedPoolDispatcher (Yul shell at the pool address; immutable tail = logic)"
-# ~0.9KB runtime; the constructor seeds currentRoot and publishes the empty
+# ~1.4KB runtime; the constructor seeds currentRoot and publishes the empty
 # root, so 3M gas is ample.
 DISP_INIT=$(python3 dispatcher.py --initcode "$LOGIC" "$VERIFIER")
 POOL=$(cast send --rpc-url "$RPC" --private-key "$DEPLOYER_PK" $PRICE --gas-limit 3000000 \

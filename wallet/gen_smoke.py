@@ -18,10 +18,12 @@ fixture pairs with the committed Groth16Verifier.sol from the same setup.
 
 Run from the wallet/ directory:
   python3 gen_smoke.py [--random] [--chain-id=N] [--source-id=0x...]
-                       [--fee-wei=N]
+                       [--shield-wei=N] [--payment-wei=N] [--fee-wei=N]
+                       [--output=PATH]
 
-`--fee-wei` adjusts change and withdrawal value to preserve conservation. It
-exists for paymaster boundary tests immediately below and at TXPARAM(max_cost).
+The value overrides preserve the same flow at a smaller scale. They are useful
+for disposable devnet deployments and paymaster boundary tests; defaults remain
+1.0 ETH shielded, 0.6 ETH paid privately, and a 0.05 ETH fee.
 """
 import json
 import subprocess
@@ -110,23 +112,32 @@ def main():
         w.set_seed(20260702)
     chain_id = TEST_CHAIN_ID
     source_id = TEST_SOURCE_ID
+    shield_wei = ETH
+    payment_wei = ETH * 60 // 100
     fee_wei = ETH * 5 // 100
+    output_path = HERE / "smoke_fixture.json"
     for arg in sys.argv[1:]:
         if arg.startswith("--chain-id="):
             chain_id = int(arg.split("=", 1)[1], 0)
         elif arg.startswith("--source-id="):
             source_id = arg.split("=", 1)[1]
+        elif arg.startswith("--shield-wei="):
+            shield_wei = int(arg.split("=", 1)[1], 0)
+        elif arg.startswith("--payment-wei="):
+            payment_wei = int(arg.split("=", 1)[1], 0)
         elif arg.startswith("--fee-wei="):
             fee_wei = int(arg.split("=", 1)[1], 0)
+        elif arg.startswith("--output="):
+            output_path = Path(arg.split("=", 1)[1]).expanduser().resolve()
     domain = w.domain_scalar(chain_id, source_id)
 
     # notes: Alice's deposit, Bob's payment target, Alice's change target
     sk_a, rho_a = w.new_note()
     sk_b, rho_b = w.new_note()
     sk_a2, rho_a2 = w.new_note()
-    v_shield, v_bob, v_fee = ETH, ETH * 60 // 100, fee_wei
-    if not 0 < v_fee < v_bob:
-        raise SystemExit("--fee-wei must be positive and below the 0.6 ETH payment note")
+    v_shield, v_bob, v_fee = shield_wei, payment_wei, fee_wei
+    if not 0 < v_fee < v_bob < v_shield:
+        raise SystemExit("value overrides require 0 < fee < payment < shield")
     v_change = v_shield - v_bob - v_fee
     inner_a = w.inner(sk_a, rho_a)
     cm_a = w.commitment(sk_a, rho_a, v_shield)
@@ -176,13 +187,14 @@ def main():
                                 w.ctx_for_recipient(RECIPIENT), pub_w, proof_w,
                                 recipient=RECIPIENT),
     }
-    (HERE / "smoke_fixture.json").write_text(json.dumps(fixture, indent=1))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(fixture, indent=1))
     print("real join-split proofs generated and verified off-chain; public signals bind the wallet publics")
+    print(f"wrote {output_path}")
     print(f"  transfer  nf1 {fixture['transfer']['nf1'][:18]}... nf2 {fixture['transfer']['nf2'][:18]}... fee {v_fee}")
     print(f"  withdraw  publicAmount {v_pub} fee {v_fee}")
     print(f"  domain   {fixture['domain']} (chain {chain_id}, source {source_id})")
     print("  same-note witness rejected in-circuit (nf1 != nf2)")
-    print(f"wrote {HERE / 'smoke_fixture.json'}")
 
 
 if __name__ == "__main__":

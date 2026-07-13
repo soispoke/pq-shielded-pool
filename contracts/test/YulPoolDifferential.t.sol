@@ -104,6 +104,8 @@ contract YulPoolDifferentialTest {
         (ok, dS) = address(sol).call{value: value}(data);
         (okY, dY) = yul.call{value: value}(data);
         assertTrue(ok == okY, "success/failure diverged");
+        // The length guard makes truncation to the first four bytes intentional.
+        // forge-lint: disable-next-line(unsafe-typecast)
         bytes4 sel = data.length >= 4 ? bytes4(data) : bytes4(0);
         if (!(ok && _isAddressDerived(sel))) {
             assertTrue(keccak256(dS) == keccak256(dY), "returndata diverged");
@@ -119,17 +121,20 @@ contract YulPoolDifferentialTest {
     }
 
     function _root(address pool) internal view returns (bytes32 r) {
-        (, bytes memory d) = pool.staticcall(abi.encodeWithSignature("currentRoot()"));
+        (bool ok, bytes memory d) = pool.staticcall(abi.encodeWithSignature("currentRoot()"));
+        assertTrue(ok && d.length == 32, "currentRoot read failed");
         r = abi.decode(d, (bytes32));
     }
 
     function _nextIndex(address pool) internal view returns (uint32 n) {
-        (, bytes memory d) = pool.staticcall(abi.encodeWithSignature("nextIndex()"));
+        (bool ok, bytes memory d) = pool.staticcall(abi.encodeWithSignature("nextIndex()"));
+        assertTrue(ok && d.length == 32, "nextIndex read failed");
         n = abi.decode(d, (uint32));
     }
 
     function _subtree(address pool, uint256 l) internal view returns (bytes32 r) {
-        (, bytes memory d) = pool.staticcall(abi.encodeWithSignature("filledSubtrees(uint256)", l));
+        (bool ok, bytes memory d) = pool.staticcall(abi.encodeWithSignature("filledSubtrees(uint256)", l));
+        assertTrue(ok && d.length == 32, "filledSubtrees read failed");
         r = abi.decode(d, (bytes32));
     }
 
@@ -226,9 +231,11 @@ contract YulPoolDifferentialTest {
         // bind the domain to THIS pool so the cascade reaches past the domain
         // check; arm the probe with this pool's faithful envelope, then break
         // the selected binding.
-        (, bytes memory dom) = pool.staticcall(abi.encodeWithSignature("domain()"));
+        (bool domOk, bytes memory dom) = pool.staticcall(abi.encodeWithSignature("domain()"));
+        assertTrue(domOk && dom.length == 32, "domain read failed");
         s.domain = abi.decode(dom, (bytes32));
-        (, bytes memory src) = pool.staticcall(abi.encodeWithSignature("sourceId()"));
+        (bool srcOk, bytes memory src) = pool.staticcall(abi.encodeWithSignature("sourceId()"));
+        assertTrue(srcOk && src.length == 32, "sourceId read failed");
         (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
         if (wrongKeys) (lo, hi) = (hi, lo);
         probe.set(3, 2, 2, 0, lo, hi, 1, wrongRef ? bytes32(uint256(1)) : abi.decode(src, (bytes32)), s.root, pool);
@@ -237,6 +244,8 @@ contract YulPoolDifferentialTest {
         (bool ok, bytes memory ret) = pool.call(abi.encodeWithSelector(bytes4(0x751a8fc5), s, POOL_SENDER));
         assertTrue(!ok, "garbage spend settled");
         assertTrue(ret.length == 4, "expected a bare error selector");
+        // The exact-length assertion makes the selector truncation intentional.
+        // forge-lint: disable-next-line(unsafe-typecast)
         e = bytes4(ret);
     }
 

@@ -29,8 +29,8 @@ The pay VERIFY frame (flags 0x01, APPROVE_PAYMENT) targets this contract with
   3. sender authentication: frame 0 targets the immutable POOL_SENDER in
      VERIFY / execution-only mode. That contract verifies the exact proof,
      nonce keys, root reference and settlement data before APPROVE_EXECUTION.
-     The paymaster does not repeat the Groth16 check; the pool still verifies
-     independently during settlement.
+     The paymaster does not repeat the Groth16 check. The preferred dispatcher
+     verifies it in frame 0, and settlement does not repeat it.
   4. economic binding: the proof-bound fee covers TXPARAM(0x06), the same
      maximum transaction cost APPROVE_PAYMENT debits from this payer.
 

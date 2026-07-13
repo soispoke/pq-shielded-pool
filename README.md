@@ -6,13 +6,15 @@ arbitrary value; a spend is a 2-in/2-out join-split proven by a Groth16 SNARK
 (circom + snarkjs) and verified onchain through the BN254 pairing precompiles,
 so no offchain attester is involved.
 
-It runs as an EIP-8141 frame-native application. A proof-authorized shared
-sender verifies the spend before execution approval; the paymaster authenticates
-that sender and requires the proof-bound fee to cover its maximum transaction
-liability before payment approval consumes the two EIP-8250 nullifiers. The
-pool verifies the proof again before settlement. The full shield → transfer → withdraw
-flow has run end to end on lambdaclass/ethrex's Hegotá devnet; addresses,
-transaction hashes, and gas are in
+It runs as an EIP-8141 frame-native application. The pool address is an
+immutable Yul dispatcher and the frame-transaction sender. In frame 0 it binds
+the envelope and verifies the proof before execution approval. A paymaster
+then binds the same spend and requires the proof-bound fee to cover its maximum
+transaction liability before payment approval consumes the two EIP-8250
+nullifiers. The settlement frame calls the pool, which delegates state changes
+to a Solidity implementation. The proof is verified once, before either
+approval. The full shield → transfer → withdraw flow has run end to end on
+lambdaclass/ethrex's Hegotá devnet; addresses, transaction hashes, and gas are in
 [devnet/REVIEW.md](devnet/REVIEW.md).
 
 ## How a spend works
@@ -38,9 +40,10 @@ also pull credits, so recipient code cannot revert settlement.
 
 ## Contracts
 
-The pool enforces four bindings around each proof:
+The dispatcher and settlement implementation enforce four bindings around
+each proof:
 
-1. the sender is the pinned `POOL_SENDER`;
+1. the pool is the transaction sender and the settlement target;
 2. the transaction consumed exactly `{nf1, nf2}` as its EIP-8250 keyed-nonce
    set at `nonce_seq = 0`;
 3. its single protocol-validated EIP-8272 reference carries this pool's source
@@ -52,7 +55,8 @@ rejects `nf1 == nf2`. The duplicate-key rule repeats that check in the envelope.
 
 ```
 contracts/src/
-  ShieldedPool.sol     the frame-native pool and incremental Merkle tree
+  ShieldedPoolLogic.sol Solidity settlement, incremental Merkle tree, and claims
+  ShieldedPool.sol     standalone Solidity reference used as the test oracle
   Groth16Verifier.sol  snarkjs verifier (GENERATED; GPL-3.0, see NOTICE)
   PoseidonT3/T4.sol    Poseidon over BN254 (GENERATED); PoseidonBN254.sol is the facade
 circuits/spend.circom  the 2-in/2-out join-split circuit
@@ -61,11 +65,12 @@ vectors/               Poseidon test vectors exported from circomlibjs
 tooling/               npm deps, circuit compile and trusted-setup script
 wallet/                witness builder, proof generation, and end-to-end scripts
 devnet/
-  ProofPaymaster.yul   proof, key-set, root-reference, and frame binding
-  SharedPoolSender.yul proof-authorized shared nullifier namespace
-  EnvelopeProbe.yul    stateless envelope reader used by settlement
-  pool_frametx.py      assembles, simulates, and submits the frame transactions
-  REVIEW.md            live-run evidence and protocol caveats
+  ShieldedPoolDispatcher.yul immutable pool/sender shell and proof authorization
+  ProofPaymaster.yul          payment, fee, key-set, root, and frame binding
+  EnvelopeProbe.yul           stateless envelope reader used by settlement
+  dispatcher.py               reproducible dispatcher initcode generator
+  pool_frametx.py             assembles, simulates, and submits frame transactions
+  REVIEW.md                   live-run evidence and protocol caveats
 ```
 
 ## Run
@@ -124,8 +129,8 @@ two-dimensional gas accounting raises these figures; see
   disposable testbed must be retired before capacity.
 - **Frame-native only.** Spends require the Hegotá EIP-8141/8250/8272 opcode
   surface and deliberately revert when called as ordinary EVM transactions.
-- **Production sender pending adversarial live validation.** The proof-authorized
-  sender and max-cost paymaster compile, but the final gas-bound pair is not
-  deployed and the malicious-payer and fee-boundary suite has not run. Do not
-  use the earlier candidate addresses for real notes.
+- **Experimental client surface.** The dispatcher and max-cost paymaster have
+  been exercised on one Hegotá ethrex configuration, including same-block
+  disjoint-nullifier spends and replay rejection. This is not evidence of
+  compatibility with other clients or ethrex configurations.
 - **Unaudited research code.**

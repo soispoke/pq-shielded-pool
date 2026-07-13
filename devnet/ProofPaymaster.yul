@@ -51,7 +51,9 @@
 ///      proof-authorized contract checked the exact proof, key set, root, and
 ///      settlement calldata and called APPROVE_EXECUTION. The paymaster does
 ///      not repeat its Groth16 check, keeping the validation prefix below the
-///      devnet's 500k budget; the pool still verifies again during settlement.
+///      devnet's 500k budget. In the preferred immutable dispatcher deployment,
+///      this frame-0 check is the sole proof verification; settlement rebinds
+///      the authenticated envelope but does not repeat the Groth16 pairing.
 ///   4. ECONOMIC BINDING. The proof-bound fee MUST cover TXPARAM(0x06), the
 ///      exact maximum cost APPROVE_PAYMENT debits and later refunds down to
 ///      actual cost. This prevents an open submitter choosing gas parameters

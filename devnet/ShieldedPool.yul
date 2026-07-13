@@ -21,7 +21,7 @@
 ///         architecture: only the opcode-facing shell must be Yul, so a
 ///         production deployment should prefer a thin immutable Yul
 ///         dispatcher at the pool address that handles frame opcodes and
-///         DELEGATECALLs settlement to the audited Solidity implementation
+///         DELEGATECALLs settlement to the reviewable Solidity implementation
 ///         (EIP-8141 permits helper contracts and DELEGATECALL during
 ///         validation when they add no mutable-state dependency). The
 ///         monolith's equivalence to ShieldedPool.sol is enforced by the

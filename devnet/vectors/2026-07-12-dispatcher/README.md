@@ -51,7 +51,7 @@ Smoke, sender = the pool throughout, proof verified once in frame-0 inline:
 Credits exact (0.55 recipient, 0.05 per paymaster, 1.0 ETH escrowed), tree at
 nextIndex 5. Gas is ~7k above the monolith single-verification pool (transfer
 1,494,000; withdraw 1,633,984): the DELEGATECALL proxy hop, ~0.45% per spend,
-the price of collapsing 5KB of hand-audited Yul to 1.4KB plus audited Solidity.
+the price of collapsing 5KB of hand-reviewed Yul to 1.4KB plus compiled Solidity.
 
 Same-block inclusion reproven on the dispatcher: race shields blocks
 152962/152963 (root published 152963), two disjoint-nullifier transfers
@@ -59,7 +59,7 @@ submitted back-to-back, BOTH MINED IN BLOCK 152969 (A idx 0 at 1,473,434 gas,
 C idx 1 at 1,307,379), replays of both raws rejected at admission with
 `Nonce mismatch: expected 1, got 0`.
 
-## Adversarial note (honest confound)
+## Adversarial note (resolved 2026-07-13)
 
 Re-running the mined race transfers with a flipped proof bit or a 5M
 down-gassed settle frame returns valid=False, payer=None, but the violation is
@@ -71,6 +71,12 @@ tree; this pool has 7 leaves), not run here. Frame-0's proof-rejection logic
 (verifyFrame2Proof, identical public-signal set to verifyProofOnly) is covered
 by contracts/test/DispatcherPool.t.sol::test_corrupted_proof_rejected_at_authentication
 and is the same inline-staticcall mechanism the monolith proved live.
+
+The gap is now closed on a new dispatcher and a fresh, unconsumed note. The
+valid baseline simulated successfully, while both a flipped proof bit and a
+5M settlement frame failed in the validation prefix with no payer. Exact
+inputs and signed raws are archived in
+`../2026-07-13-dispatcher-fresh-adversarial/`.
 
 Files: deploy_config.json, dispatcher_smoke_fixture.json (live smoke, chain
 3151908), nonce_race_fixture.json, transfer_a_raw.hex / transfer_c_raw.hex

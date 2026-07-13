@@ -1,7 +1,7 @@
 /// @title ShieldedPoolDispatcher (Yul)
 /// @notice The production-preferred pool-as-sender shell: a thin immutable Yul
 ///         object deployed AT the pool address. It does only what must be Yul,
-///         and DELEGATECALLs everything else to an audited Solidity settlement
+///         and DELEGATECALLs everything else to a reviewable Solidity settlement
 ///         implementation (contracts/src/ShieldedPoolLogic.sol).
 ///
 ///         Two entrypoints:
