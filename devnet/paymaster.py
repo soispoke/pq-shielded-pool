@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Deploy bytecode for ProofPaymaster, the proof-authorized-sender and
-max-cost-bound APPROVE paymaster for the faithful spend shape. Source:
+"""Deploy bytecode for ProofPaymaster, the optional external payer for the
+sponsored three-frame spend shape. The canonical two-frame flow is self-paying
+and does not deploy or call this contract. The pool is native-ETH only: this
+contract fronts ETH and receives an ETH credit, with no ERC-20 or conversion
+logic. Source:
 ProofPaymaster.yul (this dir).
 
 The pay VERIFY frame (flags 0x01, APPROVE_PAYMENT) targets this contract with

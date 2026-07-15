@@ -1,10 +1,14 @@
 /// @title ProofPaymaster
-/// @notice The proof-authorized-sender and max-cost-bound APPROVE paymaster for
-///         the EIP-8141 [only_verify, pay] faithful spend shape on the Hegotá
-///         devnet. It is the pay VERIFY frame's target (flags 0x01,
+/// @notice Optional external payer for the EIP-8141 [only_verify, pay]
+///         sponsored spend shape on the Hegotá devnet. The canonical
+///         two-frame flow has the pool approve execution and payment together
+///         and does not call this contract. In the sponsored form this is the
+///         pay VERIFY frame's target (flags 0x01,
 ///         APPROVE_PAYMENT), and it becomes the transaction's payer, so nothing
 ///         is approved and no nullifier is consumed unless the spend is fully
 ///         valid AND submitted by the pool's pinned POOL_SENDER.
+///         The pool is native-ETH only: this contract fronts ETH and receives
+///         a wei-denominated ETH credit. It has no ERC-20 or conversion logic.
 ///
 /// In the pay frame it does the following, reverting (no APPROVE) on any failure:
 ///   0. SENDER BINDING. TXPARAM(0x02) (tx.sender) MUST equal POOL_SENDER. This

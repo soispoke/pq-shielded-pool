@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
-"""Run the BN254 shielded pool as an EIP-8141 frame-native application on the
-Hegotá devnet (lambdaclass/ethrex hegota-devnet).
+"""Run the native-ETH BN254 shielded pool as an EIP-8141 frame-native
+application on the Hegotá devnet (lambdaclass/ethrex hegota-devnet).
+
+All note values, public amounts, fees, withdrawals, and payer credits are
+denominated in wei. Deposits use msg.value. There is no ERC-20 interface,
+token address, exchange-rate logic, or token-to-ETH paymaster conversion.
 
 Each pool interaction rides a type-0x06 frame transaction:
 
   shield:   frames = [ VERIFY(target=sender, self-verify sig -> APPROVE),
                        SENDER(target=pool, value=amount, data=shield(inner)) ]
-  transfer: frames = [ VERIFY(target=pool, proof authorization, execution),
-                       VERIFY(target=paymaster, bound Spend carrier, payment),
+  transfer: frames = [ VERIFY(target=pool, proof authorization,
+                              execution + payment),
                        SENDER(target=pool, value=0, data=transfer(Spend)) ]
   withdraw: same, data=withdraw(Spend, recipient)
+
+  optional sponsored form:
+            frames = [ VERIFY(target=pool, proof authorization, execution),
+                       VERIFY(target=paymaster, bound Spend carrier, payment),
+                       SENDER(target=pool, value=0, data=spend) ]
 
 For spends the pool IS the transaction sender (EIP-8250's intended shape:
 FrameTx { sender = PrivacyPool, nonce_keys = [nA, nB], nonce_seq = 0 }). The
@@ -25,14 +34,18 @@ The Groth16 proof is verified INSIDE the pool call (BN254 pairing precompiles),
 so no attester is needed: the whole spend, proof check
 included, executes on the devnet as an ordinary application frame.
 
-Since the settle-only pool (step 2) transfers and withdraws are ALWAYS the
-faithful shape: the pool keeps no spent set and no root history, so _spend
+Since the settle-only pool (step 2), transfers and withdraws always bind the
+same core facts: the pool keeps no spent set and no root history, so _spend
 refuses to settle unless the transaction consumed exactly the proven
 nullifiers as protocol keyed nonces and declared the proven root as its
-recent-root reference. The faithful shape is the
-EIP-8141 [only_verify, pay] grammar: an execution-scope self-verify frame
-followed by a payment-scope pay frame targeting the bounded paymaster
-(paymaster.py). The paymaster authenticates the successful proof-authorized
+recent-root reference. The default is EIP-8141 self relay: the pool is both
+sender and payer, and its VERIFY frame approves execution and payment after
+checking the proof, envelope, keyed nonces, recent root, and `fee >= max_cost`.
+No paymaster is part of that privacy flow.
+
+`--sponsored` or `--paymaster 0x...` selects the optional ETH-funded EIP-8141
+`[only_verify, pay]` fee-abstraction variant. Its bounded paymaster
+(`paymaster.py`) authenticates the successful proof-authorized
 frame 0, binds its Spend carrier byte-for-byte to settlement, requires the
 proof-bound fee to cover TXPARAM(0x06), and APPROVEs payment only if the
 envelope binds to POOL_SENDER (TXPARAM 0x02),
@@ -45,26 +58,29 @@ root]]`, with slot the consensus slot of the block that published the root
 knob does); the protocol validates the reference at admission and at block
 execution, which makes root recency protocol-enforced. The pool re-binds the
 same envelope facts in the SENDER frame via EnvelopeProbe.yul, including the
-authenticated resolved payer at TXPARAM(0x11); settlement credits the fee to
-that payer directly, with no caller-selected routing field. The
+authenticated resolved payer at TXPARAM(0x11). Settlement credits an external
+payer in ETH, with no caller-selected routing field. For self-pay, the ETH fee
+stays in the pool to offset its gas debit. The
 sender bind is what lets the paymaster rely on frame 0 rather than perform a
 second Groth16 check. The preferred immutable dispatcher verifies inline and
 the paymaster is SLOAD-free, so neither frame trips the observer's
-StorageReadNonSender ban. The sender's ~250k proof check plus the paymaster's
-bounded envelope work fit MAX_VERIFY_GAS=500k, and
+StorageReadNonSender ban. The proof check plus two first-use keyed-nonce
+charges require more than the draft 100k validation budget even without a
+paymaster. The self-paying prefix declares 350k; the optional sponsored prefix
+declares 300k + 100k. Both fit MAX_VERIFY_GAS=500k on Hegotá, and
 since 2026-07-08 non-zero nonce_keys are public-mempool admissible, so the
-faithful spend submits through the public RPC. The paymaster must be funded:
-it is the payer.
+spends submit through the public RPC. In sponsored mode the paymaster must be
+funded because it is the payer.
 
 Usage (append --dry-run to any to simulate without submitting):
   pool_frametx.py <rpc> deploy-config.json fixture.json shield   <priv>
-  pool_frametx.py <rpc> deploy-config.json fixture.json transfer <signer_priv> [--sender 0x...] [--paymaster 0x...]
-  pool_frametx.py <rpc> deploy-config.json fixture.json withdraw <signer_priv> [--sender 0x...] [--paymaster 0x...]
+  pool_frametx.py <rpc> deploy-config.json fixture.json transfer <signer_priv> [--sender 0x...] [--sponsored | --paymaster 0x...]
+  pool_frametx.py <rpc> deploy-config.json fixture.json withdraw <signer_priv> [--sender 0x...] [--sponsored | --paymaster 0x...]
 
 `--sender` decouples the authenticated frame sender from the outer signature's
 signer. Spends default it to the pool itself: the pool's VERIFY frame grants
 execution authority, while any submitter supplies the one outer signature the
-current proof-paymaster grammar requires.
+current devnet grammar requires. That submitter is neither sender nor payer.
 
 `--max-fee-per-gas` and `--max-priority-fee-per-gas` help construct repeatable
 fee-boundary tests. The builder prints the exact TXPARAM(0x06) value, including
@@ -176,8 +192,9 @@ def recent_root_ref(url, cfg, e):
     then VERIFY the derived reference against the committed predeploy entry
     before returning it. A wrong slot (mismatched genesis/seconds) fails here
     loudly instead of silently producing an unadmittable transaction. The
-    paymaster binds source_id and root (RECENTROOTREFLOAD); the protocol
-    enforces the recency window and this same committed entry."""
+    the pool's VERIFY binds source_id and root (RECENTROOTREFLOAD); an optional
+    paymaster re-binds the same tuple. The protocol enforces the recency window
+    and this same committed entry."""
     from frametx import rlp_bytes, rlp_int, rlp_list
     pub_block = int(e["slot"])
     ts = int(rpc(url, "eth_getBlockByNumber", [hex(pub_block), False])["timestamp"], 16)
@@ -223,18 +240,20 @@ def build_and_send(url, pk, pool, value, calldata, protocol_nonces=None, proof_v
 
     def build(sender_gas=10_000_000):
         if proof_verify:
-            # The FAITHFUL shape, EIP-8141 [only_verify, pay] grammar (validated
-            # live via OpenSponsor on 2026-07-05). Frame 0 self-verifies for the
-            # EXECUTION scope only (0x02, target sender). Frame 1 is the pay
-            # frame (0x01, PAYMENT scope) targeting the bounded paymaster. Frame
-            # 0 verifies the proof; frame 1 authenticates that sender, binds the
-            # same Spend bytes, and checks fee >= TXPARAM(max_cost) before
-            # approving payment. The paymaster must be funded (it is the payer).
             paymaster, vcalldata = proof_verify
-            frames = [
-                Frame(mode=1, flags=0x02, target=sender, gas_limit=300_000, value=0, data=b""),
-                Frame(mode=1, flags=0x01, target=paymaster, gas_limit=100_000, value=0, data=vcalldata),
-            ]
+            if paymaster is None:
+                # Core shape: the pool is sender and payer. Its VERIFY checks
+                # the spend and approves execution + payment in one step.
+                frames = [
+                    Frame(mode=1, flags=0x03, target=sender, gas_limit=350_000, value=0, data=b""),
+                ]
+            else:
+                # Optional fee abstraction: frame 0 approves execution only;
+                # the bounded paymaster in frame 1 approves payment.
+                frames = [
+                    Frame(mode=1, flags=0x02, target=sender, gas_limit=300_000, value=0, data=b""),
+                    Frame(mode=1, flags=0x01, target=paymaster, gas_limit=100_000, value=0, data=vcalldata),
+                ]
         else:
             # Today's shape: one self-verify frame approves execution AND payment
             # (0x03), so the sender is its own payer. VERIFY stays under
@@ -437,7 +456,9 @@ def main():
                 max_fee_override = value
             else:
                 max_priority_override = value
-    paymaster = cfg.get("paymaster")
+    # Self-pay is the default. A separate payer is an explicit fee-abstraction
+    # choice, not a requirement of the privacy or keyed-nonce flow.
+    paymaster = cfg.get("paymaster") if "--sponsored" in sys.argv else None
     if "--paymaster" in sys.argv:
         i = sys.argv.index("--paymaster")
         if i + 1 >= len(sys.argv):
@@ -451,25 +472,26 @@ def main():
         # one contract); --sender still overrides for adversarial vectors.
         if sender_override is None:
             sender_override = pool
-        if not paymaster:
-            raise SystemExit("spend requires cfg.paymaster or --paymaster 0x...")
-        try:
-            paymaster_int = int(paymaster, 16)
-        except ValueError:
-            raise SystemExit(f"invalid paymaster address: {paymaster}") from None
-        if paymaster_int == 0 or paymaster_int >= 1 << 160:
-            raise SystemExit(f"invalid paymaster address: {paymaster}")
+        if "--sponsored" in sys.argv and not paymaster:
+            raise SystemExit("--sponsored requires cfg.paymaster or --paymaster 0x...")
+        if paymaster:
+            try:
+                paymaster_int = int(paymaster, 16)
+            except ValueError:
+                raise SystemExit(f"invalid paymaster address: {paymaster}") from None
+            if paymaster_int == 0 or paymaster_int >= 1 << 160:
+                raise SystemExit(f"invalid paymaster address: {paymaster}")
+        else:
+            paymaster_int = None
     else:
         paymaster_int = None
 
     def spend_setup(op_name):
-        """Protocol nonces, verify frame, and recent-root reference for a
-        settle-only spend (always the faithful shape). The ProofPaymaster is
-        the pay-frame target and payer: it binds nonce_keys == {nf1, nf2}
-        (NONCEKEYLOAD) and the declared recent-root reference (pool source_id +
-        proven root, RECENTROOTREFLOAD), while carrying the byte-exact
-        verifyProofOnly calldata that frame 0 authenticates. The pool re-binds
-        the same envelope facts in the SENDER frame via EnvelopeProbe.
+        """Protocol nonces, validation data, and recent-root reference for a
+        settle-only spend. Self-pay is the core shape. If paymaster_int is set,
+        the same tuple also rides in an optional payment frame so that payer can
+        bind it before sponsoring. The pool re-binds the envelope facts in the
+        SENDER frame via EnvelopeProbe.
 
         `--spend-key KEY` reads the spend entry from fix[KEY] instead of
         fix[op_name] (the nonce-race fixture carries two transfers, `transfer`
@@ -509,7 +531,8 @@ def main():
         if nonce_keys_override is not None:
             protocol_nonces = nonce_keys_override
         calldata = cast_calldata(f"transfer({SPEND_TUPLE})", spend_args(e))
-        print(f"join-split transfer via faithful frame tx (payer {paymaster}, proof verified on-chain)")
+        payer_label = paymaster if paymaster else f"pool {cfg['pool']} (self-pay)"
+        print(f"join-split transfer via frame tx (payer {payer_label}, proof verified on-chain)")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
                        dry_run=dry, sender_override=sender_override,
                        max_fee_override=max_fee_override, max_priority_override=max_priority_override,
@@ -519,7 +542,8 @@ def main():
         if nonce_keys_override is not None:
             protocol_nonces = nonce_keys_override
         calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address)", spend_args(e), fix["recipient"])
-        print(f"join-split withdraw via faithful frame tx (payer {paymaster})")
+        payer_label = paymaster if paymaster else f"pool {cfg['pool']} (self-pay)"
+        print(f"join-split withdraw via frame tx (payer {payer_label})")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
                        dry_run=dry, sender_override=sender_override,
                        max_fee_override=max_fee_override, max_priority_override=max_priority_override,

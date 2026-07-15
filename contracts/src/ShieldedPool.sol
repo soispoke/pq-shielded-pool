@@ -4,9 +4,12 @@ pragma solidity ^0.8.24;
 import {PoseidonBN254} from "./PoseidonBN254.sol";
 import {Groth16Verifier} from "./Groth16Verifier.sol";
 
-/// @title ShieldedPool — arbitrary-value join-split pool (BN254 / Groth16)
-/// @notice An arbitrary-value join-split shielded pool on today's
-///         cryptography, built to exercise two envelope features:
+/// @title ShieldedPool — native-ETH join-split pool (BN254 / Groth16)
+/// @notice A native-ETH-only, arbitrary-value join-split shielded pool on
+///         today's cryptography. Every value and fee is denominated in wei;
+///         deposits use msg.value and withdrawals/credits pay ETH. There is no
+///         ERC-20 interface or token conversion. The pool exercises two
+///         envelope features:
 ///
 ///         1. EIP-8250 MULTI-KEY nonces, protocol-native. A spend's two
 ///            nullifiers ARE the transaction's keyed-nonce set, consumed by
@@ -19,10 +22,12 @@ import {Groth16Verifier} from "./Groth16Verifier.sol";
 ///            The circuit rejects nf1 == nf2; strictly-increasing keys
 ///            repeat the check at consensus.
 ///
-///         2. The PAYMASTER prepayment binding. Every spend carries a `fee`
-///            bound as a proof public signal. Settlement credits it to the
-///            authenticated payer returned by TXPARAM(0x11), which claims
-///            separately; no external call can revert the note spend.
+///         2. Native-ETH fee prepayment. Every spend carries a wei-denominated
+///            `fee` bound as a proof public signal. In the core shape the pool
+///            pays gas and retains the fee. In the optional sponsored shape,
+///            settlement credits the authenticated external payer returned by
+///            TXPARAM(0x11), which claims ETH separately; no external call can
+///            revert the note spend.
 ///
 ///         Notes carry a 128-bit value: cm = Poseidon(TAG_LEAF, inner, value)
 ///         with inner = Poseidon2(owner_pk, rho). `shield` hashes msg.value
@@ -86,6 +91,7 @@ contract ShieldedPool {
     error ZeroNullifier();
     error NotFrameNative();
     error NotFaithfulShape();
+    error FeeBelowMaxCost();
     error RootNotBoundToReference();
     error ProofInvalid();
     error InvalidDomain();
@@ -179,7 +185,7 @@ contract ShieldedPool {
 
     /// Proof and canonicity, calldata-only. Reads no storage (the verifier's
     /// key is in code, the field/range guards are on calldata), so a
-    /// VERIFY-frame paymaster can STATICCALL it and clear the ERC-7562
+    /// optional VERIFY-frame paymaster can STATICCALL it and clear the ERC-7562
     /// observer's non-sender-SLOAD ban. Root recency is NOT checked here or
     /// anywhere in the pool: the declared EIP-8272 reference carries it, the
     /// protocol validates the reference at admission and block execution, and
@@ -230,10 +236,9 @@ contract ShieldedPool {
     /// one that consumed exactly the proven nullifiers, that the proven root
     /// rides as the transaction's protocol-validated recent-root reference,
     /// and that the proof holds; then it settles. The pool keeps no spent set
-    /// and no root history. The proof check stays pool-side deliberately: the
-    /// paymaster's prefix check protects the paymaster's gas float, this one
-    /// protects noteholders, and the pool has no authenticated signal naming
-    /// the execution authorizer that verified the prefix.
+    /// and no root history. The proof check stays pool-side deliberately. In
+    /// the core self-paying shape it protects the pool; in the optional
+    /// sponsored shape it also remains independent of the payer.
     function _spend(Spend calldata s) internal returns (address payer) {
         // pinned sender: EIP-8250 key domains are per sender, so this pin is
         // what makes (POOL_SENDER, {nf}) a global spent set
@@ -262,17 +267,20 @@ contract ShieldedPool {
         ) = abi.decode(
             ret, (uint256, uint256, uint256, uint256, bytes32, bytes32, uint256, bytes32, bytes32, address, uint256)
         );
-        // Exactly-once per consumption. The faithful grammar has ONE settle
-        // frame, index 2 of 3, and the protocol calls each frame's target
-        // once. Requiring frame 2 to target THIS pool directly means the
-        // single frame-2 call is the only entry: a settle frame pointing at
+        // Exactly-once per consumption. The core self-paying grammar has one
+        // VERIFY and one settle frame; the optional paymaster grammar inserts
+        // one payment VERIFY between them. Requiring the current final frame
+        // to target this pool directly means its single call is the only entry:
+        // a settle frame pointing at
         // some intermediary (even POOL_SENDER itself, were it a contract or a
         // 7702-delegated EOA that re-enters twice) has settleTarget != this
         // and cannot double-credit against one protocol nonce consumption.
         // The sender pin already blocks any intermediary whose address is not
         // POOL_SENDER; this closes the residual case where POOL_SENDER is the
-        // intermediary. frameIndex == 2 ensures we are executing that frame.
-        if (frames != 3 || frameIndex != 2 || settleTarget != address(this)) revert NotFaithfulShape();
+        // intermediary.
+        bool selfPayShape = frames == 2 && frameIndex == 1;
+        bool paymasterShape = frames == 3 && frameIndex == 2;
+        if ((!selfPayShape && !paymasterShape) || settleTarget != address(this)) revert NotFaithfulShape();
         // the protocol's consumed key set == exactly the proven nullifiers
         // (strictly increasing at consensus, so matching {lo, hi} also
         // rejects nf1 == nf2)
@@ -318,7 +326,10 @@ contract ShieldedPool {
             if (new2) emit LeafAppended(s.outCm2, i2, currentRoot, slot);
         }
         _publishRoot();
-        if (s.fee != 0) {
+        // In the core shape the pool is payer, so the proof-bound fee remains
+        // in the pool to offset its ETH gas debit. Only an external payer gets
+        // a pull credit.
+        if (s.fee != 0 && payer != address(this)) {
             feeCredit[payer] += s.fee;
             emit FeeCredited(payer, s.fee);
         }
@@ -340,7 +351,7 @@ contract ShieldedPool {
     /// Pull-payment claims. ANYONE may push a party's recorded credit to that
     /// party: the amount is what settlement recorded for `who`, and it is sent
     /// to `who` itself (no redirect). This is what lets a passive contract
-    /// recipient, such as the faithful-shape paymaster (whose only ETH-in path
+    /// recipient, such as an optional paymaster (whose only ETH-in path
     /// is a bare receive), actually collect its fee, closing the sponsorship
     /// loop, since a keyed `feeCredit[msg.sender]` claim would strand it (the
     /// paymaster has no code path to call this). The credit is zeroed before

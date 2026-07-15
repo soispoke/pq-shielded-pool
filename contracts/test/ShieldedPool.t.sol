@@ -119,6 +119,17 @@ contract ShieldedPoolBN254Test {
         assertTrue(pool.currentRoot() == _s(".withdraw.root"), "pool root after transfer != wallet's withdraw root");
     }
 
+    function test_two_frame_self_payer_shape_settles_without_fee_credit() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
+        probe.setPayer(address(pool));
+        probe.set(2, 1, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool));
+        vm.prank(POOL_SENDER);
+        pool.transfer(s);
+        assertTrue(pool.isLeaf(s.outCm1) && pool.isLeaf(s.outCm2), "self-payer outputs appended");
+        assertTrue(pool.feeCredit(address(pool)) == 0, "self-payer fee retained, not credited");
+    }
+
     // ---- 2. envelope bindings (the settle-only trust surface) ----
 
     /// Outside a frame transaction the probe's opcodes halt; the pool must
@@ -131,9 +142,9 @@ contract ShieldedPoolBN254Test {
         pool.transfer(s);
     }
 
-    /// Exactly-once: only the faithful [verify, pay, SENDER] grammar settles.
-    /// A second settle frame in the same tx would re-credit the fee for one
-    /// protocol consumption.
+    /// Exactly-once: only [self-verify, SENDER] or the optional
+    /// [only-verify, pay, SENDER] grammar settles. A second settle frame in the
+    /// same tx could duplicate state effects for one protocol consumption.
     function test_wrong_frame_shape_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
         (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
@@ -366,8 +377,8 @@ contract ShieldedPoolBN254Test {
         assertTrue(POOL_SENDER.balance == senderBefore + ts.fee + ws.fee, "fees claimed");
     }
 
-    /// The stranded-fee regression: in the faithful shape the resolved payer
-    /// is the paymaster, a passive contract whose only ETH-in path is receive().
+    /// The optional sponsored-path regression: the resolved external payer is
+    /// a passive contract whose only ETH-in path is receive().
     /// A keyed `feeCredit[msg.sender]` claim would strand it. The pushable
     /// claim lets any keeper move the credit into the paymaster's balance,
     /// where it funds future sponsorship.
@@ -540,7 +551,7 @@ contract ShieldedPoolBN254Test {
         );
     }
 
-    // ---- verifyProofOnly: the paymaster's prefix check ----
+    // ---- verifyProofOnly: proof entrypoint used by frame 0 and optional payer ----
 
     /// verifyProofOnly must succeed under STATICCALL (VERIFY-frame legal) and
     /// reads no storage, so it clears the observer's non-sender-SLOAD ban.

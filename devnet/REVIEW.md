@@ -1774,5 +1774,112 @@ Local verification passes all 123 Forge tests, including zero and
 non-canonical payer words against the Solidity reference, monolithic Yul pool,
 and dispatcher architecture. Python compilation, frame vectors, wallet/tree
 fixtures, Poseidon vectors, Yul compilation, formatter, and warning-denying
-lint gates also pass. A fresh live deployment of this revised ABI remains the
-next integration check; no live result is claimed here.
+lint gates also pass. At that point a fresh live deployment of the revised ABI
+was the remaining integration check; the completed run is recorded below.
+
+## Authenticated payer live closure (2026-07-15)
+
+That integration check is now complete on a fresh deployment. Pool
+`0x1275d096…` shielded 0.10 ETH in block 189110. An unrelated zero-balance
+outer signer then submitted a proof-authorized transfer through paymaster A
+in block 189135 and a withdrawal through independent paymaster B in block
+189151. Both were admitted through the public RPC as type-0x06 transactions;
+simulation and execution resolved the intended paymaster as payer, and
+settlement credited each authenticated payer exactly the proof-bound 0.04 ETH
+fee through `TXPARAM(0x11)`. The outer signer remained at zero balance.
+
+Before consuming the transfer nullifiers, under-fee, corrupted-proof,
+wrong-key-set, and down-gassed controls all failed in the validation prefix
+with `payer=None`; the valid baseline still passed immediately afterward.
+After the two spends the pool was exactly solvent for 0.08 ETH of fee credits
+plus 0.02 ETH of withdrawal credit. Permissionless claims paid both
+paymasters and the bound recipient, leaving every credit and the pool balance
+at zero. Replaying either exact mined transaction was rejected at admission
+with keyed-nonce `expected 1, got 0`.
+
+Addresses, proof fixture, root-publication blocks, signed mined transactions,
+negative vectors, transaction hashes, gas measurements, and final balances
+are archived in `devnet/vectors/2026-07-15-trustless-loop/`. This closes the
+trustless pool-side loop on the upgraded ethrex devnet. It proves normal
+public-mempool admission, not carriage by a FOCIL inclusion list; actual
+inclusion-list enforcement and omission validation remain an ethrex/consensus
+milestone.
+
+## Architecture correction: self-paying core, optional paymaster (2026-07-15)
+
+The privacy protocol does not need paymaster functionality. The pool can be
+both sender and payer. Its frame-0 VERIFY checks the proof, keyed nonce set,
+recent-root reference, settlement data, gas limits, and proof-bound fee, then
+uses combined execution-and-payment approval. The final SENDER frame settles.
+Payment approval consumes the keyed nullifiers exactly as it does in the
+sponsored shape.
+
+The builder now emits this two-frame shape by default. The pool keeps the fee
+instead of recording a fee credit owed to itself. `--sponsored` and
+`--paymaster` retain the three-frame external-payer path as optional fee
+abstraction. Settlement and `EnvelopeProbe.yul` accept and authenticate both
+exact shapes.
+
+All 126 Forge tests pass, including a two-frame self-paying settlement test for
+the standalone Solidity reference, monolithic Yul pool, and thin dispatcher.
+The generated Yul artifacts and Python builder were regenerated and checked.
+The archived live runs above remain valid evidence for the optional sponsored
+shape. They are not evidence that a paymaster is required. The fresh live
+self-paying result is recorded below.
+
+## Two-frame self-paying live closure (2026-07-15)
+
+The default path has now completed a fresh end-to-end run on the public
+Hegotá RPC with no paymaster deployed. The probe, logic, and dispatcher were
+newly deployed as pool `0x0d4ff719…`; the immutable verifier and Poseidon
+libraries were reused from the earlier same-day proof lifecycle to conserve
+the disposable devnet account's ETH. A 0.10 ETH shield mined in block 191883.
+
+An unrelated outer signer with zero ETH then submitted both private spends.
+The transfer mined in block 191889 at 1,385,529 gas and the withdrawal mined
+in block 191899 at 1,525,556 gas. Simulation resolved the pool itself as payer
+for both. Decoding each signed type-0x06 transaction showed exactly two frames:
+one VERIFY frame targeting the pool with combined execution-and-payment flags,
+then one SENDER frame targeting the pool. There was no paymaster frame.
+
+After the transfer, the three-leaf tree root matched the withdrawal proof's
+root byte for byte. After both spends, `feeCredit(pool)` was still zero and
+the bound recipient held exactly 0.02 ETH of withdrawal credit. The pool's
+two gas debits totaled 2,911,085,020,377,595 wei. An ordinary claim paid the
+recipient exactly 0.02 ETH, cleared the credit, and left the pool at the exact
+accounting result of 77,088,914,979,622,405 wei. The outer signer remained at
+zero throughout.
+
+Replaying either exact mined transaction was rejected at admission with
+keyed-nonce `expected 1, got 0`. Deployment details, proof fixture, signed
+transactions, hashes, gas measurements, and accounting are archived in
+`devnet/vectors/2026-07-15-self-paying/`. This proves the self-paying path on
+one ethrex configuration, not FOCIL inclusion-list carriage.
+
+## Ethrex payer versus paymaster audit (2026-07-15)
+
+The live result confirms that ethrex's execution core supports the intended
+split: combined approval makes the pool both sender and payer, while a
+payment-only VERIFY target can be a distinct external payer. Most earlier
+feature work was not paymaster-only. The higher validation budget,
+validation-prefix simulation, keyed-nonce access, recent-root access, payer
+bookkeeping, refund, receipt, and payer introspection also serve the
+self-paying privacy path. Only the separate `pay` prefix and paymaster-specific
+mempool policy are exclusive to external sponsorship. ERC-20 reimbursement
+itself remains contract logic and is not implemented by the client or pool.
+
+The public ethrex `hegota-devnet` branch at `2d64fba` still needs two cleanups.
+First, it classifies every resolved payer, including `payer == sender`, as an
+`accessed_paymaster`, so the non-canonical-paymaster pending limit can apply to
+a self-paying pool. Balance reservation should remain general payer accounting,
+but canonicality and paymaster-specific limits should be conditional on a
+distinct payer or an actual `pay` frame. Second, its payment-only APPROVE path
+does not require prior execution approval, while the current EIP-8141 text
+does. The normal `only_verify + pay` prefix supplies that ordering, but the VM
+must enforce it too.
+
+The running devnet adds resolved payer selector `TXPARAM(0x11)`, but that patch
+is not present in the public branch, whose selector table stops at `0x10`.
+Both live shapes prove the runtime behavior: it returns the pool for combined
+self-payment and the pay-frame target for sponsorship. Public source and tests
+remain necessary before treating that extension as closed.

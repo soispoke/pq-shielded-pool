@@ -210,6 +210,12 @@ contract YulShieldedPoolTest {
         probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool));
     }
 
+    function _armSelfPay(ShieldedPool.Spend memory s) internal {
+        (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
+        probe.setPayer(address(pool));
+        probe.set(2, 1, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool));
+    }
+
     /// Shield Alice's 1.0-ether note so the pool's tree matches the fixture's
     /// transfer root, and return the armed fixture transfer spend.
     function _shieldA() internal returns (ShieldedPool.Spend memory ts) {
@@ -231,6 +237,15 @@ contract YulShieldedPoolTest {
         assertTrue(pool.currentRoot() == _s(".withdraw.root"), "pool root after transfer != wallet's withdraw root");
     }
 
+    function test_self_paying_two_frame_shape_settles_without_fee_credit() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        _armSelfPay(s);
+        vm.prank(address(pool));
+        pool.transfer(s);
+        assertTrue(pool.isLeaf(s.outCm1) && pool.isLeaf(s.outCm2), "self-pay outputs appended");
+        assertTrue(pool.feeCredit(address(pool)) == 0, "self-pay fee retained, not credited");
+    }
+
     // ---- 2. envelope bindings (the settle-only trust surface) ----
 
     /// Outside a frame transaction the probe's opcodes halt; the pool must
@@ -243,7 +258,8 @@ contract YulShieldedPoolTest {
         pool.transfer(s);
     }
 
-    /// Exactly-once: only the faithful [verify, pay, SENDER] grammar settles.
+    /// Exactly-once: only [self-verify, SENDER] or the optional
+    /// [only-verify, pay, SENDER] grammar settles.
     function test_wrong_frame_shape_reverts() public {
         ShieldedPool.Spend memory s = _shieldA();
         (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
@@ -478,8 +494,8 @@ contract YulShieldedPoolTest {
         assertTrue(SUBMITTER.balance == senderBefore + ts.fee + ws.fee, "fees claimed");
     }
 
-    /// The stranded-fee regression: pushable claims let a passive contract
-    /// recipient (the faithful-shape paymaster) actually collect its fee.
+    /// The optional sponsored-path regression: pushable claims let a passive
+    /// external payer actually collect its ETH fee.
     function test_anyone_can_push_fee_to_passive_recipient() public {
         PassiveReceiver pm = new PassiveReceiver();
         ShieldedPool.Spend memory s = _shieldA();
@@ -698,7 +714,7 @@ contract YulShieldedPoolTest {
         );
     }
 
-    // ---- verifyProofOnly: the paymaster's prefix check ----
+    // ---- verifyProofOnly: proof entrypoint used by frame 0 and optional payer ----
 
     function test_verifyProofOnly_is_static() public {
         ShieldedPool.Spend memory s = _shieldA();

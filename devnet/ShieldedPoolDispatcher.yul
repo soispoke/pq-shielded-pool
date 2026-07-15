@@ -3,15 +3,19 @@
 ///         object deployed AT the pool address. It does only what must be Yul,
 ///         and DELEGATECALLs everything else to a reviewable Solidity settlement
 ///         implementation (contracts/src/ShieldedPoolLogic.sol).
+///         The delegated pool is native-ETH only; this shell contains no ERC-20
+///         or token-conversion path.
 ///
 ///         Two entrypoints:
-///           - empty calldata: the frame-0 execution-scope VERIFY frame. This
+///           - empty calldata: the frame-0 VERIFY frame. This
 ///             is the sole reason the pool must be Yul: it reads the frame-tx
 ///             envelope opcodes (TXPARAM / FRAMEPARAM / FRAMEDATALOAD /
 ///             NONCEKEYLOAD / RECENTROOTREFLOAD), authenticates the grammar,
 ///             the exact keyed-nonce set, and the recent-root reference,
-///             verifies the proof over the byte-exact frame-2 Spend, and emits
-///             APPROVE_EXECUTION (verbatim, unavailable to Solidity).
+///             verifies the proof over the byte-exact final-frame Spend, and
+///             emits combined execution-and-payment approval in the canonical
+///             self-paying shape. The optional sponsored shape uses execution
+///             approval here and payment approval in a separate VERIFY frame.
 ///           - any nonzero calldata: forwarded by DELEGATECALL to the
 ///             implementation, so shield / transfer / withdraw / verifyProofOnly
 ///             / claims / views all run as compiled, memory-safe Solidity in
@@ -80,6 +84,7 @@ object "ShieldedPoolDispatcher" {
             function nonceKey(i) -> value { value := verbatim_1i_1o(hex"B9", i) }
             function recentRootRef(field, index) -> value { value := verbatim_2i_1o(hex"B5", field, index) }
             function approveExecution() { verbatim_3i_0o(hex"AA", 0, 0, 2) }
+            function approveExecutionAndPayment() { verbatim_3i_0o(hex"AA", 0, 0, 3) }
 
             // ================= named errors (ShieldedPool.sol selectors) =====
             // The frame-0 path reuses the pool's error selectors so a
@@ -98,6 +103,7 @@ object "ShieldedPoolDispatcher" {
             function errCtxRecipient() -> s { s := 0x49cb8b3a } // CtxDoesNotNameRecipient()
             function errNotCanonical() -> s { s := 0xd7c7beeb }
             function errValueTooLarge() -> s { s := 0x2ad907fb }
+            function errFeeBelowMaxCost() -> s { s := 0x315cb54e }
             function errInvalidDomain() -> s { s := 0xeb127982 }
             function errZeroNullifier() -> s { s := 0xcbbbbfe1 }
 
@@ -134,7 +140,7 @@ object "ShieldedPoolDispatcher" {
                 a := and(mload(0x00), 0xffffffffffffffffffffffffffffffffffffffff)
             }
 
-            // Verify the proof INLINE from the frame-2 Spend tuple (offsets
+            // Verify the proof INLINE from the settle frame's Spend tuple (offsets
             // relative to the SENDER calldata: 4-byte selector, then the static
             // 544-byte tuple). Canonicity + range + domain, then a direct
             // STATICCALL to the immutable verifier (no delegatecall: the
@@ -142,16 +148,16 @@ object "ShieldedPoolDispatcher" {
             // ShieldedPoolLogic.verifyProofOnly + _verifyProof over the same
             // nine public signals, so frame-0 authenticates the exact tuple the
             // SENDER frame will settle. Fixed 500k gas literal, no GAS opcode.
-            function verifyFrame2Proof() {
-                let root := frameDataLoad(2, 4)
-                let dom := frameDataLoad(2, 36)
-                let nf1 := frameDataLoad(2, 68)
-                let nf2 := frameDataLoad(2, 100)
-                let oc1 := frameDataLoad(2, 132)
-                let oc2 := frameDataLoad(2, 164)
-                let pub := frameDataLoad(2, 196)
-                let fee := frameDataLoad(2, 228)
-                let ctx := frameDataLoad(2, 260)
+            function verifyFrameProof(settleIndex) {
+                let root := frameDataLoad(settleIndex, 4)
+                let dom := frameDataLoad(settleIndex, 36)
+                let nf1 := frameDataLoad(settleIndex, 68)
+                let nf2 := frameDataLoad(settleIndex, 100)
+                let oc1 := frameDataLoad(settleIndex, 132)
+                let oc2 := frameDataLoad(settleIndex, 164)
+                let pub := frameDataLoad(settleIndex, 196)
+                let fee := frameDataLoad(settleIndex, 228)
+                let ctx := frameDataLoad(settleIndex, 260)
                 if iszero(nf1) { fail(errZeroNullifier()) }
                 if iszero(nf2) { fail(errZeroNullifier()) }
                 if iszero(eq(dom, domainVal())) { fail(errInvalidDomain()) }
@@ -169,9 +175,9 @@ object "ShieldedPoolDispatcher" {
                 // at 0x80 (keep 0x00..0x80 scratch free).
                 let m := 0x80
                 mstore(m, shl(224, 0xc542c93b))
-                // pA,pB,pC = 8 words from the frame-2 proof region (offset 292).
+                // pA,pB,pC = 8 words from the settle-frame proof region (offset 292).
                 for { let i := 0 } lt(i, 8) { i := add(i, 1) } {
-                    mstore(add(add(m, 0x04), mul(i, 0x20)), frameDataLoad(2, add(292, mul(i, 0x20))))
+                    mstore(add(add(m, 0x04), mul(i, 0x20)), frameDataLoad(settleIndex, add(292, mul(i, 0x20))))
                 }
                 // input[9] in the circuit's public-signal order.
                 mstore(add(m, 0x104), nf1)
@@ -191,57 +197,72 @@ object "ShieldedPoolDispatcher" {
 
             // ================= frame-0 VERIFY as the sender =================
             // Empty-calldata invocation is the frame-0 execution-scope VERIFY
-            // frame targeting the sender (this pool). Extracted verbatim from
-            // the validated monolith: authenticate grammar, exact keyed nonces,
-            // recent-root reference, verify the proof over the frame-2 Spend,
-            // emit APPROVE_EXECUTION.
+            // frame targeting the sender (this pool). The core two-frame shape
+            // approves execution and payment here, so the pool is both sender
+            // and payer. The optional three-frame shape approves execution here
+            // and lets a separate paymaster approve payment in frame 1.
             function verifyFrameApprove() {
                 // envelope: this pool is the sender and the frame-0 target
                 if iszero(eq(txParam(0x02), address())) { fail(errNotFaithfulShape()) }
-                if iszero(eq(txParam(0x09), 3)) { fail(errNotFaithfulShape()) }
+                let frames := txParam(0x09)
+                let settleIndex := 0
+                let selfPay := 0
+                switch frames
+                case 2 { settleIndex := 1 selfPay := 1 }
+                case 3 { settleIndex := 2 }
+                default { fail(errNotFaithfulShape()) }
                 if txParam(0x0A) { fail(errKeySetMismatch()) } // nonce_seq == 0
                 if iszero(eq(txParam(0x0B), 1)) { fail(errRootNotBound()) } // one recent-root ref
                 if txParam(0x07) { fail(errNotFaithfulShape()) } // no blobs
                 if iszero(eq(txParam(0x0D), 2)) { fail(errKeySetMismatch()) } // two nonce keys
                 if txParam(0x01) { fail(errNotFaithfulShape()) }
                 if iszero(eq(txParam(0x0F), 1)) { fail(errNotFaithfulShape()) } // one signature
-                // frame 0: VERIFY(this), execution-only, empty, zero-value
+                // frame 0: VERIFY(this), empty, zero-value. It is combined
+                // execution+payment in the core shape and execution-only when
+                // an optional paymaster follows.
                 if iszero(eq(frameParam(0, 0x00), address())) { fail(errNotFaithfulShape()) }
                 if iszero(eq(frameParam(0, 0x02), 1)) { fail(errNotFaithfulShape()) }
-                if iszero(eq(frameParam(0, 0x03), 2)) { fail(errNotFaithfulShape()) }
                 if frameParam(0, 0x04) { fail(errNotFaithfulShape()) }
-                if iszero(eq(frameParam(0, 0x01), 300000)) { fail(errNotFaithfulShape()) }
                 if frameParam(0, 0x08) { fail(errNotFaithfulShape()) }
-                // frame 1: payment-only VERIFY (the paymaster)
-                if iszero(eq(frameParam(1, 0x02), 1)) { fail(errNotFaithfulShape()) }
-                if iszero(eq(frameParam(1, 0x03), 1)) { fail(errNotFaithfulShape()) }
-                if iszero(eq(frameParam(1, 0x01), 100000)) { fail(errNotFaithfulShape()) }
-                if frameParam(1, 0x08) { fail(errNotFaithfulShape()) }
-                // frame 2: the only execution, directly into this pool
-                if iszero(eq(frameParam(2, 0x00), address())) { fail(errNotFaithfulShape()) }
-                if iszero(eq(frameParam(2, 0x02), 2)) { fail(errNotFaithfulShape()) }
-                if frameParam(2, 0x03) { fail(errNotFaithfulShape()) }
-                if iszero(eq(frameParam(2, 0x01), 10000000)) { fail(errNotFaithfulShape()) }
-                if frameParam(2, 0x08) { fail(errNotFaithfulShape()) }
-                let dataLen := frameParam(2, 0x04)
-                let selector := shr(224, frameDataLoad(2, 0))
+                switch selfPay
+                case 1 {
+                    if iszero(eq(frameParam(0, 0x03), 3)) { fail(errNotFaithfulShape()) }
+                    if iszero(eq(frameParam(0, 0x01), 350000)) { fail(errNotFaithfulShape()) }
+                }
+                default {
+                    if iszero(eq(frameParam(0, 0x03), 2)) { fail(errNotFaithfulShape()) }
+                    if iszero(eq(frameParam(0, 0x01), 300000)) { fail(errNotFaithfulShape()) }
+                    // frame 1: payment-only VERIFY (optional paymaster)
+                    if iszero(eq(frameParam(1, 0x02), 1)) { fail(errNotFaithfulShape()) }
+                    if iszero(eq(frameParam(1, 0x03), 1)) { fail(errNotFaithfulShape()) }
+                    if iszero(eq(frameParam(1, 0x01), 100000)) { fail(errNotFaithfulShape()) }
+                    if frameParam(1, 0x08) { fail(errNotFaithfulShape()) }
+                }
+                // final frame: the only execution, directly into this pool
+                if iszero(eq(frameParam(settleIndex, 0x00), address())) { fail(errNotFaithfulShape()) }
+                if iszero(eq(frameParam(settleIndex, 0x02), 2)) { fail(errNotFaithfulShape()) }
+                if frameParam(settleIndex, 0x03) { fail(errNotFaithfulShape()) }
+                if iszero(eq(frameParam(settleIndex, 0x01), 10000000)) { fail(errNotFaithfulShape()) }
+                if frameParam(settleIndex, 0x08) { fail(errNotFaithfulShape()) }
+                let dataLen := frameParam(settleIndex, 0x04)
+                let selector := shr(224, frameDataLoad(settleIndex, 0))
                 switch dataLen
                 case 548 {
                     if iszero(eq(selector, 0xb9947fa0)) { fail(errNotFaithfulShape()) } // transfer
-                    if frameDataLoad(2, 196) { fail(errTransferShape()) } // publicAmount == 0
-                    if frameDataLoad(2, 260) { fail(errTransferShape()) } // ctx == 0
+                    if frameDataLoad(settleIndex, 196) { fail(errTransferShape()) } // publicAmount == 0
+                    if frameDataLoad(settleIndex, 260) { fail(errTransferShape()) } // ctx == 0
                 }
                 case 580 {
                     if iszero(eq(selector, 0xd677b46e)) { fail(errNotFaithfulShape()) } // withdraw
-                    if iszero(frameDataLoad(2, 196)) { fail(errWithdrawShape()) } // publicAmount > 0
-                    let recipient := frameDataLoad(2, 548)
+                    if iszero(frameDataLoad(settleIndex, 196)) { fail(errWithdrawShape()) } // publicAmount > 0
+                    let recipient := frameDataLoad(settleIndex, 548)
                     if or(iszero(recipient), shr(160, recipient)) { fail(errWithdrawShape()) }
-                    if iszero(eq(frameDataLoad(2, 260), recipient)) { fail(errCtxRecipient()) } // ctx names recipient
+                    if iszero(eq(frameDataLoad(settleIndex, 260), recipient)) { fail(errCtxRecipient()) } // ctx names recipient
                 }
                 default { fail(errNotFaithfulShape()) }
                 // nonce keys == sorted proof nullifiers
-                let nf1 := frameDataLoad(2, 68)
-                let nf2 := frameDataLoad(2, 100)
+                let nf1 := frameDataLoad(settleIndex, 68)
+                let nf2 := frameDataLoad(settleIndex, 100)
                 let lo := nf1
                 let hi := nf2
                 if gt(lo, hi) {
@@ -252,12 +273,19 @@ object "ShieldedPoolDispatcher" {
                 if iszero(eq(nonceKey(1), hi)) { fail(errKeySetMismatch()) }
                 // recent-root ref names this pool's source and the proven root
                 if iszero(eq(recentRootRef(0, 0), sourceId())) { fail(errRootNotBound()) }
-                if iszero(eq(recentRootRef(2, 0), frameDataLoad(2, 4))) { fail(errRootNotBound()) }
+                if iszero(eq(recentRootRef(2, 0), frameDataLoad(settleIndex, 4))) { fail(errRootNotBound()) }
                 // Verify the proof INLINE (direct staticcall to the verifier),
                 // not via a delegatecall to the implementation: the observer
                 // bans delegatecall in a VERIFY frame.
-                verifyFrame2Proof()
-                approveExecution()
+                verifyFrameProof(settleIndex)
+                switch selfPay
+                case 1 {
+                    // The proof removes at least the transaction's maximum gas
+                    // liability from note value before the pool pays that cost.
+                    if lt(frameDataLoad(settleIndex, 228), txParam(0x06)) { fail(errFeeBelowMaxCost()) }
+                    approveExecutionAndPayment()
+                }
+                default { approveExecution() }
             }
 
             // ================= dispatch =====================================

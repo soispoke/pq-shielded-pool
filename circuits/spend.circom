@@ -2,17 +2,18 @@ pragma circom 2.0.8;
 
 // Shielded-pool JOIN-SPLIT spend circuit, BN254 edition (Groth16 / circom).
 //
-// Arbitrary-value notes: a spend consumes up to two input notes and creates
-// two output notes, with a public withdrawal amount and a public fee. It is
-// built to exercise two envelope features end to end:
+// Native-ETH-only, arbitrary-value notes: every value, public amount, and fee
+// is denominated in wei. A spend consumes up to two input notes and creates
+// two output notes, with a public ETH withdrawal amount and a public ETH fee.
+// The circuit has no token address or ERC-20 semantics. It is built to
+// exercise two envelope features end to end:
 //
 //   - EIP-8250 MULTI-KEY nonces: the two nullifiers are consumed as ONE
 //     keyed-nonce set (shared nonce_seq = 0, atomic, per-sender domain), the
 //     `nonce_keys` list shape bounded by MAX_NONCE_KEYS = 16;
-//   - the fee binding that makes a TRUSTLESS PAYMASTER possible: `fee` is a
-//     public signal the proof binds, so whoever submits the spend is
-//     reimbursed from shielded value by the contract itself, and no relayer
-//     needs trusting.
+//   - native-ETH fee binding: `fee` is a public signal. In the core path the
+//     pool self-pays and retains it; an optional external ETH payer can instead
+//     receive it as reimbursement. No token-to-ETH conversion is modeled.
 //
 // What it proves (hiding keys, secrets, values, and both Merkle paths):
 //

@@ -185,6 +185,12 @@ contract DispatcherPoolTest {
         probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool));
     }
 
+    function _armSelfPay(ShieldedPool.Spend memory s) internal {
+        (bytes32 lo, bytes32 hi) = uint256(s.nf1) < uint256(s.nf2) ? (s.nf1, s.nf2) : (s.nf2, s.nf1);
+        probe.setPayer(address(pool));
+        probe.set(2, 1, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool));
+    }
+
     function _shieldA() internal returns (ShieldedPool.Spend memory ts) {
         pool.shield{value: _u(".shield_value")}(_s(".inner_a"));
         require(pool.isLeaf(_s(".cm_a")), "shield hashed the wrong commitment");
@@ -230,6 +236,15 @@ contract DispatcherPoolTest {
         assertTrue(pool.isLeaf(s.outCm1) && pool.isLeaf(s.outCm2), "both outputs appended");
         assertTrue(pool.feeCredit(SUBMITTER) == s.fee, "fee credited");
         assertTrue(pool.currentRoot() == _s(".withdraw.root"), "root advanced to wallet's withdraw root");
+    }
+
+    function test_self_paying_two_frame_shape_settles_without_fee_credit() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        _armSelfPay(s);
+        vm.prank(address(pool));
+        pool.transfer(s);
+        assertTrue(pool.isLeaf(s.outCm1) && pool.isLeaf(s.outCm2), "self-pay outputs appended");
+        assertTrue(pool.feeCredit(address(pool)) == 0, "self-pay fee retained, not credited");
     }
 
     function test_transfer_emits_full_sequence_in_order() public {

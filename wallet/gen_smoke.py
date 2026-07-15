@@ -1,6 +1,6 @@
-"""Generate the join-split smoke fixture with REAL Groth16 proofs.
+"""Generate the native-ETH join-split smoke fixture with REAL Groth16 proofs.
 
-The story, with arbitrary values and fees end to end:
+All values and fees are wei-denominated; no ERC-20 path is modeled. The story:
 
   1. Alice shields 1.0 ether into note A.
   2. Alice's join-split transfer: inputs (A, dummy), outputs (Bob 0.6,

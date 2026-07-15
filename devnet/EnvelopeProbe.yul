@@ -13,7 +13,7 @@
 ///           [6] recent-root ref count  TXPARAM 0x0F
 ///           [7] ref[0].source_id       RECENTROOTREFLOAD 0xB5 (0 when none)
 ///           [8] ref[0].root            RECENTROOTREFLOAD 0xB5 (0 when none)
-///           [9] frame[2].target        FRAMEPARAM 0xB3 (0 when < 3 frames)
+///           [9] current frame target   FRAMEPARAM 0xB3
 ///          [10] resolved payer         TXPARAM 0x11
 ///
 ///         Guarded reads: the load opcodes exceptional-halt out of range, so
@@ -33,7 +33,8 @@ object "EnvelopeProbe" {
             }
             let frames := txParam(0x09)
             mstore(0, frames)
-            mstore(32, txParam(0x0A))
+            let frameIndex := txParam(0x0A)
+            mstore(32, frameIndex)
             let keyCount := txParam(0x0D)
             mstore(64, keyCount)
             mstore(96, txParam(0x01))
@@ -46,9 +47,12 @@ object "EnvelopeProbe" {
                 mstore(224, verbatim_2i_1o(hex"B5", 0, 0)) // field 0: source_id
                 mstore(256, verbatim_2i_1o(hex"B5", 2, 0)) // field 2: root
             }
-            // frame[2].target: guarded, since FRAMEPARAM halts out of range.
+            // Current frame target. The settle frame is index 1 in the
+            // self-paying shape and index 2 in the optional paymaster shape.
             // FRAMEPARAM pops frameIndex first (stack top), then param 0x00.
-            if gt(frames, 2) { mstore(288, verbatim_2i_1o(hex"B3", 2, 0x00)) }
+            if lt(frameIndex, frames) {
+                mstore(288, verbatim_2i_1o(hex"B3", frameIndex, 0x00))
+            }
             // The consensus-resolved account whose successful payment-scoped
             // APPROVE paid the transaction's maximum cost. Payment approval
             // precedes the SENDER settlement frame, so this is authenticated

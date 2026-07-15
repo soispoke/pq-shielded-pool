@@ -8,16 +8,26 @@ waste is not independently controlled.
 
 ## Security model
 
+The asset model is native ETH only. Deposits enter as `msg.value`; all note
+values, public amounts, fees, withdrawals, and payer credits are denominated
+in wei and settle as ETH. No ERC-20 contract is called, and the optional
+paymaster neither accepts tokens nor converts a token-denominated fee into ETH.
+
 The pool is frame-native and depends on the Hegotá implementations of
 EIP-8141, EIP-8250, and EIP-8272. Its two nullifiers are consumed by protocol
-state at payment approval. Settlement therefore assumes the exact three-frame
-grammar and the envelope values returned by `EnvelopeProbe.yul`.
+state at payment approval. The core transaction has two frames: the pool's
+VERIFY frame authenticates the proof and keyed nonces, then approves execution
+and payment together; the pool's SENDER frame settles. The pool is both sender
+and payer. A separate paymaster is not required. An optional sponsored form
+inserts a payment-only VERIFY frame. Settlement accepts only these two exact
+grammars and the envelope values returned by `EnvelopeProbe.yul`.
 
 The pool deliberately keeps no second spent set. A settlement revert after
 approval permanently consumes the notes. Pull credits remove recipient-call
 failures, and fee routing has no calldata choice: settlement credits the
 nonzero, right-aligned payer authenticated by `TXPARAM(0x11)`. Tests cover
-malformed payer words plus the envelope and proof failure paths. Tree
+malformed payer words, self-paying settlement, external payer credits, and the
+envelope and proof failure paths. Tree
 exhaustion remains an explicit testbed limit: retire the pool before its
 depth-20 tree reaches capacity.
 

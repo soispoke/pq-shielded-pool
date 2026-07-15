@@ -1,21 +1,31 @@
 # Minimal shielded pool
 
-A minimal, immutable shielded pool for Ethereum. Three operations (shield,
-transfer, withdraw), no token, no governance, no admin key. Notes hold an
-arbitrary value; a spend is a 2-in/2-out join-split proven by a Groth16 SNARK
+A minimal, immutable native-ETH shielded pool for Ethereum. Three operations
+(shield, transfer, withdraw), no ERC-20 support, no governance, no admin key.
+Every note value, public amount, withdrawal, and fee is denominated in wei. A
+spend is a 2-in/2-out join-split proven by a Groth16 SNARK
 (circom + snarkjs) and verified onchain through the BN254 pairing precompiles,
 so no offchain attester is involved.
 
 It runs as an EIP-8141 frame-native application. The pool address is an
 immutable Yul dispatcher and the frame-transaction sender. In frame 0 it binds
-the envelope and verifies the proof before execution approval. A paymaster
-then binds the same spend and requires the proof-bound fee to cover its maximum
-transaction liability before payment approval consumes the two EIP-8250
-nullifiers. The settlement frame calls the pool, which delegates state changes
-to a Solidity implementation. The proof is verified once, before either
-approval. The full shield → transfer → withdraw flow has run end to end on
-lambdaclass/ethrex's Hegotá devnet; addresses, transaction hashes, and gas are in
-[devnet/REVIEW.md](devnet/REVIEW.md).
+the envelope, verifies the proof, requires the proof-bound fee to cover maximum
+transaction cost, and approves execution and payment together. Payment approval
+consumes the two EIP-8250 nullifiers, then the SENDER frame calls the pool and
+delegates state changes to a Solidity implementation. The pool is both sender
+and payer. No paymaster is required.
+
+An optional three-frame form inserts a payment-only VERIFY frame when an
+external account should sponsor gas. That payer fronts ETH and receives its
+proof-bound fee in ETH from the pool. It does not perform token conversion.
+Both forms have run end to end on lambdaclass/ethrex's Hegotá devnet through
+unrelated zero-balance submitters. The default two-frame path used no
+paymaster: the pool paid for a private transfer and withdrawal, retained both
+proof-bound fees, and paid the recipient's withdrawal claim. Its addresses,
+transaction hashes, signed vectors, gas, and exact ETH accounting are in
+[devnet/vectors/2026-07-15-self-paying/](devnet/vectors/2026-07-15-self-paying/).
+The optional sponsored run is archived separately in
+[devnet/vectors/2026-07-15-trustless-loop/](devnet/vectors/2026-07-15-trustless-loop/).
 
 ## How a spend works
 
@@ -35,13 +45,15 @@ and change), and proves in-circuit:
 
 Transfer sets `publicAmount = 0` and `ctx = 0`; withdraw sets `publicAmount > 0`
 and `ctx` naming the recipient. Either may carry a `fee`, paid from shielded
-value as a pull credit to the payer authenticated by `TXPARAM(0x11)`. The
-settlement ABI contains no caller-chosen fee recipient. Withdrawals are also
-pull credits, so recipient code cannot revert settlement.
+ETH value. When the pool pays for itself, that ETH fee stays in the pool to
+replenish its gas balance. In the optional sponsored form, it becomes an ETH
+pull credit to the external payer authenticated by `TXPARAM(0x11)`. The settlement ABI
+contains no caller-chosen fee recipient. Withdrawals are also pull credits, so
+recipient code cannot revert settlement.
 
 ## Contracts
 
-The dispatcher and settlement implementation enforce four bindings around
+The dispatcher and settlement implementation enforce five bindings around
 each proof:
 
 1. the pool is the transaction sender and the settlement target;
@@ -49,8 +61,10 @@ each proof:
    set at `nonce_seq = 0`;
 3. its single protocol-validated EIP-8272 reference carries this pool's source
    ID and the proven root;
-4. the transaction has the exact three-frame settlement shape;
-5. its resolved payment payer is a nonzero, right-aligned address returned by
+4. the transaction has either the exact two-frame self-paying shape or the
+   exact three-frame sponsored shape;
+5. its resolved payment payer is the pool in the self-paying shape, or the
+   external payment verifier in the sponsored shape, as authenticated by
    `TXPARAM(0x11)`.
 
 Nullifiers are separated by `domain = H(chain_id, source_id)` and the circuit
@@ -69,7 +83,7 @@ tooling/               npm deps, circuit compile and trusted-setup script
 wallet/                witness builder, proof generation, and end-to-end scripts
 devnet/
   ShieldedPoolDispatcher.yul immutable pool/sender shell and proof authorization
-  ProofPaymaster.yul          payment, fee, key-set, root, and frame binding
+  ProofPaymaster.yul          optional external payment and fee binding
   EnvelopeProbe.yul           stateless envelope reader used by settlement
   dispatcher.py               reproducible dispatcher initcode generator
   pool_frametx.py             assembles, simulates, and submits frame transactions
@@ -83,6 +97,10 @@ cd tooling && npm ci && ./setup.sh   # compile the circuit, run a TESTBED truste
 cd ../wallet && ./smoke.sh           # generate real proofs, verify offchain, run onchain
 ./deploy_flow.sh                     # deploy and run the full flow on a local node
 ```
+
+`devnet/pool_frametx.py transfer` and `withdraw` build the two-frame
+self-paying form by default. Pass `--sponsored` to use the paymaster from the
+deployment config, or `--paymaster 0x...` to select an explicit external payer.
 
 `forge test` runs from a fresh clone: the committed proof fixtures pair with the
 committed `Groth16Verifier.sol`. Re-running `setup.sh` re-randomises the
@@ -115,6 +133,10 @@ two-dimensional gas accounting raises these figures; see
 
 ## Limitations
 
+- **Native ETH only.** Deposits use `msg.value`; notes, public amounts, fees,
+  withdrawals, and payer credits are wei-denominated. There is no token
+  address, ERC-20 transfer path, exchange-rate oracle, or token-to-ETH
+  paymaster conversion. ERC-20 pools are deliberately out of scope.
 - **Trusted setup.** `tooling/setup.sh` runs a local, testbed-only ceremony
   whose toxic waste could forge membership. `PTAU=<file>` supplies a public
   powers-of-tau; a real deployment also needs a multi-party phase 2.
@@ -132,8 +154,10 @@ two-dimensional gas accounting raises these figures; see
   disposable testbed must be retired before capacity.
 - **Frame-native only.** Spends require the Hegotá EIP-8141/8250/8272 opcode
   surface and deliberately revert when called as ordinary EVM transactions.
-- **Experimental client surface.** The dispatcher and max-cost paymaster have
-  been exercised on one Hegotá ethrex configuration, including same-block
-  disjoint-nullifier spends and replay rejection. This is not evidence of
-  compatibility with other clients or ethrex configurations.
+- **Experimental client surface.** The dispatcher and optional max-cost
+  paymaster have been exercised on one Hegotá ethrex configuration, including
+  same-block disjoint-nullifier spends and replay rejection. The two-frame
+  self-paying form has also completed a fresh shield, transfer, withdrawal,
+  claim, and replay lifecycle. This is not evidence of compatibility with
+  other clients or ethrex configurations.
 - **Unaudited research code.**
