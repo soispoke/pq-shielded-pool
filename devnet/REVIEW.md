@@ -1741,3 +1741,38 @@ passes all 117 Forge tests. The disposable run also caught a stale operational
 limit: current `ShieldedPoolLogic` deployment exhausted the script's 6M gas
 cap. The deployment succeeded at 12M, and `run_live_dispatcher.sh` now carries
 that tested limit.
+
+## Authenticated payer routing (2026-07-15)
+
+ethrex now exposes the payer selected by a payment-scoped `APPROVE`
+(`0x01` or `0x03`) as `TXPARAM(0x11)`, right-aligned in a 32-byte word.
+The pool consumes that protocol-authenticated value directly. This supersedes
+the earlier interim `feeRecipient` design described in the historical review
+entries above.
+
+`EnvelopeProbe.yul` returns eleven words (352 bytes), with the resolved payer
+last. Both settlement implementations reject a zero payer or any word with
+bits set above bit 159, then credit the proof-bound fee to that address. There
+is no fee-recipient calldata field and therefore no caller-selected routing or
+post-consumption recipient-mismatch branch.
+
+The settlement ABI is now:
+
+- `transfer(Spend)`: selector `0xb9947fa0`, 548 bytes including selector;
+- `withdraw(Spend,address)`: selector `0xd677b46e`, 580 bytes including
+  selector.
+
+The immutable dispatcher, monolithic pool, shared sender, paymaster, frame
+builder, generated initcode, Solidity interfaces, and differential tests were
+updated together. The paymaster still binds the complete proof-bearing
+`Spend` tuple and the exact frame grammar; settlement independently reads the
+same payer selected by payment approval. Existing deployments are ABI- and
+probe-incompatible and must be redeployed against an ethrex build that
+implements `TXPARAM(0x11)`.
+
+Local verification passes all 123 Forge tests, including zero and
+non-canonical payer words against the Solidity reference, monolithic Yul pool,
+and dispatcher architecture. Python compilation, frame vectors, wallet/tree
+fixtures, Poseidon vectors, Yul compilation, formatter, and warning-denying
+lint gates also pass. A fresh live deployment of this revised ABI remains the
+next integration check; no live result is claimed here.

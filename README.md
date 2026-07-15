@@ -35,8 +35,9 @@ and change), and proves in-circuit:
 
 Transfer sets `publicAmount = 0` and `ctx = 0`; withdraw sets `publicAmount > 0`
 and `ctx` naming the recipient. Either may carry a `fee`, paid from shielded
-value as a pull credit to the envelope-bound fee recipient. Withdrawals are
-also pull credits, so recipient code cannot revert settlement.
+value as a pull credit to the payer authenticated by `TXPARAM(0x11)`. The
+settlement ABI contains no caller-chosen fee recipient. Withdrawals are also
+pull credits, so recipient code cannot revert settlement.
 
 ## Contracts
 
@@ -48,7 +49,9 @@ each proof:
    set at `nonce_seq = 0`;
 3. its single protocol-validated EIP-8272 reference carries this pool's source
    ID and the proven root;
-4. the transaction has the exact three-frame settlement shape.
+4. the transaction has the exact three-frame settlement shape;
+5. its resolved payment payer is a nonzero, right-aligned address returned by
+   `TXPARAM(0x11)`.
 
 Nullifiers are separated by `domain = H(chain_id, source_id)` and the circuit
 rejects `nf1 == nf2`. The duplicate-key rule repeats that check in the envelope.

@@ -15,9 +15,11 @@ grammar and the envelope values returned by `EnvelopeProbe.yul`.
 
 The pool deliberately keeps no second spent set. A settlement revert after
 approval permanently consumes the notes. Pull credits remove recipient-call
-failures, the paymaster binds a nonzero fee recipient, and tests cover the
-envelope and proof failure paths. Tree exhaustion remains an explicit testbed
-limit: retire the pool before its depth-20 tree reaches capacity.
+failures, and fee routing has no calldata choice: settlement credits the
+nonzero, right-aligned payer authenticated by `TXPARAM(0x11)`. Tests cover
+malformed payer words plus the envelope and proof failure paths. Tree
+exhaustion remains an explicit testbed limit: retire the pool before its
+depth-20 tree reaches capacity.
 
 The preferred deployment is an immutable Yul dispatcher at the pool address
 with a Solidity settlement implementation behind `DELEGATECALL`. Proof

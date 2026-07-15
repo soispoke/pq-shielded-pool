@@ -48,6 +48,8 @@ jobs:
       - name: Check generated Yul bytecode
         run: |
           forge build --root contracts
+          python devnet/yul_pool.py --artifact >/dev/null
+          git diff --exit-code -- devnet/build/shielded_pool_init.hex
           python devnet/dispatcher.py --artifact >/dev/null
           git diff --exit-code -- devnet/build/shielded_pool_dispatcher_init.hex
           python devnet/dispatcher.py --initcode \
@@ -77,4 +79,7 @@ jobs:
         run: |
           forge fmt --check
           forge lint --deny warnings
-          forge test -vv
+          # A preceding `forge build` can leave ABI-only test artifacts in
+          # Foundry's cache. Force recompilation so test discovery cannot
+          # silently collapse to a partial suite.
+          forge test --force -vv

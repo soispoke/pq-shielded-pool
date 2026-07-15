@@ -88,25 +88,20 @@ object "SharedPoolSender" {
             let dataLen := frameParam(2, 0x04)
             let selector := shr(224, frameDataLoad(2, 0))
             switch dataLen
-            case 580 {
-                if iszero(eq(selector, 0x751a8fc5)) { revert(0, 0) }
-                // transfer: publicAmount == 0, ctx == 0, canonical nonzero
-                // fee recipient (the selected paymaster in today's ABI).
+            case 548 {
+                if iszero(eq(selector, 0xb9947fa0)) { revert(0, 0) }
+                // transfer: publicAmount == 0 and ctx == 0.
                 if frameDataLoad(2, 196) { revert(0, 0) }
                 if frameDataLoad(2, 260) { revert(0, 0) }
-                let feeRecipient := frameDataLoad(2, 548)
-                if or(iszero(feeRecipient), shr(160, feeRecipient)) { revert(0, 0) }
             }
-            case 612 {
-                if iszero(eq(selector, 0x215ae4c7)) { revert(0, 0) }
+            case 580 {
+                if iszero(eq(selector, 0xd677b46e)) { revert(0, 0) }
                 // withdraw: positive public amount and ctx names the canonical
                 // recipient exactly, so settlement cannot fail after approval.
                 if iszero(frameDataLoad(2, 196)) { revert(0, 0) }
                 let recipient := frameDataLoad(2, 548)
                 if or(iszero(recipient), shr(160, recipient)) { revert(0, 0) }
                 if iszero(eq(frameDataLoad(2, 260), recipient)) { revert(0, 0) }
-                let feeRecipient := frameDataLoad(2, 580)
-                if or(iszero(feeRecipient), shr(160, feeRecipient)) { revert(0, 0) }
             }
             default { revert(0, 0) }
 

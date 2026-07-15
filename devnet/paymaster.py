@@ -21,11 +21,11 @@ The pay VERIFY frame (flags 0x01, APPROVE_PAYMENT) targets this contract with
      execution, so root recency is protocol-enforced, not pool storage.
   2. envelope binding: one signature, no blobs, and exactly three frames. The
      full [self-verify, pay, sender] grammar is checked, and the SENDER frame
-     must target this pool with transfer(Spend,address) or
-     withdraw(Spend,address,address). Its 544-byte Spend tuple must equal the
-     tuple proven in the pay frame, and the fee recipient must equal this
-     paymaster, so the payer cannot be charged for unrelated execution and is
-     credited the proof-bound prepayment.
+     must target this pool with transfer(Spend) or withdraw(Spend,address).
+     Its 544-byte Spend tuple must equal the tuple proven in the pay frame, so
+     the payer cannot be charged for unrelated execution. Settlement credits the
+     consensus-resolved payer exposed by TXPARAM(0x11), so no routing argument
+     exists for the submitter to choose.
   3. sender authentication: frame 0 targets the immutable POOL_SENDER in
      VERIFY / execution-only mode. That contract verifies the exact proof,
      nonce keys, root reference and settlement data before APPROVE_EXECUTION.

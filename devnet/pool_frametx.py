@@ -8,8 +8,8 @@ Each pool interaction rides a type-0x06 frame transaction:
                        SENDER(target=pool, value=amount, data=shield(inner)) ]
   transfer: frames = [ VERIFY(target=pool, proof authorization, execution),
                        VERIFY(target=paymaster, bound Spend carrier, payment),
-                       SENDER(target=pool, value=0, data=transfer(Spend, feeRecipient)) ]
-  withdraw: same, data=withdraw(Spend, recipient, feeRecipient)
+                       SENDER(target=pool, value=0, data=transfer(Spend)) ]
+  withdraw: same, data=withdraw(Spend, recipient)
 
 For spends the pool IS the transaction sender (EIP-8250's intended shape:
 FrameTx { sender = PrivacyPool, nonce_keys = [nA, nB], nonce_seq = 0 }). The
@@ -44,7 +44,9 @@ root]]`, with slot the consensus slot of the block that published the root
 (derived from that block's timestamp the same way ethrex's derivedSlotTime
 knob does); the protocol validates the reference at admission and at block
 execution, which makes root recency protocol-enforced. The pool re-binds the
-same envelope facts in the SENDER frame via EnvelopeProbe.yul. The
+same envelope facts in the SENDER frame via EnvelopeProbe.yul, including the
+authenticated resolved payer at TXPARAM(0x11); settlement credits the fee to
+that payer directly, with no caller-selected routing field. The
 sender bind is what lets the paymaster rely on frame 0 rather than perform a
 second Groth16 check. The preferred immutable dispatcher verifies inline and
 the paymaster is SLOAD-free, so neither frame trips the observer's
@@ -465,9 +467,9 @@ def main():
         settle-only spend (always the faithful shape). The ProofPaymaster is
         the pay-frame target and payer: it binds nonce_keys == {nf1, nf2}
         (NONCEKEYLOAD) and the declared recent-root reference (pool source_id +
-        proven root, RECENTROOTREFLOAD), and staticcalls verifyProofOnly (proof
-        + canonicity, no storage read). The pool re-binds the same envelope
-        facts in the SENDER frame via EnvelopeProbe.
+        proven root, RECENTROOTREFLOAD), while carrying the byte-exact
+        verifyProofOnly calldata that frame 0 authenticates. The pool re-binds
+        the same envelope facts in the SENDER frame via EnvelopeProbe.
 
         `--spend-key KEY` reads the spend entry from fix[KEY] instead of
         fix[op_name] (the nonce-race fixture carries two transfers, `transfer`
@@ -506,7 +508,7 @@ def main():
         e, protocol_nonces, verify, refs = spend_setup("transfer")
         if nonce_keys_override is not None:
             protocol_nonces = nonce_keys_override
-        calldata = cast_calldata(f"transfer({SPEND_TUPLE},address)", spend_args(e), paymaster)
+        calldata = cast_calldata(f"transfer({SPEND_TUPLE})", spend_args(e))
         print(f"join-split transfer via faithful frame tx (payer {paymaster}, proof verified on-chain)")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
                        dry_run=dry, sender_override=sender_override,
@@ -516,8 +518,7 @@ def main():
         e, protocol_nonces, verify, refs = spend_setup("withdraw")
         if nonce_keys_override is not None:
             protocol_nonces = nonce_keys_override
-        calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address,address)", spend_args(e),
-                                 fix["recipient"], paymaster)
+        calldata = cast_calldata(f"withdraw({SPEND_TUPLE},address)", spend_args(e), fix["recipient"])
         print(f"join-split withdraw via faithful frame tx (payer {paymaster})")
         build_and_send(url, pk, pool, 0, calldata, protocol_nonces, verify, refs,
                        dry_run=dry, sender_override=sender_override,

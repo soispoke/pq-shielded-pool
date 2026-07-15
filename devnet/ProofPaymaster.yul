@@ -40,12 +40,10 @@
 ///   2. ENVELOPE BINDING. Requires one signature, no blobs, and exactly three
 ///      frames. It checks the full [self-verify, pay, sender] grammar, including
 ///      each frame's target, mode, flags, gas limit, value, and data length. The SENDER
-///      frame must target this pool and call transfer(Spend,address) or
-///      withdraw(Spend,address,address), with the 544-byte Spend tuple
-///      byte-for-byte equal to the tuple proven in this pay frame. The final
-///      feeRecipient argument MUST equal this paymaster, so shielded fee value
-///      is credited to the actual payer. No unrelated or appended execution
-///      can be charged to it.
+///      frame must target this pool and call transfer(Spend) or
+///      withdraw(Spend,address), with the 544-byte Spend tuple byte-for-byte
+///      equal to the tuple proven in this pay frame. No unrelated or appended
+///      execution can be charged to it.
 ///   3. SENDER AUTHENTICATION. Frame 0 targets the immutable POOL_SENDER in
 ///      VERIFY / execution-only mode. The transaction is valid only if that
 ///      proof-authorized contract checked the exact proof, key set, root, and
@@ -62,10 +60,11 @@
 ///      frame_target == sender, so it composes with the execution-scope
 ///      self-verify frame ahead of it.
 ///
-/// @dev Fee routing. The SENDER calldata names this paymaster as feeRecipient,
-///      and the pool records a pull credit for that exact address. Anyone may
-///      later push the credit to the paymaster itself, replenishing its gas
-///      float without giving the caller any redirect authority.
+/// @dev Fee routing. APPROVE_PAYMENT makes this contract the consensus-resolved
+///      payer. In settlement the pool reads that authenticated address through
+///      TXPARAM(0x11) and records the proof-bound fee to it directly. Anyone
+///      may later push the credit to this paymaster, replenishing its gas float;
+///      there is no caller-supplied routing field.
 ///
 /// @dev SLOAD-free. Two 32-byte constructor args, pool || poolSender, are
 ///      appended to the initcode; the constructor appends them to the DEPLOYED
@@ -188,7 +187,7 @@ object "ProofPaymaster" {
             if frameParam(1, 0x08) { revert(0, 0) }
 
             // frame 2: the only paid execution. It must call this pool with the
-            // same Spend tuple and credit the proof-bound fee to this paymaster.
+            // same Spend tuple. Settlement routes the fee to the resolved payer.
             if iszero(eq(frameParam(2, 0x00), pool)) { revert(0, 0) }
             if iszero(eq(frameParam(2, 0x02), 2)) { revert(0, 0) } // SENDER
             if frameParam(2, 0x03) { revert(0, 0) }
@@ -197,13 +196,11 @@ object "ProofPaymaster" {
             let senderDataLen := frameParam(2, 0x04)
             let senderSelector := shr(224, frameDataLoad(2, 0))
             switch senderDataLen
-            case 580 {
-                if iszero(eq(senderSelector, 0x751a8fc5)) { revert(0, 0) } // transfer(Spend,address)
-                if iszero(eq(frameDataLoad(2, 548), address())) { revert(0, 0) }
+            case 548 {
+                if iszero(eq(senderSelector, 0xb9947fa0)) { revert(0, 0) } // transfer(Spend)
             }
-            case 612 {
-                if iszero(eq(senderSelector, 0x215ae4c7)) { revert(0, 0) } // withdraw(Spend,address,address)
-                if iszero(eq(frameDataLoad(2, 580), address())) { revert(0, 0) }
+            case 580 {
+                if iszero(eq(senderSelector, 0xd677b46e)) { revert(0, 0) } // withdraw(Spend,address)
             }
             default { revert(0, 0) }
             for { let offset := 4 } lt(offset, 548) { offset := add(offset, 32) } {

@@ -28,8 +28,8 @@ interface Vm {
 /// sender, so spends require msg.sender == the pool itself).
 interface IYulPool {
     function shield(bytes32 inner) external payable returns (uint32);
-    function transfer(ShieldedPool.Spend calldata s, address feeRecipient) external;
-    function withdraw(ShieldedPool.Spend calldata s, address recipient, address feeRecipient) external;
+    function transfer(ShieldedPool.Spend calldata s) external;
+    function withdraw(ShieldedPool.Spend calldata s, address recipient) external;
     function verifyProofOnly(ShieldedPool.Spend calldata s) external view;
     function claimWithdrawal(address payable who) external;
     function claimFee(address payable who) external;
@@ -148,6 +148,7 @@ contract YulShieldedPoolTest {
         // setUp, so the pool lands at the CREATE address the wallet fixture's
         // domain was generated for.
         probe = new MockEnvelopeProbe();
+        probe.setPayer(SUBMITTER);
         verifier = new Groth16Verifier();
         vm.etch(T3_SHIM, type(PoseidonT3Shim).runtimeCode);
         vm.etch(T4_SHIM, type(PoseidonT4Shim).runtimeCode);
@@ -224,7 +225,7 @@ contract YulShieldedPoolTest {
     function test_transfer_settles_under_faithful_envelope() public {
         ShieldedPool.Spend memory s = _shieldA();
         vm.prank(address(pool));
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
         assertTrue(pool.isLeaf(s.outCm1) && pool.isLeaf(s.outCm2), "both outputs appended");
         assertTrue(pool.feeCredit(SUBMITTER) == s.fee, "fee credited to submitter");
         assertTrue(pool.currentRoot() == _s(".withdraw.root"), "pool root after transfer != wallet's withdraw root");
@@ -239,7 +240,7 @@ contract YulShieldedPoolTest {
         probe.setHalted();
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.NotFrameNative.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     /// Exactly-once: only the faithful [verify, pay, SENDER] grammar settles.
@@ -249,11 +250,11 @@ contract YulShieldedPoolTest {
         probe.set(4, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool)); // four frames
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
         probe.set(3, 1, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool)); // wrong index
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     /// The transaction's consumed key set must be exactly the proven
@@ -265,19 +266,19 @@ contract YulShieldedPoolTest {
         probe.set(3, 2, 2, 0, hi, lo, 1, pool.sourceId(), s.root, address(pool)); // unsorted
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
         probe.set(3, 2, 2, 0, lo, bytes32(uint256(hi) ^ 1), 1, pool.sourceId(), s.root, address(pool)); // wrong key
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
         probe.set(3, 2, 1, 0, lo, bytes32(0), 1, pool.sourceId(), s.root, address(pool)); // one key
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
         probe.set(3, 2, 2, 1, lo, hi, 1, pool.sourceId(), s.root, address(pool)); // seq != 0
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     /// The proven root must ride as the transaction's declared reference,
@@ -288,15 +289,15 @@ contract YulShieldedPoolTest {
         probe.set(3, 2, 2, 0, lo, hi, 0, bytes32(0), bytes32(0), address(pool)); // no reference
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
         probe.set(3, 2, 2, 0, lo, hi, 1, bytes32(uint256(1)), s.root, address(pool)); // foreign source
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
         probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), bytes32(uint256(999)), address(pool)); // wrong root
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     /// The settle frame must target the pool directly; an intermediary that
@@ -307,7 +308,23 @@ contract YulShieldedPoolTest {
         probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, SUBMITTER); // frame 2 targets an intermediary
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
+    }
+
+    function test_zero_resolved_payer_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayer(address(0));
+        vm.prank(address(pool));
+        vm.expectRevert(ShieldedPool.InvalidPayer.selector);
+        pool.transfer(s);
+    }
+
+    function test_noncanonical_resolved_payer_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayerWord(1 << 160);
+        vm.prank(address(pool));
+        vm.expectRevert(ShieldedPool.InvalidPayer.selector);
+        pool.transfer(s);
     }
 
     /// A foreign root in the SPEND (proof side) mismatches the armed
@@ -317,7 +334,7 @@ contract YulShieldedPoolTest {
         s.root = bytes32(uint256(999));
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     // ---- 3. sender pin (the pool IS the sender) ----
@@ -326,7 +343,7 @@ contract YulShieldedPoolTest {
         ShieldedPool.Spend memory s = _shieldA();
         vm.prank(address(0xEEEE));
         vm.expectRevert(ShieldedPool.NotPoolSender.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     /// The old external POOL_SENDER is just another stranger now.
@@ -334,7 +351,7 @@ contract YulShieldedPoolTest {
         ShieldedPool.Spend memory s = _shieldA();
         vm.prank(SUBMITTER);
         vm.expectRevert(ShieldedPool.NotPoolSender.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     // ---- 4. proof attacks ----
@@ -344,7 +361,7 @@ contract YulShieldedPoolTest {
         s.nf2 = bytes32(0);
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.ZeroNullifier.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     function test_corrupted_proof_rejected_at_authentication() public {
@@ -393,7 +410,7 @@ contract YulShieldedPoolTest {
     function test_rebound_ctx_and_repriced_amount_rejected_at_authentication() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(address(pool));
-        pool.transfer(ts, SUBMITTER);
+        pool.transfer(ts);
 
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         address payable evil = payable(address(0xBEEF));
@@ -414,14 +431,14 @@ contract YulShieldedPoolTest {
         s.publicAmount = 1; // nonzero publicAmount is not a transfer
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.TransferShape.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     function test_transfer_shaped_spend_rejected_by_withdraw() public {
         ShieldedPool.Spend memory s = _shieldA(); // publicAmount == 0, ctx == 0
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.WithdrawShape.selector);
-        pool.withdraw(s, address(0xBEEF), SUBMITTER);
+        pool.withdraw(s, address(0xBEEF));
     }
 
     // ---- 5c. duplicate output is a no-op success, never a revert ----
@@ -432,7 +449,7 @@ contract YulShieldedPoolTest {
         require(pool.isLeaf(s.outCm1), "pre-seeded output leaf");
         uint32 before = pool.nextIndex();
         vm.prank(address(pool));
-        pool.transfer(s, SUBMITTER); // must not revert
+        pool.transfer(s); // must not revert
         assertTrue(pool.nextIndex() == before + 1, "only the change note appended");
     }
 
@@ -441,13 +458,13 @@ contract YulShieldedPoolTest {
     function test_full_lifecycle_pays_recipient_fees_and_stays_solvent() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(address(pool));
-        pool.transfer(ts, SUBMITTER);
+        pool.transfer(ts);
 
         address payable recipient = payable(vm.parseAddress(vm.parseJsonString(j, ".recipient")));
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         _arm(ws);
         vm.prank(address(pool));
-        pool.withdraw(ws, recipient, SUBMITTER);
+        pool.withdraw(ws, recipient);
 
         assertTrue(pool.withdrawalCredit(recipient) == ws.publicAmount, "withdrawal credited");
         assertTrue(pool.feeCredit(SUBMITTER) == ts.fee + ws.fee, "both fees credited");
@@ -466,8 +483,9 @@ contract YulShieldedPoolTest {
     function test_anyone_can_push_fee_to_passive_recipient() public {
         PassiveReceiver pm = new PassiveReceiver();
         ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayer(address(pm));
         vm.prank(address(pool));
-        pool.transfer(s, address(pm)); // fee recipient is the passive contract
+        pool.transfer(s);
         assertTrue(pool.feeCredit(address(pm)) == s.fee, "fee credited to passive recipient");
         uint256 before = address(pm).balance;
         vm.prank(address(0xF00D));
@@ -483,15 +501,16 @@ contract YulShieldedPoolTest {
     function test_payout_reentrancy_cannot_enter_settlement_as_pool() public {
         ReentrantSettlementProbe recipient = new ReentrantSettlementProbe();
         ShieldedPool.Spend memory ts = _shieldA();
+        probe.setPayer(address(recipient));
         vm.prank(address(pool));
-        pool.transfer(ts, address(recipient));
+        pool.transfer(ts);
 
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         address withdrawalRecipient = vm.parseAddress(vm.parseJsonString(j, ".recipient"));
         recipient.arm(
             address(pool),
-            abi.encodeWithSelector(IYulPool.transfer.selector, ts, address(recipient)),
-            abi.encodeWithSelector(IYulPool.withdraw.selector, ws, withdrawalRecipient, address(recipient))
+            abi.encodeWithSelector(IYulPool.transfer.selector, ts),
+            abi.encodeWithSelector(IYulPool.withdraw.selector, ws, withdrawalRecipient)
         );
 
         pool.claimFee(payable(address(recipient)));
@@ -505,20 +524,23 @@ contract YulShieldedPoolTest {
         assertTrue(pool.feeCredit(address(recipient)) == 0, "paid credit was not cleared");
     }
 
-    /// Fee routing is selected per spend, not pinned in the pool.
+    /// Fee routing is selected by the authenticated payer returned by the
+    /// settlement probe, not by caller calldata.
     function test_distinct_paymasters_receive_only_their_bound_fees() public {
         PassiveReceiver paymasterA = new PassiveReceiver();
         PassiveReceiver paymasterB = new PassiveReceiver();
 
         ShieldedPool.Spend memory ts = _shieldA();
+        probe.setPayer(address(paymasterA));
         vm.prank(address(pool));
-        pool.transfer(ts, address(paymasterA));
+        pool.transfer(ts);
 
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         _arm(ws);
+        probe.setPayer(address(paymasterB));
         address recipient = vm.parseAddress(vm.parseJsonString(j, ".recipient"));
         vm.prank(address(pool));
-        pool.withdraw(ws, recipient, address(paymasterB));
+        pool.withdraw(ws, recipient);
 
         assertTrue(pool.feeCredit(address(paymasterA)) == ts.fee, "paymaster A received only transfer fee");
         assertTrue(pool.feeCredit(address(paymasterB)) == ws.fee, "paymaster B received only withdraw fee");
@@ -534,8 +556,9 @@ contract YulShieldedPoolTest {
 
     function test_failed_fee_claim_preserves_credit() public {
         ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayer(address(this));
         vm.prank(address(pool));
-        pool.transfer(s, address(this));
+        pool.transfer(s);
         uint256 credit = pool.feeCredit(address(this));
         vm.expectRevert(ShieldedPool.PayoutFailed.selector);
         pool.claimFee(payable(address(this))); // this test contract rejects plain ETH
@@ -545,12 +568,12 @@ contract YulShieldedPoolTest {
     function test_withdraw_wrong_recipient_reverts() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(address(pool));
-        pool.transfer(ts, SUBMITTER);
+        pool.transfer(ts);
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         _arm(ws);
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.CtxDoesNotNameRecipient.selector);
-        pool.withdraw(ws, address(0xDEAD), SUBMITTER);
+        pool.withdraw(ws, address(0xDEAD));
     }
 
     // ---- deploy-time state (replaces the constructor-argument tests: raw
@@ -608,13 +631,13 @@ contract YulShieldedPoolTest {
         vm.expectEmit(true, false, false, true);
         emit FeeCredited(SUBMITTER, s.fee);
         vm.prank(address(pool));
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     function test_withdraw_and_claims_emit() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(address(pool));
-        pool.transfer(ts, SUBMITTER);
+        pool.transfer(ts);
 
         address payable recipient = payable(vm.parseAddress(vm.parseJsonString(j, ".recipient")));
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
@@ -624,7 +647,7 @@ contract YulShieldedPoolTest {
         vm.expectEmit(true, false, false, true);
         emit WithdrawalCredited(recipient, ws.publicAmount);
         vm.prank(address(pool));
-        pool.withdraw(ws, recipient, SUBMITTER);
+        pool.withdraw(ws, recipient);
 
         vm.expectEmit(true, false, false, true);
         emit Withdrawn(recipient, ws.publicAmount);
@@ -716,7 +739,7 @@ contract YulShieldedPoolTest {
 
         vm.prank(address(pool));
         g = gasleft();
-        pool.transfer(ts, SUBMITTER);
+        pool.transfer(ts);
         emit log_named_uint("transfer.total", g - gasleft());
 
         address payable recipient = payable(vm.parseAddress(vm.parseJsonString(j, ".recipient")));
@@ -728,7 +751,7 @@ contract YulShieldedPoolTest {
 
         vm.prank(address(pool));
         g = gasleft();
-        pool.withdraw(ws, recipient, SUBMITTER);
+        pool.withdraw(ws, recipient);
         emit log_named_uint("withdraw.total", g - gasleft());
     }
 

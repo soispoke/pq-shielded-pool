@@ -48,6 +48,7 @@ contract ShieldedPoolBN254Test {
         // keeping the pool's CREATE address (and so sourceId/domain and the
         // fixture) stable across the settle-only migration.
         probe = new MockEnvelopeProbe();
+        probe.setPayer(POOL_SENDER);
         verifier = new Groth16Verifier();
         pool = new ShieldedPool(POOL_SENDER, address(probe), verifier);
         vm.deal(address(this), 100 ether);
@@ -112,7 +113,7 @@ contract ShieldedPoolBN254Test {
     function test_transfer_settles_under_faithful_envelope() public {
         ShieldedPool.Spend memory s = _shieldA();
         vm.prank(POOL_SENDER);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
         assertTrue(pool.isLeaf(s.outCm1) && pool.isLeaf(s.outCm2), "both outputs appended");
         assertTrue(pool.feeCredit(POOL_SENDER) == s.fee, "fee credited to submitter");
         assertTrue(pool.currentRoot() == _s(".withdraw.root"), "pool root after transfer != wallet's withdraw root");
@@ -127,7 +128,7 @@ contract ShieldedPoolBN254Test {
         probe.setHalted();
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.NotFrameNative.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     /// Exactly-once: only the faithful [verify, pay, SENDER] grammar settles.
@@ -139,11 +140,11 @@ contract ShieldedPoolBN254Test {
         probe.set(4, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool)); // four frames
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
         probe.set(3, 1, 2, 0, lo, hi, 1, pool.sourceId(), s.root, address(pool)); // wrong index
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     /// The transaction's consumed key set must be exactly the proven
@@ -155,19 +156,19 @@ contract ShieldedPoolBN254Test {
         probe.set(3, 2, 2, 0, hi, lo, 1, pool.sourceId(), s.root, address(pool)); // unsorted
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
         probe.set(3, 2, 2, 0, lo, bytes32(uint256(hi) ^ 1), 1, pool.sourceId(), s.root, address(pool)); // wrong key
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
         probe.set(3, 2, 1, 0, lo, bytes32(0), 1, pool.sourceId(), s.root, address(pool)); // one key
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
         probe.set(3, 2, 2, 1, lo, hi, 1, pool.sourceId(), s.root, address(pool)); // seq != 0
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     /// The proven root must ride as the transaction's declared reference,
@@ -178,15 +179,15 @@ contract ShieldedPoolBN254Test {
         probe.set(3, 2, 2, 0, lo, hi, 0, bytes32(0), bytes32(0), address(pool)); // no reference
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
         probe.set(3, 2, 2, 0, lo, hi, 1, bytes32(uint256(1)), s.root, address(pool)); // foreign source
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
         probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), bytes32(uint256(999)), address(pool)); // wrong root
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     /// The settle frame must target the pool directly. If it targets an
@@ -199,7 +200,7 @@ contract ShieldedPoolBN254Test {
         probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, POOL_SENDER); // frame 2 targets sender, not pool
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     /// A foreign root in the SPEND (proof side) mismatches the armed
@@ -209,7 +210,7 @@ contract ShieldedPoolBN254Test {
         s.root = bytes32(uint256(999));
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     // ---- 3. sender pin ----
@@ -218,7 +219,7 @@ contract ShieldedPoolBN254Test {
         ShieldedPool.Spend memory s = _shieldA();
         vm.prank(address(0xEEEE));
         vm.expectRevert(ShieldedPool.NotPoolSender.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     // ---- 4. proof attacks ----
@@ -228,7 +229,7 @@ contract ShieldedPoolBN254Test {
         s.nf2 = bytes32(0);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ZeroNullifier.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     function test_corrupted_proof_reverts() public {
@@ -237,7 +238,7 @@ contract ShieldedPoolBN254Test {
         uint256 before = gasleft();
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
         assertTrue(before - gasleft() < 1_500_000, "invalid proof consumed unbounded gas");
     }
 
@@ -248,7 +249,7 @@ contract ShieldedPoolBN254Test {
         s.fee = s.fee + 1;
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     function test_tampered_outputs_revert() public {
@@ -256,7 +257,7 @@ contract ShieldedPoolBN254Test {
         s.outCm1 = bytes32(uint256(12345));
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     function test_wrong_domain_reverts_before_verifier() public {
@@ -264,7 +265,7 @@ contract ShieldedPoolBN254Test {
         s.domain = bytes32(uint256(s.domain) ^ 1);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.InvalidDomain.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     /// The root is bound by the PROOF, not only by the reference binding:
@@ -278,7 +279,7 @@ contract ShieldedPoolBN254Test {
         _arm(s); // reference now carries the new root, so that check passes
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     /// ctx and publicAmount are bound by the PROOF, not only by the shape
@@ -289,7 +290,7 @@ contract ShieldedPoolBN254Test {
     function test_rebound_ctx_and_repriced_amount_revert_in_verifier() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(POOL_SENDER);
-        pool.transfer(ts, POOL_SENDER);
+        pool.transfer(ts);
 
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         address payable evil = payable(address(0xBEEF));
@@ -297,14 +298,14 @@ contract ShieldedPoolBN254Test {
         _arm(ws);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.withdraw(ws, evil, POOL_SENDER);
+        pool.withdraw(ws, evil);
 
         ShieldedPool.Spend memory wp = _spendOf(".withdraw");
         wp.publicAmount = wp.publicAmount + 1;
         _arm(wp);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.ProofInvalid.selector);
-        pool.withdraw(wp, vm.parseAddress(vm.parseJsonString(j, ".recipient")), POOL_SENDER);
+        pool.withdraw(wp, vm.parseAddress(vm.parseJsonString(j, ".recipient")));
     }
 
     // ---- 5. operation-shape attacks ----
@@ -314,14 +315,14 @@ contract ShieldedPoolBN254Test {
         s.publicAmount = 1; // nonzero publicAmount is not a transfer
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.TransferShape.selector);
-        pool.transfer(s, POOL_SENDER);
+        pool.transfer(s);
     }
 
     function test_transfer_shaped_spend_rejected_by_withdraw() public {
         ShieldedPool.Spend memory s = _shieldA(); // publicAmount == 0, ctx == 0
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.WithdrawShape.selector);
-        pool.withdraw(s, address(0xBEEF), POOL_SENDER);
+        pool.withdraw(s, address(0xBEEF));
     }
 
     // ---- 5c. duplicate output is a no-op success, never a revert ----
@@ -334,7 +335,7 @@ contract ShieldedPoolBN254Test {
         require(pool.isLeaf(s.outCm1), "pre-seeded output leaf");
         uint32 before = pool.nextIndex();
         vm.prank(POOL_SENDER);
-        pool.transfer(s, POOL_SENDER); // must not revert
+        pool.transfer(s); // must not revert
         assertTrue(pool.nextIndex() == before + 1, "only the change note appended");
     }
 
@@ -343,13 +344,13 @@ contract ShieldedPoolBN254Test {
     function test_full_lifecycle_pays_recipient_fees_and_stays_solvent() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(POOL_SENDER);
-        pool.transfer(ts, POOL_SENDER);
+        pool.transfer(ts);
 
         address payable recipient = payable(vm.parseAddress(vm.parseJsonString(j, ".recipient")));
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         _arm(ws);
         vm.prank(POOL_SENDER);
-        pool.withdraw(ws, recipient, POOL_SENDER);
+        pool.withdraw(ws, recipient);
 
         assertTrue(pool.withdrawalCredit(recipient) == ws.publicAmount, "withdrawal credited");
         assertTrue(pool.feeCredit(POOL_SENDER) == ts.fee + ws.fee, "both fees credited");
@@ -365,16 +366,17 @@ contract ShieldedPoolBN254Test {
         assertTrue(POOL_SENDER.balance == senderBefore + ts.fee + ws.fee, "fees claimed");
     }
 
-    /// The stranded-fee regression: in the faithful shape the fee recipient is
-    /// the paymaster, a passive contract whose only ETH-in path is receive().
+    /// The stranded-fee regression: in the faithful shape the resolved payer
+    /// is the paymaster, a passive contract whose only ETH-in path is receive().
     /// A keyed `feeCredit[msg.sender]` claim would strand it. The pushable
     /// claim lets any keeper move the credit into the paymaster's balance,
     /// where it funds future sponsorship.
     function test_anyone_can_push_fee_to_passive_recipient() public {
         PassiveReceiver pm = new PassiveReceiver();
         ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayer(address(pm));
         vm.prank(POOL_SENDER);
-        pool.transfer(s, address(pm)); // fee recipient is the passive contract
+        pool.transfer(s);
         assertTrue(pool.feeCredit(address(pm)) == s.fee, "fee credited to passive recipient");
         uint256 before = address(pm).balance;
         // a third party (0xF00D), not the recipient, pushes the credit
@@ -384,22 +386,23 @@ contract ShieldedPoolBN254Test {
         assertTrue(pool.feeCredit(address(pm)) == 0, "credit cleared after push");
     }
 
-    /// Fee routing is selected per spend, not pinned in the pool. This models
-    /// two independently deployed proof paymasters: each binds its own address
-    /// into the SENDER calldata and receives only the fee for the spend it paid.
+    /// Fee routing is selected by payment approval, not caller calldata. This
+    /// models two independently deployed paymasters returned by TXPARAM(0x11).
     function test_distinct_paymasters_receive_only_their_bound_fees() public {
         PassiveReceiver paymasterA = new PassiveReceiver();
         PassiveReceiver paymasterB = new PassiveReceiver();
 
         ShieldedPool.Spend memory ts = _shieldA();
+        probe.setPayer(address(paymasterA));
         vm.prank(POOL_SENDER);
-        pool.transfer(ts, address(paymasterA));
+        pool.transfer(ts);
 
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         _arm(ws);
+        probe.setPayer(address(paymasterB));
         address recipient = vm.parseAddress(vm.parseJsonString(j, ".recipient"));
         vm.prank(POOL_SENDER);
-        pool.withdraw(ws, recipient, address(paymasterB));
+        pool.withdraw(ws, recipient);
 
         assertTrue(pool.feeCredit(address(paymasterA)) == ts.fee, "paymaster A received only transfer fee");
         assertTrue(pool.feeCredit(address(paymasterB)) == ws.fee, "paymaster B received only withdraw fee");
@@ -415,23 +418,40 @@ contract ShieldedPoolBN254Test {
 
     function test_failed_fee_claim_preserves_credit() public {
         ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayer(address(this));
         vm.prank(POOL_SENDER);
-        pool.transfer(s, address(this));
+        pool.transfer(s);
         uint256 credit = pool.feeCredit(address(this));
         vm.expectRevert(ShieldedPool.PayoutFailed.selector);
         pool.claimFee(payable(address(this))); // this test contract rejects plain ETH
         assertTrue(pool.feeCredit(address(this)) == credit, "failed claim restored credit");
     }
 
+    function test_zero_resolved_payer_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayer(address(0));
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.InvalidPayer.selector);
+        pool.transfer(s);
+    }
+
+    function test_noncanonical_resolved_payer_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayerWord(1 << 160);
+        vm.prank(POOL_SENDER);
+        vm.expectRevert(ShieldedPool.InvalidPayer.selector);
+        pool.transfer(s);
+    }
+
     function test_withdraw_wrong_recipient_reverts() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(POOL_SENDER);
-        pool.transfer(ts, POOL_SENDER);
+        pool.transfer(ts);
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         _arm(ws);
         vm.prank(POOL_SENDER);
         vm.expectRevert(ShieldedPool.CtxDoesNotNameRecipient.selector);
-        pool.withdraw(ws, address(0xDEAD), POOL_SENDER);
+        pool.withdraw(ws, address(0xDEAD));
     }
 
     // ---- shield rules ----
@@ -570,7 +590,7 @@ contract ShieldedPoolBN254Test {
 
         vm.prank(POOL_SENDER);
         g = gasleft();
-        pool.transfer(ts, POOL_SENDER);
+        pool.transfer(ts);
         emit log_named_uint("transfer.total", g - gasleft());
 
         address payable recipient = payable(vm.parseAddress(vm.parseJsonString(j, ".recipient")));
@@ -582,7 +602,7 @@ contract ShieldedPoolBN254Test {
 
         vm.prank(POOL_SENDER);
         g = gasleft();
-        pool.withdraw(ws, recipient, POOL_SENDER);
+        pool.withdraw(ws, recipient);
         emit log_named_uint("withdraw.total", g - gasleft());
     }
 
@@ -593,11 +613,20 @@ contract ShieldedPoolBN254Test {
 }
 
 /// Configurable stand-in for devnet/EnvelopeProbe.yul: anvil/Forge has no
-/// frame-tx opcodes, so tests arm the ten envelope words a faithful
+/// frame-tx opcodes, so tests arm the eleven envelope words a faithful
 /// transaction would expose (or halt, emulating a non-frame context).
 contract MockEnvelopeProbe {
     bytes blob;
     bool halted;
+    uint256 payerWord;
+
+    function setPayer(address payer_) external {
+        payerWord = uint256(uint160(payer_));
+    }
+
+    function setPayerWord(uint256 payerWord_) external {
+        payerWord = payerWord_;
+    }
 
     function set(
         uint256 frames,
@@ -621,7 +650,7 @@ contract MockEnvelopeProbe {
 
     fallback() external {
         if (halted) revert();
-        bytes memory b = blob;
+        bytes memory b = bytes.concat(blob, abi.encode(payerWord));
         assembly {
             return(add(b, 32), mload(b))
         }

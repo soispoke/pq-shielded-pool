@@ -105,7 +105,7 @@ object "ShieldedPool" {
             function errWithdrawShape() -> s { s := 0x7f54f5ab }
             function errCtxRecipient() -> s { s := 0x49cb8b3a } // CtxDoesNotNameRecipient()
             function errPayoutFailed() -> s { s := 0x3b1ab104 }
-            function errZeroFeeRecipient() -> s { s := 0xcff9f194 }
+            function errInvalidPayer() -> s { s := 0x8eb5b891 }
             function errNoCredit() -> s { s := 0x315b0e14 }
             function errRootPublishFailed() -> s { s := 0x5c3c03e8 }
 
@@ -343,25 +343,24 @@ object "ShieldedPool" {
             }
 
             // ================= settlement (frame-2 SENDER) ==================
-            // Envelope facts via the mockable probe (staticcall, 320-byte
+            // Envelope facts via the mockable probe (staticcall, 352-byte
             // return). The keyed nonces were consumed by the protocol at
             // payment approval; this checks THIS tx consumed exactly the proven
-            // nullifiers, the proven root rode as the recent-root reference,
             // nullifiers and the proven root rode as the recent-root reference.
             // Proof validity was authenticated over this exact frame-2 tuple by
             // the pool's frame-0 code before APPROVE_EXECUTION. msg.sender must
             // be the pool itself, so the frame-2 self-call has caller() == address().
-            function spendCheck(base) {
+            function spendCheck(base) -> payer {
                 if iszero(eq(caller(), address())) { fail(errNotPoolSender()) }
                 let nf1 := calldataload(add(base, 64))
                 let nf2 := calldataload(add(base, 96))
                 if iszero(nf1) { fail(errZeroNullifier()) }
                 if iszero(nf2) { fail(errZeroNullifier()) }
-                // probe.staticcall("") -> 10 words, gas-capped
+                // probe.staticcall("") -> 11 words, gas-capped
                 let ok := staticcall(100000, probeAddr(), 0x00, 0x00, 0x00, 0x00)
                 if iszero(ok) { fail(errNotFrameNative()) }
-                if iszero(eq(returndatasize(), 320)) { fail(errNotFrameNative()) }
-                returndatacopy(0x80, 0, 320)
+                if iszero(eq(returndatasize(), 352)) { fail(errNotFrameNative()) }
+                returndatacopy(0x80, 0, 352)
                 let frames := mload(0x80)
                 let frameIndex := mload(0xa0)
                 let keyCount := mload(0xc0)
@@ -372,6 +371,7 @@ object "ShieldedPool" {
                 let refSource := mload(0x160)
                 let refRoot := mload(0x180)
                 let settleTarget := and(mload(0x1a0), 0xffffffffffffffffffffffffffffffffffffffff)
+                let payerWord := mload(0x1c0)
                 if or(or(iszero(eq(frames, 3)), iszero(eq(frameIndex, 2))),
                        iszero(eq(settleTarget, address()))) { fail(errNotFaithfulShape()) }
                 // consumed key set == proven nullifiers, sorted {lo, hi}
@@ -383,14 +383,17 @@ object "ShieldedPool" {
                 let root := calldataload(add(base, 0))
                 if or(or(iszero(eq(refCount, 1)), iszero(eq(refSource, sourceId()))),
                        iszero(eq(refRoot, root))) { fail(errRootNotBound()) }
+                if or(iszero(payerWord), shr(160, payerWord)) { fail(errInvalidPayer()) }
+                payer := payerWord
                 validateSpend(base)
                 emitNoteSpent(nf1)
                 emitNoteSpent(nf2)
             }
 
             // Insert the two output notes (duplicate = no-op), recompute+publish
-            // once, then record the fee as a pull credit for feeRecipient.
-            function settle(base, feeRecipient) {
+            // once, then record the fee as a pull credit for the authenticated
+            // transaction payer returned by TXPARAM(0x11).
+            function settle(base, payer) {
                 let oc1 := calldataload(add(base, 128))
                 let oc2 := calldataload(add(base, 160))
                 let fee := calldataload(add(base, 224))
@@ -408,10 +411,9 @@ object "ShieldedPool" {
                 }
                 publishRoot()
                 if iszero(iszero(fee)) {
-                    if iszero(feeRecipient) { fail(errZeroFeeRecipient()) }
-                    let s := mapSlot(feeRecipient, 25)
+                    let s := mapSlot(payer, 25)
                     sstore(s, add(sload(s), fee))
-                    emitFeeCredited(feeRecipient, fee)
+                    emitFeeCredited(payer, fee)
                 }
             }
 
@@ -470,21 +472,17 @@ object "ShieldedPool" {
                 let dataLen := frameParam(2, 0x04)
                 let selector := shr(224, frameDataLoad(2, 0))
                 switch dataLen
-                case 580 {
-                    if iszero(eq(selector, 0x751a8fc5)) { fail(errNotFaithfulShape()) } // transfer
+                case 548 {
+                    if iszero(eq(selector, 0xb9947fa0)) { fail(errNotFaithfulShape()) } // transfer
                     if frameDataLoad(2, 196) { fail(errTransferShape()) }  // publicAmount == 0
                     if frameDataLoad(2, 260) { fail(errTransferShape()) }  // ctx == 0
-                    let fr := frameDataLoad(2, 548)
-                    if or(iszero(fr), shr(160, fr)) { fail(errZeroFeeRecipient()) }
                 }
-                case 612 {
-                    if iszero(eq(selector, 0x215ae4c7)) { fail(errNotFaithfulShape()) } // withdraw
+                case 580 {
+                    if iszero(eq(selector, 0xd677b46e)) { fail(errNotFaithfulShape()) } // withdraw
                     if iszero(frameDataLoad(2, 196)) { fail(errWithdrawShape()) }    // publicAmount > 0
                     let recipient := frameDataLoad(2, 548)
                     if or(iszero(recipient), shr(160, recipient)) { fail(errWithdrawShape()) }
                     if iszero(eq(frameDataLoad(2, 260), recipient)) { fail(errCtxRecipient()) } // ctx names recipient
-                    let fr := frameDataLoad(2, 580)
-                    if or(iszero(fr), shr(160, fr)) { fail(errZeroFeeRecipient()) }
                 }
                 default { fail(errNotFaithfulShape()) }
                 // nonce keys == sorted proof nullifiers
@@ -537,24 +535,22 @@ object "ShieldedPool" {
                 publishRoot()
                 ret(index)
             }
-            case 0x751a8fc5 { // transfer(Spend,address)
-                needArgs(576)
-                let feeRecipient := addrArg(548)
+            case 0xb9947fa0 { // transfer(Spend)
+                needArgs(544)
                 if or(iszero(iszero(calldataload(196))), iszero(iszero(calldataload(260)))) { fail(errTransferShape()) } // publicAmount==0 && ctx==0
-                spendCheck(4)
-                settle(4, feeRecipient)
+                let payer := spendCheck(4)
+                settle(4, payer)
                 stop()
             }
-            case 0x215ae4c7 { // withdraw(Spend,address recipient,address feeRecipient)
-                needArgs(608)
+            case 0xd677b46e { // withdraw(Spend,address recipient)
+                needArgs(576)
                 let recipient := addrArg(548)
-                let feeRecipient := addrArg(580)
                 let pub := calldataload(196)
                 let ctx := calldataload(260)
                 if or(iszero(pub), iszero(ctx)) { fail(errWithdrawShape()) }
                 if iszero(eq(ctx, ctxFor(recipient))) { fail(errCtxRecipient()) }
-                spendCheck(4)
-                settle(4, feeRecipient)
+                let payer := spendCheck(4)
+                settle(4, payer)
                 // withdrawalCredit[recipient] += publicAmount
                 let s := mapSlot(recipient, 24)
                 sstore(s, add(sload(s), pub))

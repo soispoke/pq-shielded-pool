@@ -2,7 +2,7 @@
 /// @notice Stateless frame-transaction envelope reader for the settle-only
 ///         pool. Solidity cannot emit the EIP-8141/8250/8272 introspection
 ///         opcodes (verbatim is Yul-object-only), so ShieldedPool._spend
-///         STATICCALLs this contract and binds the ten returned words:
+///         STATICCALLs this contract and binds the eleven returned words:
 ///
 ///           [0] frame count            TXPARAM 0x09
 ///           [1] current frame index    TXPARAM 0x0A
@@ -14,6 +14,7 @@
 ///           [7] ref[0].source_id       RECENTROOTREFLOAD 0xB5 (0 when none)
 ///           [8] ref[0].root            RECENTROOTREFLOAD 0xB5 (0 when none)
 ///           [9] frame[2].target        FRAMEPARAM 0xB3 (0 when < 3 frames)
+///          [10] resolved payer         TXPARAM 0x11
 ///
 ///         Guarded reads: the load opcodes exceptional-halt out of range, so
 ///         keys/refs are read only when the counts cover them. Outside a
@@ -48,7 +49,12 @@ object "EnvelopeProbe" {
             // frame[2].target: guarded, since FRAMEPARAM halts out of range.
             // FRAMEPARAM pops frameIndex first (stack top), then param 0x00.
             if gt(frames, 2) { mstore(288, verbatim_2i_1o(hex"B3", 2, 0x00)) }
-            return(0, 320)
+            // The consensus-resolved account whose successful payment-scoped
+            // APPROVE paid the transaction's maximum cost. Payment approval
+            // precedes the SENDER settlement frame, so this is authenticated
+            // and populated when the pool calls the probe.
+            mstore(320, txParam(0x11))
+            return(0, 352)
         }
     }
 }

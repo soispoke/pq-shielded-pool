@@ -96,7 +96,6 @@ object "ShieldedPoolDispatcher" {
             function errTransferShape() -> s { s := 0xef7a30fa }
             function errWithdrawShape() -> s { s := 0x7f54f5ab }
             function errCtxRecipient() -> s { s := 0x49cb8b3a } // CtxDoesNotNameRecipient()
-            function errZeroFeeRecipient() -> s { s := 0xcff9f194 }
             function errNotCanonical() -> s { s := 0xd7c7beeb }
             function errValueTooLarge() -> s { s := 0x2ad907fb }
             function errInvalidDomain() -> s { s := 0xeb127982 }
@@ -227,21 +226,17 @@ object "ShieldedPoolDispatcher" {
                 let dataLen := frameParam(2, 0x04)
                 let selector := shr(224, frameDataLoad(2, 0))
                 switch dataLen
-                case 580 {
-                    if iszero(eq(selector, 0x751a8fc5)) { fail(errNotFaithfulShape()) } // transfer
+                case 548 {
+                    if iszero(eq(selector, 0xb9947fa0)) { fail(errNotFaithfulShape()) } // transfer
                     if frameDataLoad(2, 196) { fail(errTransferShape()) } // publicAmount == 0
                     if frameDataLoad(2, 260) { fail(errTransferShape()) } // ctx == 0
-                    let fr := frameDataLoad(2, 548)
-                    if or(iszero(fr), shr(160, fr)) { fail(errZeroFeeRecipient()) }
                 }
-                case 612 {
-                    if iszero(eq(selector, 0x215ae4c7)) { fail(errNotFaithfulShape()) } // withdraw
+                case 580 {
+                    if iszero(eq(selector, 0xd677b46e)) { fail(errNotFaithfulShape()) } // withdraw
                     if iszero(frameDataLoad(2, 196)) { fail(errWithdrawShape()) } // publicAmount > 0
                     let recipient := frameDataLoad(2, 548)
                     if or(iszero(recipient), shr(160, recipient)) { fail(errWithdrawShape()) }
                     if iszero(eq(frameDataLoad(2, 260), recipient)) { fail(errCtxRecipient()) } // ctx names recipient
-                    let fr := frameDataLoad(2, 580)
-                    if or(iszero(fr), shr(160, fr)) { fail(errZeroFeeRecipient()) }
                 }
                 default { fail(errNotFaithfulShape()) }
                 // nonce keys == sorted proof nullifiers

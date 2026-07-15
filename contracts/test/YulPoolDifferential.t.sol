@@ -46,8 +46,8 @@ contract YulPoolDifferentialTest {
     // every selector the Yul pool dispatches, for structured raw fuzzing
     bytes4[23] SELECTORS = [
         bytes4(0x26123548), // shield
-        bytes4(0x751a8fc5), // transfer
-        bytes4(0x215ae4c7), // withdraw
+        bytes4(0xb9947fa0), // transfer
+        bytes4(0xd677b46e), // withdraw
         bytes4(0x8cc8fe8d), // verifyProofOnly
         bytes4(0xa3066aab), // claimWithdrawal
         bytes4(0x6ebc51e1), // claimFee
@@ -73,6 +73,7 @@ contract YulPoolDifferentialTest {
     function setUp() public {
         vm.roll(1000);
         probe = new MockEnvelopeProbe();
+        probe.setPayer(POOL_SENDER);
         verifier = new Groth16Verifier();
         sol = new ShieldedPool(POOL_SENDER, address(probe), verifier);
         vm.etch(T3_SHIM, type(PoseidonT3Shim).runtimeCode);
@@ -241,7 +242,7 @@ contract YulPoolDifferentialTest {
         probe.set(3, 2, 2, 0, lo, hi, 1, wrongRef ? bytes32(uint256(1)) : abi.decode(src, (bytes32)), s.root, pool);
         if (halt) probe.setHalted();
         vm.prank(pin);
-        (bool ok, bytes memory ret) = pool.call(abi.encodeWithSelector(bytes4(0x751a8fc5), s, POOL_SENDER));
+        (bool ok, bytes memory ret) = pool.call(abi.encodeWithSelector(bytes4(0xb9947fa0), s));
         assertTrue(!ok, "garbage spend settled");
         assertTrue(ret.length == 4, "expected a bare error selector");
         // The exact-length assertion makes the selector truncation intentional.
@@ -274,7 +275,7 @@ contract YulPoolDifferentialTest {
     function test_short_calldata_parity() public {
         _both(abi.encodePacked(bytes4(0xb83b3026), bytes16(0)), 0); // isLeaf, 16 of 32 bytes
         _both(abi.encodePacked(bytes4(0x26123548)), 1 ether); // shield, no argument
-        _both(abi.encodePacked(bytes4(0x751a8fc5), new bytes(100)), 0); // transfer, truncated Spend
+        _both(abi.encodePacked(bytes4(0xb9947fa0), new bytes(100)), 0); // transfer, truncated Spend
     }
 
     /// Value on a non-payable function reverts in Solidity; accepting it

@@ -30,8 +30,8 @@ interface Vm {
 /// proxy). Same selectors/errors/events as ShieldedPool.sol.
 interface IPool {
     function shield(bytes32 inner) external payable returns (uint32);
-    function transfer(ShieldedPool.Spend calldata s, address feeRecipient) external;
-    function withdraw(ShieldedPool.Spend calldata s, address recipient, address feeRecipient) external;
+    function transfer(ShieldedPool.Spend calldata s) external;
+    function withdraw(ShieldedPool.Spend calldata s, address recipient) external;
     function verifyProofOnly(ShieldedPool.Spend calldata s) external view;
     function claimWithdrawal(address payable who) external;
     function claimFee(address payable who) external;
@@ -121,6 +121,7 @@ contract DispatcherPoolTest {
 
     function _deploy() internal {
         probe = new MockEnvelopeProbe(); // nonce 1
+        probe.setPayer(SUBMITTER);
         verifier = new Groth16Verifier(); // nonce 2
         vm.etch(T3_SHIM, type(PoseidonT3Shim).runtimeCode);
         vm.etch(T4_SHIM, type(PoseidonT4Shim).runtimeCode);
@@ -225,7 +226,7 @@ contract DispatcherPoolTest {
     function test_transfer_settles_under_faithful_envelope() public {
         ShieldedPool.Spend memory s = _shieldA();
         vm.prank(address(pool));
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
         assertTrue(pool.isLeaf(s.outCm1) && pool.isLeaf(s.outCm2), "both outputs appended");
         assertTrue(pool.feeCredit(SUBMITTER) == s.fee, "fee credited");
         assertTrue(pool.currentRoot() == _s(".withdraw.root"), "root advanced to wallet's withdraw root");
@@ -245,19 +246,19 @@ contract DispatcherPoolTest {
         vm.expectEmit(true, false, false, true);
         emit FeeCredited(SUBMITTER, s.fee);
         vm.prank(address(pool));
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     function test_full_lifecycle_pays_recipient_fees_and_stays_solvent() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(address(pool));
-        pool.transfer(ts, SUBMITTER);
+        pool.transfer(ts);
 
         address payable recipient = payable(vm.parseAddress(vm.parseJsonString(j, ".recipient")));
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         _arm(ws);
         vm.prank(address(pool));
-        pool.withdraw(ws, recipient, SUBMITTER);
+        pool.withdraw(ws, recipient);
 
         assertTrue(pool.withdrawalCredit(recipient) == ws.publicAmount, "withdrawal credited");
         assertTrue(pool.feeCredit(SUBMITTER) == ts.fee + ws.fee, "both fees credited");
@@ -277,7 +278,7 @@ contract DispatcherPoolTest {
         ShieldedPool.Spend memory s = _shieldA();
         vm.prank(address(0xEEEE));
         vm.expectRevert(ShieldedPool.NotPoolSender.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     /// A payout CALL gives the recipient control while the pool is on the
@@ -294,11 +295,12 @@ contract DispatcherPoolTest {
         address wRecipient = vm.parseAddress(vm.parseJsonString(j, ".recipient"));
         r.arm(
             address(pool),
-            abi.encodeWithSelector(IPool.transfer.selector, fakeT, address(0xF00D)),
-            abi.encodeWithSelector(IPool.withdraw.selector, fakeW, wRecipient, address(0xF00D))
+            abi.encodeWithSelector(IPool.transfer.selector, fakeT),
+            abi.encodeWithSelector(IPool.withdraw.selector, fakeW, wRecipient)
         );
+        probe.setPayer(address(r));
         vm.prank(address(pool));
-        pool.transfer(ts, address(r)); // fee recipient re-enters on receipt of its claim
+        pool.transfer(ts);
         pool.claimFee(payable(address(r)));
         assertTrue(r.transferError() == ShieldedPool.NotPoolSender.selector, "transfer re-entry pinned");
         assertTrue(r.withdrawError() == ShieldedPool.NotPoolSender.selector, "withdraw re-entry pinned");
@@ -311,7 +313,7 @@ contract DispatcherPoolTest {
         probe.setHalted();
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.NotFrameNative.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     function test_wrong_key_set_reverts() public {
@@ -320,7 +322,7 @@ contract DispatcherPoolTest {
         probe.set(3, 2, 2, 0, hi, lo, 1, pool.sourceId(), s.root, address(pool));
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.KeySetMismatch.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     function test_wrong_reference_reverts() public {
@@ -329,7 +331,7 @@ contract DispatcherPoolTest {
         probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), bytes32(uint256(999)), address(pool));
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.RootNotBoundToReference.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     function test_wrong_settle_target_reverts() public {
@@ -338,7 +340,23 @@ contract DispatcherPoolTest {
         probe.set(3, 2, 2, 0, lo, hi, 1, pool.sourceId(), s.root, SUBMITTER);
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.NotFaithfulShape.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
+    }
+
+    function test_zero_resolved_payer_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayer(address(0));
+        vm.prank(address(pool));
+        vm.expectRevert(ShieldedPool.InvalidPayer.selector);
+        pool.transfer(s);
+    }
+
+    function test_noncanonical_resolved_payer_reverts() public {
+        ShieldedPool.Spend memory s = _shieldA();
+        probe.setPayerWord(1 << 160);
+        vm.prank(address(pool));
+        vm.expectRevert(ShieldedPool.InvalidPayer.selector);
+        pool.transfer(s);
     }
 
     // ---- proof attacks: rejected at the verifyProofOnly authentication
@@ -349,7 +367,7 @@ contract DispatcherPoolTest {
         s.nf2 = bytes32(0);
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.ZeroNullifier.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     function test_corrupted_proof_rejected_at_authentication() public {
@@ -393,25 +411,25 @@ contract DispatcherPoolTest {
         s.publicAmount = 1;
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.TransferShape.selector);
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
     }
 
     function test_transfer_shaped_spend_rejected_by_withdraw() public {
         ShieldedPool.Spend memory s = _shieldA();
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.WithdrawShape.selector);
-        pool.withdraw(s, address(0xBEEF), SUBMITTER);
+        pool.withdraw(s, address(0xBEEF));
     }
 
     function test_withdraw_wrong_recipient_reverts() public {
         ShieldedPool.Spend memory ts = _shieldA();
         vm.prank(address(pool));
-        pool.transfer(ts, SUBMITTER);
+        pool.transfer(ts);
         ShieldedPool.Spend memory ws = _spendOf(".withdraw");
         _arm(ws);
         vm.prank(address(pool));
         vm.expectRevert(ShieldedPool.CtxDoesNotNameRecipient.selector);
-        pool.withdraw(ws, address(0xDEAD), SUBMITTER);
+        pool.withdraw(ws, address(0xDEAD));
     }
 
     // ---- shield rules & duplicate-output no-op ----
@@ -434,7 +452,7 @@ contract DispatcherPoolTest {
         require(pool.isLeaf(s.outCm1), "pre-seeded output leaf");
         uint32 before = pool.nextIndex();
         vm.prank(address(pool));
-        pool.transfer(s, SUBMITTER);
+        pool.transfer(s);
         assertTrue(pool.nextIndex() == before + 1, "only the change note appended");
     }
 

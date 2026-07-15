@@ -49,7 +49,7 @@ contract ShieldedPoolLogic {
     address public constant RECENT_ROOT_PREDEPLOY = address(0x8272);
 
     /// Stateless Yul envelope reader (devnet/EnvelopeProbe.yul): returns the
-    /// ten envelope words _spend binds. A separate contract because Solidity
+    /// eleven envelope words _spend binds. A separate contract because Solidity
     /// cannot emit the frame-tx opcodes (verbatim is Yul-object-only). Read
     /// from the implementation's code under DELEGATECALL, so it is the same
     /// fixed address regardless of the executing context.
@@ -91,7 +91,7 @@ contract ShieldedPoolLogic {
     error WithdrawShape();
     error CtxDoesNotNameRecipient();
     error PayoutFailed();
-    error ZeroFeeRecipient();
+    error InvalidPayer();
     error NoCredit();
     error RootPublishFailed();
     error InvalidProbe();
@@ -150,32 +150,30 @@ contract ShieldedPoolLogic {
         bytes32 outCm1;
         bytes32 outCm2;
         uint256 publicAmount; // paid to the withdraw recipient (0 for transfer)
-        uint256 fee; // credited to the envelope-bound fee recipient
+        uint256 fee; // credited to the authenticated transaction payer
         bytes32 ctx;
         uint256[2] pA; // the Groth16 proof, in snarkjs calldata form
         uint256[2][2] pB;
         uint256[2] pC;
     }
 
-    /// Consume two notes, create two notes. Value stays shielded except the fee.
-    /// `feeRecipient` is NOT bound by the proof (unlike the withdraw recipient,
-    /// which `s.ctx` commits to). In the faithful shape the paymaster binds the
-    /// exact SENDER calldata, including this argument, to itself, so the fee
-    /// reaches the actual payer; a deployment that submits spends without that
-    /// paymaster binding gets no fee-recipient guarantee from the pool.
-    function transfer(Spend calldata s, address feeRecipient) external {
+    /// Consume two notes and create two notes. Value stays shielded except the
+    /// proof-bound fee, which is credited to the authenticated transaction
+    /// payer returned by TXPARAM(0x11).
+    function transfer(Spend calldata s) external {
         if (s.publicAmount != 0 || s.ctx != bytes32(0)) revert TransferShape();
-        _spend(s);
-        _settle(s, feeRecipient);
+        address payer = _spend(s);
+        _settle(s, payer);
     }
 
     /// Consume two notes, create two notes, and pay publicAmount to the
-    /// recipient named by ctx (plus the fee credit to feeRecipient).
-    function withdraw(Spend calldata s, address recipient, address feeRecipient) external {
+    /// recipient named by ctx. The proof-bound fee is credited separately to
+    /// the authenticated transaction payer.
+    function withdraw(Spend calldata s, address recipient) external {
         if (s.publicAmount == 0 || s.ctx == bytes32(0)) revert WithdrawShape();
         if (s.ctx != ctxFor(recipient)) revert CtxDoesNotNameRecipient();
-        _spend(s);
-        _settle(s, feeRecipient);
+        address payer = _spend(s);
+        _settle(s, payer);
         withdrawalCredit[recipient] += s.publicAmount;
         emit WithdrawalCredited(recipient, s.publicAmount);
     }
@@ -246,7 +244,7 @@ contract ShieldedPoolLogic {
     /// dispatcher-implementation binding being immutable). This implementation
     /// therefore calls _validateSpend (canonicity/range, no pairing) and leaves
     /// the full proof check to frame 0 and the paymaster carrier.
-    function _spend(Spend calldata s) internal {
+    function _spend(Spend calldata s) internal returns (address payer) {
         // pool-as-sender pin: the frame-2 SENDER frame runs with the pool as
         // caller (the pool is tx.sender), so under DELEGATECALL msg.sender is
         // the dispatcher == address(this). EIP-8250 key domains are per sender,
@@ -256,11 +254,11 @@ contract ShieldedPoolLogic {
         // Envelope facts via the probe. Gas-capped: outside a frame
         // transaction the opcodes exceptional-halt and consume everything
         // forwarded, so cap the burn and turn it into a named revert. 100k
-        // leaves generous headroom over the probe's ~10 fixed introspection
+        // leaves generous headroom over the probe's fixed introspection
         // opcodes (attacker cannot inflate the count) against future
         // opcode repricing.
         (bool ok, bytes memory ret) = probe.staticcall{gas: 100_000}("");
-        if (!ok || ret.length != 320) revert NotFrameNative();
+        if (!ok || ret.length != 352) revert NotFrameNative();
         (
             uint256 frames,
             uint256 frameIndex,
@@ -271,8 +269,11 @@ contract ShieldedPoolLogic {
             uint256 refCount,
             bytes32 refSource,
             bytes32 refRoot,
-            address settleTarget
-        ) = abi.decode(ret, (uint256, uint256, uint256, uint256, bytes32, bytes32, uint256, bytes32, bytes32, address));
+            address settleTarget,
+            uint256 payerWord
+        ) = abi.decode(
+            ret, (uint256, uint256, uint256, uint256, bytes32, bytes32, uint256, bytes32, bytes32, address, uint256)
+        );
         // Exactly-once per consumption. The faithful grammar has ONE settle
         // frame, index 2 of 3, and the protocol calls each frame's target
         // once. Requiring frame 2 to target THIS pool directly means the
@@ -289,6 +290,10 @@ contract ShieldedPoolLogic {
         if (keyCount != 2 || nonceSeq != 0 || k0 != lo || k1 != hi) revert KeySetMismatch();
         // the proven root == the declared, protocol-validated reference
         if (refCount != 1 || refSource != sourceId() || refRoot != s.root) revert RootNotBoundToReference();
+        if (payerWord == 0 || payerWord > type(uint160).max) revert InvalidPayer();
+        // Safe: the preceding bound proves that truncation cannot discard bits.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        payer = address(uint160(payerWord));
         _validateSpend(s);
         emit NoteSpent(s.nf1);
         emit NoteSpent(s.nf2);
@@ -313,7 +318,7 @@ contract ShieldedPoolLogic {
     /// two output notes (duplicate inserts are no-ops, never reverts),
     /// recompute and publish the new root once, then record the fee as a
     /// pull credit (claimFee).
-    function _settle(Spend calldata s, address feeRecipient) internal {
+    function _settle(Spend calldata s, address payer) internal {
         uint32 i1;
         uint32 i2;
         bool new1 = !isLeaf[s.outCm1];
@@ -328,19 +333,9 @@ contract ShieldedPoolLogic {
         }
         _publishRoot();
         if (s.fee != 0) {
-            address resolvedFeeRecipient = _feeRecipient(feeRecipient);
-            if (resolvedFeeRecipient == address(0)) revert ZeroFeeRecipient();
-            feeCredit[resolvedFeeRecipient] += s.fee;
-            emit FeeCredited(resolvedFeeRecipient, s.fee);
+            feeCredit[payer] += s.fee;
+            emit FeeCredited(payer, s.fee);
         }
-    }
-
-    /// Fee-routing migration seam. Today the bounded paymaster binds the
-    /// calldata recipient to itself. Once frame transactions expose their
-    /// consensus-resolved payer as an authenticated TXPARAM, this function can
-    /// read that value and the external feeRecipient argument can be retired.
-    function _feeRecipient(address calldataRecipient) internal pure returns (address) {
-        return calldataRecipient;
     }
 
     // ---- encodings ----
